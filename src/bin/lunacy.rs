@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use lunacy::api::{self};
 use lunacy::config::{self, Config};
-use lunacy::daemon::{Command, Daemon, Shared};
+use lunacy::daemon::{Daemon, Shared};
 use lunacy::git;
 use lunacy::model::{self, read_last_sha, Trigger};
 use lunacy::pipeline;
@@ -341,20 +341,7 @@ fn run(path: PathBuf) -> Result<()> {
 
     // Wire the API to the workers so triggers reach them.
     let commands: api::Commands = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
-    {
-        let shared = daemon.shared.clone();
-        let commands = commands.clone();
-        // Workers are spawned inside Daemon; take their senders by name.
-        for project in cfg.projects.iter() {
-            if let Some(tx) = daemon_command_sender(&daemon, &project.name) {
-                commands
-                    .lock()
-                    .expect("commands")
-                    .insert(project.name.clone(), tx);
-            }
-        }
-        drop(shared);
-    }
+    daemon.sync_commands(&commands);
 
     let listen = cfg.server.as_ref().map(|s| s.listen.clone());
     let api_state = Arc::new(api::ApiState {
@@ -385,7 +372,7 @@ fn run(path: PathBuf) -> Result<()> {
     let _ = ctrlc_handler(shared);
 
     log::info!("daemon running; press Ctrl-C to stop");
-    daemon.wait();
+    daemon.wait_with_reloads(&api_state.reloads, &api_state.commands);
     daemon.shutdown();
     if let Some(handle) = api_thread {
         // The API thread parks on accept; it ends with the process.
@@ -393,11 +380,6 @@ fn run(path: PathBuf) -> Result<()> {
     }
     log::info!("stopped");
     Ok(())
-}
-
-/// Reach into a `Daemon` for a worker's command channel.
-fn daemon_command_sender(daemon: &Daemon, name: &str) -> Option<std::sync::mpsc::Sender<Command>> {
-    daemon.command_sender(name)
 }
 
 fn ctrlc_handler(shared: Arc<Mutex<Shared>>) -> Result<()> {

@@ -611,17 +611,21 @@ fn handle_put_config(state: &Arc<ApiState>, mut request: tiny_http::Request) -> 
     let restarted = {
         let mut shared = state.shared.lock().expect("shared");
         shared.config = incoming.clone();
-        let names: Vec<String> = incoming.projects.iter().map(|p| p.name.clone()).collect();
-        // Refresh the read models for renamed/added projects.
+        // Refresh the read models for added/removed/reordered projects.
         let state_dir = shared.state_dir.clone();
-        shared.projects.retain(|p| names.contains(&p.name));
-        for (i, project) in incoming.projects.iter().enumerate() {
-            if !shared.projects.iter().any(|p| p.name == project.name) {
-                let fresh = crate::daemon::ProjectState::new_public(project, &state_dir);
-                let at = i.min(shared.projects.len());
-                shared.projects.insert(at, fresh);
+        let mut old_projects = std::mem::take(&mut shared.projects);
+        let mut ordered = Vec::with_capacity(incoming.projects.len());
+        for project in &incoming.projects {
+            if let Some(pos) = old_projects.iter().position(|p| p.name == project.name) {
+                let mut existing = old_projects.remove(pos);
+                existing.branch = project.branch.clone();
+                existing.github_repo = project.github_repo.clone();
+                ordered.push(existing);
+            } else {
+                ordered.push(crate::daemon::ProjectState::new_public(project, &state_dir));
             }
         }
+        shared.projects = ordered;
         shared.server_restart_needed()
     };
 

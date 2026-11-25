@@ -160,17 +160,50 @@ impl Daemon {
 
         let mut shared = self.shared.lock().expect("shared");
         let state_dir = shared.state_dir.clone();
-        for (i, project) in cfg.projects.iter().enumerate() {
-            match shared.projects.iter().position(|p| p.name == project.name) {
-                Some(pos) => shared.projects[pos].refresh(project, &state_dir),
-                None => {
-                    let at = i.min(shared.projects.len());
-                    let state = ProjectState::new(project, &state_dir);
-                    shared.projects.insert(at, state);
-                }
+        let mut old_projects = std::mem::take(&mut shared.projects);
+        let mut ordered = Vec::with_capacity(cfg.projects.len());
+        for project in &cfg.projects {
+            if let Some(pos) = old_projects.iter().position(|p| p.name == project.name) {
+                let mut existing = old_projects.remove(pos);
+                existing.refresh(project, &state_dir);
+                ordered.push(existing);
+            } else {
+                ordered.push(ProjectState::new(project, &state_dir));
             }
         }
-        shared.projects.retain(|p| wanted.contains(&p.name));
+        shared.projects = ordered;
+    }
+
+    /// Keep an API command map aligned with the currently active workers.
+    pub fn sync_commands(
+        &self,
+        commands: &Arc<Mutex<std::collections::BTreeMap<String, Sender<Command>>>>,
+    ) {
+        let mut guard = commands.lock().expect("commands");
+        guard.clear();
+        for (name, handle) in &self.workers {
+            guard.insert(name.clone(), handle.cmd.clone());
+        }
+    }
+
+    /// Wait until shutdown is requested, reconciling workers whenever `reloads` bumps.
+    pub fn wait_with_reloads(
+        &mut self,
+        reloads: &Arc<Mutex<u32>>,
+        commands: &Arc<Mutex<std::collections::BTreeMap<String, Sender<Command>>>>,
+    ) {
+        let mut seen = *reloads.lock().expect("reloads");
+        while !self.shutdown.load(std::sync::atomic::Ordering::SeqCst)
+            && !self.shared.lock().map(|s| s.shutdown).unwrap_or(true)
+        {
+            let now = *reloads.lock().expect("reloads");
+            if now != seen {
+                seen = now;
+                self.reconcile();
+                self.sync_commands(commands);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     pub fn shutdown(&mut self) {

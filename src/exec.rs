@@ -61,12 +61,11 @@ pub fn exec(spec: &ExecSpec, sink: Option<LineSink>) -> Result<ExecResult> {
         Ok(c) => c,
         Err(e) => {
             // Log the failure instead of raising: a missing tool is a failed step.
-            writeln!(
-                log.lock().expect("log mutex"),
-                "failed to start {}: {e}",
-                spec.program
-            )
-            .ok();
+            note(
+                &log,
+                sink.as_ref(),
+                &format!("failed to start {}: {e}", spec.program),
+            );
             guard.disarm();
             return Ok(ExecResult {
                 outcome: Outcome::Spawn,
@@ -78,7 +77,8 @@ pub fn exec(spec: &ExecSpec, sink: Option<LineSink>) -> Result<ExecResult> {
     let out = child.stdout.take().expect("piped stdout");
     let err = child.stderr.take().expect("piped stderr");
     let pump_out = spawn_pump(out, log.clone(), sink.clone());
-    let pump_err = spawn_pump(err, log.clone(), None);
+    // stderr goes to the sink too: act prints fatal errors there as plain text.
+    let pump_err = spawn_pump(err, log.clone(), sink.clone());
 
     let mut timed_out = false;
     loop {
@@ -105,11 +105,13 @@ pub fn exec(spec: &ExecSpec, sink: Option<LineSink>) -> Result<ExecResult> {
 
     let status = child.wait().ok();
     let outcome = if timed_out {
-        let mut f = log.lock().expect("log mutex");
-        let _ = writeln!(
-            f,
-            "\n[lunacy] timed out after {}s; killed the process tree",
-            spec.timeout.as_secs()
+        note(
+            &log,
+            sink.as_ref(),
+            &format!(
+                "[lunacy] timed out after {}s; killed the process tree",
+                spec.timeout.as_secs()
+            ),
         );
         Outcome::Timeout
     } else {
@@ -121,6 +123,16 @@ pub fn exec(spec: &ExecSpec, sink: Option<LineSink>) -> Result<ExecResult> {
     };
 
     Ok(ExecResult { outcome })
+}
+
+/// A lunacy message: into the raw log and, if any, the sink's log.
+fn note(log: &Mutex<std::fs::File>, sink: Option<&LineSink>, msg: &str) {
+    if let Ok(mut f) = log.lock() {
+        let _ = writeln!(f, "{msg}");
+    }
+    if let Some(sink) = sink {
+        sink(msg);
+    }
 }
 
 fn spawn_pump<R: std::io::Read + Send + 'static>(
@@ -323,6 +335,30 @@ mod tests {
             timeout,
             log_path: dir.join("log"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_reaches_the_sink() {
+        // act reports fatal errors (e.g. invalid workflow YAML) as plain stderr.
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink: LineSink = {
+            let seen = seen.clone();
+            Arc::new(move |l: &str| seen.lock().unwrap().push(l.to_string()))
+        };
+        let r = exec(
+            &spec(
+                dir.path(),
+                "sh",
+                &["-c", "echo boom >&2; exit 1"],
+                Duration::from_secs(10),
+            ),
+            Some(sink),
+        )
+        .unwrap();
+        assert_eq!(r.outcome, Outcome::Failed(1));
+        assert_eq!(*seen.lock().unwrap(), vec!["boom".to_string()]);
     }
 
     #[test]

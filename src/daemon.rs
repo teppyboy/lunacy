@@ -194,7 +194,10 @@ impl Daemon {
 
     /// Block until `shutdown` is requested.
     pub fn wait(&self) {
-        while !self.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        // The signal handler and the API request a stop through `Shared`.
+        while !self.shutdown.load(std::sync::atomic::Ordering::SeqCst)
+            && !self.shared.lock().map(|s| s.shutdown).unwrap_or(true)
+        {
             std::thread::sleep(Duration::from_millis(200));
         }
     }

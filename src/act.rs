@@ -261,8 +261,14 @@ impl ActProgress {
                         duration_ms,
                     });
                 }
-            } else if step_id.is_some() {
-                // A step start line: it also carries `msg`, but it is progress.
+            } else if step_id.is_some()
+                && parsed
+                    .msg
+                    .as_deref()
+                    .is_some_and(|m| m.trim_start().starts_with('⭐'))
+            {
+                // A step start line ("⭐ Run Main X"). Other lines with a stepID, such as
+                // the "exit status 1" error after a failure, are not starts.
                 self.substeps.push(Substep {
                     job: self.current_job.clone().unwrap_or_default(),
                     job_id: self.current_job_id.clone().unwrap_or_default(),
@@ -442,6 +448,7 @@ mod tests {
 {"job":"Rust CI/Validate workspace","jobID":"validate","stage":"Main","step":"Run tests","stepID":["1"],"msg":"⭐ Run Main Run tests"}
 {"step":"Run tests","raw_output":true,"msg":"assertion failed\n"}
 {"step":"Run tests","stepResult":"failure","executionTime":2500000000}
+{"job":"Rust CI/Validate workspace","jobID":"validate","level":"error","stage":"Main","step":"Run tests","stepID":["1"],"msg":"exit status 1"}
 {"jobID":"validate","jobResult":"failure","msg":"🏁  Job failed"}
 not json at all
 {"job":"Rust CI/Audit dependencies","jobID":"audit","stage":"Main","step":"Scan","stepID":["0"],"msg":"⭐ Run Main Scan"}
@@ -473,13 +480,13 @@ not json at all
         // Two jobs -> messages get a job prefix. Streaming means job 1's lines
         // were already written before job 2 was seen, so only later lines can
         // be prefixed; that is called out here rather than faked.
-        assert_eq!(human.len(), 5, "{human:?}");
+        assert_eq!(human.len(), 6, "{human:?}");
         assert!(
             human[0].starts_with("⭐"),
             "unprefixed first job: {human:?}"
         );
-        assert!(human[3].starts_with("[Audit dependencies] "), "{human:?}");
         assert!(human[4].starts_with("[Audit dependencies] "), "{human:?}");
+        assert!(human[5].starts_with("[Audit dependencies] "), "{human:?}");
     }
 
     #[test]

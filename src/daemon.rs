@@ -209,13 +209,23 @@ impl Daemon {
     pub fn shutdown(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let names: Vec<String> = self.workers.keys().cloned().collect();
-        for name in names {
-            if let Some(handle) = self.workers.remove(&name) {
-                let _ = handle.cmd.send(Command::Stop);
-                if let Some(j) = handle.join {
-                    let _ = j.join();
-                }
+        let handles: Vec<WorkerHandle> = std::mem::take(&mut self.workers).into_values().collect();
+        for handle in &handles {
+            let _ = handle.cmd.send(Command::Stop);
+        }
+        // A worker inside a pipeline step or a `git fetch` only sees Stop when that returns, so
+        // don't wait past the service manager's stop timeout (systemd: 30 s); the process exit
+        // ends what is left, and the next start retries.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for handle in handles {
+            let Some(j) = handle.join else { continue };
+            while !j.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if j.is_finished() {
+                let _ = j.join();
+            } else {
+                log::warn!("a worker is still busy; exiting without waiting for it");
             }
         }
     }

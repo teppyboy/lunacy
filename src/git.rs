@@ -1,8 +1,10 @@
 //! Thin `git` wrappers. Everything shells out; no libgit2 dependency.
 
 use anyhow::{bail, Context, Result};
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -22,9 +24,48 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// How long one `git fetch` may take. A hung credential helper or network otherwise stalls the
+/// project's worker for good (seen: a `gh auth git-credential` child stuck for 46 minutes).
+const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub fn fetch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
     let refspec = format!("{branch}:refs/remotes/{remote}/{branch}");
-    git(repo, &["fetch", "--quiet", remote, &refspec])?;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "--quiet", remote, &refspec])
+        // Never wait on a terminal prompt for credentials: there is no one to answer it.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running git fetch in {}", repo.display()))?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= FETCH_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "git fetch {remote} {branch} timed out after {}s",
+                FETCH_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+        bail!(
+            "git fetch failed: {}",
+            stderr.trim().lines().last().unwrap_or("(no output)")
+        );
+    }
     Ok(())
 }
 

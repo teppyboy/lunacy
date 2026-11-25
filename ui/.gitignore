@@ -1,0 +1,8 @@
+# Build output and the generated web bundle.
+/target/
+/dist/
+
+# The screenshots are checked in; no need to ignore them.
+
+# Python bytecode from the mock server.
+__pycache__/

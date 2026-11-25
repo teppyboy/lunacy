@@ -1,0 +1,686 @@
+{
+  "version": "0.1.0",
+  "failing_step": "",
+  "system": {
+    "os": "linux",
+    "version": "0.1.0",
+    "config_path": "/home/you/.config/lunacy/config.toml",
+    "act": {
+      "path": "/usr/local/bin/act",
+      "version": "0.2.97"
+    },
+    "docker": {
+      "ok": true,
+      "error": null
+    },
+    "git": {
+      "version": "git version 2.47.1"
+    }
+  },
+  "workflows": [
+    {
+      "file": ".github/workflows/ci.yml",
+      "name": "CI",
+      "jobs": [
+        {
+          "id": "web",
+          "name": "Analyze, test and build Web",
+          "runs_on": [
+            "ubuntu-latest"
+          ]
+        },
+        {
+          "id": "server",
+          "name": "Server tests",
+          "runs_on": [
+            "ubuntu-latest"
+          ]
+        },
+        {
+          "id": "windows",
+          "name": "Windows packaging",
+          "runs_on": [
+            "windows-latest"
+          ]
+        }
+      ]
+    },
+    {
+      "file": ".github/workflows/release.yml",
+      "name": "Release",
+      "jobs": [
+        {
+          "id": "build",
+          "name": "Build artefacts",
+          "runs_on": [
+            "ubuntu-latest"
+          ]
+        },
+        {
+          "id": "publish",
+          "name": "Publish",
+          "runs_on": [
+            "ubuntu-latest"
+          ]
+        }
+      ]
+    }
+  ],
+  "projects": [
+    {
+      "name": "lunarum",
+      "branch": "master",
+      "github_repo": "teppyboy/lunarum",
+      "upstream_sha": "4f1c2b9e8a7d6c5b4a39281706f5e4d3c2b1a090",
+      "last_sha": "9a8b7c6d5e4f30211f2e3d4c5b6a7988a7b6c5d4",
+      "running": true,
+      "current_run": {
+        "id": "lunarum-1764067434-4f1c2b9",
+        "project": "lunarum",
+        "sha": "4f1c2b9e8a7d6c5b4a39281706f5e4d3c2b1a090",
+        "subject": "feat(web): keyboard navigation for the project list",
+        "status": "running",
+        "started_at": 1764067434,
+        "finished_at": null,
+        "failed_step": null,
+        "github_url": "https://github.com/teppyboy/lunarum/runs/5839201476",
+        "trigger": "poll",
+        "steps": []
+      },
+      "last_run": {
+        "id": "lunarum-1764064800-9a8b7c6",
+        "project": "lunarum",
+        "sha": "9a8b7c6d5e4f30211f2e3d4c5b6a7988a7b6c5d4",
+        "subject": "fix: keep the act lock across a reload",
+        "status": "success",
+        "started_at": 1764064800,
+        "finished_at": 1764065005,
+        "failed_step": null,
+        "github_url": "https://github.com/teppyboy/lunarum/runs/5838441203",
+        "trigger": "poll",
+        "steps": []
+      }
+    },
+    {
+      "name": "dotfiles",
+      "branch": "main",
+      "github_repo": "teppyboy/dotfiles",
+      "upstream_sha": "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+      "last_sha": "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+      "running": false,
+      "current_run": null,
+      "last_run": {
+        "id": "dotfiles-1764059000-1a2b3c4",
+        "project": "dotfiles",
+        "sha": "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+        "subject": "zsh: bind history search to the arrow keys",
+        "status": "failure",
+        "started_at": 1764059000,
+        "finished_at": 1764059062,
+        "failed_step": "Validate zsh config",
+        "github_url": null,
+        "trigger": "manual",
+        "steps": []
+      }
+    },
+    {
+      "name": "blog",
+      "branch": "main",
+      "github_repo": null,
+      "upstream_sha": null,
+      "last_sha": null,
+      "running": false,
+      "current_run": null,
+      "last_run": null
+    },
+    {
+      "name": "playground",
+      "branch": "trunk",
+      "github_repo": "teppyboy/playground",
+      "upstream_sha": "77aa66bb55cc44dd33ee22ff1100998877665544",
+      "last_sha": "77aa66bb55cc44dd33ee22ff1100998877665544",
+      "running": false,
+      "current_run": null,
+      "last_run": {
+        "id": "playground-1764040000-77aa66b",
+        "project": "playground",
+        "sha": "77aa66bb55cc44dd33ee22ff1100998877665544",
+        "subject": "spike: try the streaming log view",
+        "status": "error",
+        "started_at": 1764040000,
+        "finished_at": 1764040004,
+        "failed_step": "act · CI / web",
+        "github_url": null,
+        "trigger": "manual",
+        "steps": []
+      }
+    }
+  ],
+  "runs": [
+    {
+      "id": "lunarum-1764067434-4f1c2b9",
+      "project": "lunarum",
+      "sha": "4f1c2b9e8a7d6c5b4a39281706f5e4d3c2b1a090",
+      "subject": "feat(web): keyboard navigation for the project list",
+      "status": "running",
+      "started_at": 1764067434,
+      "finished_at": null,
+      "failed_step": null,
+      "github_url": "https://github.com/teppyboy/lunarum/runs/5839201476",
+      "trigger": "poll",
+      "steps": [
+        {
+          "phase": "ci",
+          "name": "Install dependencies",
+          "status": "success",
+          "duration_ms": 8412,
+          "exit_code": 0,
+          "kind": "shell",
+          "substeps": []
+        },
+        {
+          "phase": "ci",
+          "name": "act · CI",
+          "status": "running",
+          "duration_ms": null,
+          "exit_code": null,
+          "kind": "act",
+          "substeps": [
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Set up job",
+              "status": "success",
+              "duration_ms": 1203
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Run actions/checkout@v4",
+              "status": "success",
+              "duration_ms": 2840
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Run actions/setup-node@v4",
+              "status": "success",
+              "duration_ms": 6171
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Install dependencies",
+              "status": "success",
+              "duration_ms": 19204
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Lint",
+              "status": "success",
+              "duration_ms": 5310
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Test",
+              "status": "running",
+              "duration_ms": null
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Build",
+              "status": "pending",
+              "duration_ms": null
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Complete job",
+              "status": "pending",
+              "duration_ms": null
+            }
+          ]
+        },
+        {
+          "phase": "ci",
+          "name": "Package for Windows",
+          "status": "pending",
+          "duration_ms": null,
+          "exit_code": null,
+          "kind": "shell",
+          "substeps": [],
+          "only_on": [
+            "windows"
+          ]
+        },
+        {
+          "phase": "deploy",
+          "name": "Sync to the edge",
+          "status": "pending",
+          "duration_ms": null,
+          "exit_code": null,
+          "kind": "shell",
+          "substeps": [],
+          "only_on": []
+        }
+      ]
+    },
+    {
+      "id": "lunarum-1764064800-9a8b7c6",
+      "project": "lunarum",
+      "sha": "9a8b7c6d5e4f30211f2e3d4c5b6a7988a7b6c5d4",
+      "subject": "fix: keep the act lock across a reload",
+      "status": "success",
+      "started_at": 1764064800,
+      "finished_at": 1764065005,
+      "failed_step": null,
+      "github_url": "https://github.com/teppyboy/lunarum/runs/5838441203",
+      "trigger": "poll",
+      "steps": [
+        {
+          "phase": "ci",
+          "name": "Install dependencies",
+          "status": "success",
+          "duration_ms": 7903,
+          "exit_code": 0,
+          "kind": "shell",
+          "substeps": []
+        },
+        {
+          "phase": "ci",
+          "name": "act · CI",
+          "status": "success",
+          "duration_ms": 186220,
+          "exit_code": 0,
+          "kind": "act",
+          "substeps": [
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Set up job",
+              "status": "success",
+              "duration_ms": 1188
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Run actions/checkout@v4",
+              "status": "success",
+              "duration_ms": 2704
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Install dependencies",
+              "status": "success",
+              "duration_ms": 18877
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Test",
+              "status": "success",
+              "duration_ms": 92014
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Build",
+              "status": "success",
+              "duration_ms": 66410
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Complete job",
+              "status": "success",
+              "duration_ms": 1027
+            },
+            {
+              "job": "Server tests",
+              "job_id": "server",
+              "name": "Set up job",
+              "status": "success",
+              "duration_ms": 1104
+            },
+            {
+              "job": "Server tests",
+              "job_id": "server",
+              "name": "Test",
+              "status": "success",
+              "duration_ms": 8033
+            },
+            {
+              "job": "Server tests",
+              "job_id": "server",
+              "name": "Complete job",
+              "status": "success",
+              "duration_ms": 996
+            }
+          ]
+        },
+        {
+          "phase": "ci",
+          "name": "Package for Windows",
+          "status": "skipped",
+          "duration_ms": null,
+          "exit_code": null,
+          "kind": "shell",
+          "substeps": [],
+          "only_on": [
+            "windows"
+          ]
+        },
+        {
+          "phase": "deploy",
+          "name": "Sync to the edge",
+          "status": "skipped",
+          "duration_ms": null,
+          "exit_code": null,
+          "kind": "shell",
+          "substeps": [],
+          "only_on": []
+        }
+      ]
+    },
+    {
+      "id": "lunarum-1764057600-3c4d5e6",
+      "project": "lunarum",
+      "sha": "3c4d5e6f7081920a1b2c3d4e5f60718293a4b5c6",
+      "subject": "refactor: single act lock for every project",
+      "status": "failure",
+      "started_at": 1764057600,
+      "finished_at": 1764057850,
+      "failed_step": "act · CI",
+      "github_url": "https://github.com/teppyboy/lunarum/runs/5837012899",
+      "trigger": "poll",
+      "steps": [
+        {
+          "phase": "ci",
+          "name": "Install dependencies",
+          "status": "success",
+          "duration_ms": 8120,
+          "exit_code": 0,
+          "kind": "shell",
+          "substeps": []
+        },
+        {
+          "phase": "ci",
+          "name": "act · CI",
+          "status": "failure",
+          "duration_ms": 141004,
+          "exit_code": 1,
+          "kind": "act",
+          "substeps": [
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Set up job",
+              "status": "success",
+              "duration_ms": 1191
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Install dependencies",
+              "status": "success",
+              "duration_ms": 19102
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Test",
+              "status": "failure",
+              "duration_ms": 88210
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Build",
+              "status": "skipped",
+              "duration_ms": null
+            },
+            {
+              "job": "Analyze, test and build Web",
+              "job_id": "web",
+              "name": "Complete job",
+              "status": "success",
+              "duration_ms": 1011
+            }
+          ]
+        },
+        {
+          "phase": "deploy",
+          "name": "Sync to the edge",
+          "status": "pending",
+          "duration_ms": null,
+          "exit_code": null,
+          "kind": "shell",
+          "substeps": [],
+          "only_on": []
+        }
+      ]
+    },
+    {
+      "id": "dotfiles-1764059000-1a2b3c4",
+      "project": "dotfiles",
+      "sha": "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+      "subject": "zsh: bind history search to the arrow keys",
+      "status": "failure",
+      "started_at": 1764059000,
+      "finished_at": 1764059062,
+      "failed_step": "Validate zsh config",
+      "github_url": null,
+      "trigger": "manual",
+      "steps": [
+        {
+          "phase": "ci",
+          "name": "Validate zsh config",
+          "status": "failure",
+          "duration_ms": 62,
+          "exit_code": 1,
+          "kind": "shell",
+          "substeps": []
+        },
+        {
+          "phase": "deploy",
+          "name": "Install dotfiles",
+          "status": "pending",
+          "duration_ms": null,
+          "exit_code": null,
+          "kind": "shell",
+          "substeps": [],
+          "only_on": [
+            "linux",
+            "macos"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "playground-1764040000-77aa66b",
+      "project": "playground",
+      "sha": "77aa66bb55cc44dd33ee22ff1100998877665544",
+      "subject": "spike: try the streaming log view",
+      "status": "error",
+      "started_at": 1764040000,
+      "finished_at": 1764040004,
+      "failed_step": "act · CI / web",
+      "github_url": null,
+      "trigger": "manual",
+      "steps": [
+        {
+          "phase": "ci",
+          "name": "act · CI / web",
+          "status": "error",
+          "duration_ms": 4100,
+          "exit_code": null,
+          "kind": "act",
+          "substeps": []
+        }
+      ]
+    }
+  ],
+  "logs": {
+    "lunarum-1764067434-4f1c2b9/0": "npm warn deprecated inflight@1.0.6: This module is not supported\nadded 812 packages, and audited 813 packages in 8s\n\n164 packages are looking for funding\n  run `npm fund` for details\n\nfound 0 vulnerabilities\n",
+    "lunarum-1764067434-4f1c2b9/1": "[web] 🚀  Start image=catthehacker/ubuntu:act-latest\n[web]   🐳  docker pull image=catthehacker/ubuntu:act-latest platform= username= forcePull=true\n[web]   🐳  docker create image=catthehacker/ubuntu:act-latest platform= entrypoint=[\"tail\" \"-f\" \"/dev/null\"] cmd=[] network=\"container:act-CI-web-2f8c1a\"\n[web] [command]/usr/bin/git version\n[web] git version 2.43.0\n[web] [command]/usr/bin/node --version\n[web] v20.11.0\n[web] ⚙  ::group::Install dependencies\n[web] [command]npm ci\n[web] added 812 packages, and audited 813 packages in 19s\n[web] ⚙  ::endgroup::\n[web] ⚙  ::group::Lint\n[web] [command]npm run lint\n[web] > lunarum-web@0.1.0 lint\n[web] > eslint src --max-warnings 0\n[web] ⚙  ::endgroup::\n[web] ⚙  ::group::Test\n[web] [command]npm test\n[web] > lunarum-web@0.1.0 test\n[web] > vitest run\n[web] \n[web]  RUN  v2.1.8 /home/runner/work/lunarum/lunarum\n[web] \n[web]  ✓ src/api.test.ts (14 tests) 62ms\n[web]  ✓ src/poll.test.ts (6 tests) 41ms\n[web]  ❯ src/list.test.ts (9 tests | 1 failed) 88ms\n[web]    × ProjectList keeps the selection when a poll reorders rows\n[web]      → expected element list to equal [a, b, c]\n[web] \n[web]  Test Files  1 failed | 2 passed (3)\n[web]       Tests  1 failed | 28 passed (29)\n",
+    "lunarum-1764064800-9a8b7c6/0": "added 812 packages, and audited 813 packages in 8s\n\n164 packages are looking for funding\nfound 0 vulnerabilities\n",
+    "lunarum-1764800/1": "no output\n",
+    "lunarum-1764064800-9a8b7c6/1": "[web] 🚀  Start image=catthehacker/ubuntu:act-latest\n[web] [command]npm ci\n[web] added 812 packages, and audited 813 packages in 18s\n[web] [command]npm test\n[web]  Test Files  3 passed (3)\n[web]       Tests  29 passed (29)\n[web] [command]npm run build\n[web] vite v6.0.7 building for production...\n[web] ✓ 812 modules transformed.\n[web] dist/index.html                   0.61 kB │ gzip:  0.36 kB\n[web] dist/assets/index-D7f3a1b2.js     142.08 kB │ gzip: 45.81 kB\n[web] ✓ built in 6.41s\n[web] ⭐ Run Complete job\n[web]   ✅  Success - Main Complete job\n[server] 🚀  Start image=catthehacker/ubuntu:act-latest\n[server] [command]cargo test --all\n[server] running 62 tests\n[server] test result: ok. 62 passed; 0 failed\n[server]   ✅  Success - Main Complete job\n",
+    "lunarum-1764057600-3c4d5e6/1": "[web] [command]npm test\n[web]  ❯ src/list.test.ts (9 tests | 1 failed) 88ms\n[web]    × ProjectList keeps the selection when a poll reorders rows\n[web]      → expected element list to equal [a, b, c]\n[web] Error: Process completed with exit code 1.\n",
+    "dotfiles-1764059000-1a2b3c4/0": "zsh -n zsh/.zshrc\nzsh/.zshrc:42: parse error near `\\n'\n",
+    "playground-1764040000-77aa66b/0": "[act] exec: \"act\": executable file not found in $PATH\n"
+  },
+  "config": {
+    "general": {
+      "state_dir": "/home/you/.local/state/lunacy",
+      "poll_interval": 300,
+      "shell": [
+        "bash",
+        "-lc"
+      ]
+    },
+    "server": {
+      "listen": "127.0.0.1:7878",
+      "token": "********",
+      "public_url": null,
+      "web_root": "ui/dist"
+    },
+    "github": {
+      "mode": "checks",
+      "token": "********",
+      "app": {
+        "app_id": 184920,
+        "private_key": "********",
+        "webhook_secret": "********",
+        "installation_id": 58120443
+      }
+    },
+    "discord": {
+      "webhook_url": "********",
+      "notify_on_start": false
+    },
+    "act": {
+      "command": [
+        "act"
+      ],
+      "platforms": {
+        "ubuntu-latest": "catthehacker/ubuntu:act-latest",
+        "windows-latest": "catthehacker/windows:latest"
+      },
+      "args": [
+        "--pull=false"
+      ]
+    },
+    "project": [
+      {
+        "name": "lunarum",
+        "repo_path": "/home/you/src/lunarum",
+        "remote": "origin",
+        "branch": "master",
+        "github_repo": "teppyboy/lunarum",
+        "checkout": "worktree",
+        "poll_interval": 60,
+        "env": {
+          "NODE_OPTIONS": "--max-old-space-size=4096"
+        },
+        "discord_webhook_url": "********",
+        "ci": [
+          {
+            "name": "Install dependencies",
+            "kind": "shell",
+            "run": "npm ci",
+            "timeout": 900,
+            "env": {},
+            "only_on": []
+          },
+          {
+            "name": "act · CI",
+            "kind": "act",
+            "workflow": ".github/workflows/ci.yml",
+            "job": "web",
+            "event": "push",
+            "platforms": {
+              "ubuntu-latest": "catthehacker/ubuntu:act-latest"
+            },
+            "args": [
+              "--pull=false"
+            ],
+            "secrets": {
+              "GITHUB_TOKEN": "********"
+            },
+            "vars": {},
+            "only_on": []
+          },
+          {
+            "name": "Package for Windows",
+            "kind": "shell",
+            "run": "cargo build --release --target x86_64-pc-windows-gnu",
+            "timeout": 1800,
+            "env": {},
+            "only_on": [
+              "windows"
+            ]
+          }
+        ],
+        "deploy": [
+          {
+            "name": "Sync to the edge",
+            "kind": "shell",
+            "run": "rsync -az --delete ui/dist/ edge:/srv/lunarum/",
+            "timeout": 300,
+            "env": {},
+            "only_on": []
+          }
+        ]
+      },
+      {
+        "name": "dotfiles",
+        "repo_path": "/home/you/src/dotfiles",
+        "remote": "origin",
+        "branch": "main",
+        "github_repo": "teppyboy/dotfiles",
+        "checkout": "none",
+        "poll_interval": 300,
+        "env": {},
+        "ci": [
+          {
+            "name": "Validate zsh config",
+            "kind": "shell",
+            "run": "zsh -n zsh/.zshrc",
+            "timeout": 60,
+            "env": {},
+            "only_on": []
+          }
+        ],
+        "deploy": [
+          {
+            "name": "Install dotfiles",
+            "kind": "shell",
+            "run": "./install.sh --force",
+            "timeout": 120,
+            "env": {},
+            "only_on": [
+              "linux",
+              "macos"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "blog",
+        "repo_path": "/home/you/src/blog",
+        "remote": "origin",
+        "branch": "main",
+        "github_repo": null,
+        "checkout": "none",
+        "env": {},
+        "ci": [],
+        "deploy": []
+      }
+    ]
+  }
+}

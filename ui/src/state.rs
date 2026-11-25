@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use rune::{Latest, TextEdit, Tx};
+#[cfg(not(target_arch = "wasm32"))]
+use rune::Latest;
+use rune::{TextEdit, Tx};
 use serde_json::Value;
 
 use crate::api::{self, Answer, Call};
@@ -221,6 +223,7 @@ pub type Outcome = Result<Answer, Failure>;
 
 /// The request layer: fire a `Call`, drain the answers later. Never blocks the UI thread.
 pub struct Bus {
+    #[cfg(not(target_arch = "wasm32"))]
     latest: [Latest<(Call, Outcome)>; SLOTS],
     #[cfg(target_arch = "wasm32")]
     handle: Option<rune::AppHandle<State>>,
@@ -235,6 +238,7 @@ pub struct Bus {
 impl Default for Bus {
     fn default() -> Self {
         Bus {
+            #[cfg(not(target_arch = "wasm32"))]
             latest: std::array::from_fn(|_| Latest::default()),
             #[cfg(target_arch = "wasm32")]
             handle: None,
@@ -273,10 +277,18 @@ impl Bus {
         }
     }
 
-    pub fn cancel(&self) {
+    pub fn cancel(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         for latest in &self.latest {
             latest.cancel();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for s in &mut self.seq {
+                self.next += 1;
+                *s = self.next;
+            }
+            self.live = [0; SLOTS];
         }
     }
 
@@ -310,7 +322,7 @@ impl Bus {
                         return false;
                     }
                     s.bus.live[index] = 0;
-                    s.answer(call, out, tx)
+                    s.wants(&call) && s.answer(call, out, tx)
                 });
             });
         }
@@ -318,14 +330,20 @@ impl Bus {
 
     /// Every answer that landed since the last drain.
     fn drain(&self) -> Vec<(Call, Outcome)> {
-        let mut out = Vec::new();
         #[cfg(not(target_arch = "wasm32"))]
-        for latest in &self.latest {
-            while let Some(answer) = latest.take() {
-                out.push(answer);
+        {
+            let mut out = Vec::new();
+            for latest in &self.latest {
+                while let Some(answer) = latest.take() {
+                    out.push(answer);
+                }
             }
+            out
         }
-        out
+        #[cfg(target_arch = "wasm32")]
+        {
+            Vec::new()
+        }
     }
 }
 
@@ -571,6 +589,12 @@ impl Editor {
         self.text.insert(path.to_string(), edit);
     }
 
+    /// Records the seed value corresponding to an active edit so `text_for` does not reset the
+    /// cursor when `on_change` writes back to `draft`.
+    pub fn sync_seeded(&mut self, path: &str, seeded: String) {
+        self.seeded.insert(path.to_string(), seeded);
+    }
+
     /// Rebuilds every field from the draft (after a load, a save or a discard).
     pub fn reseed(&mut self) {
         self.forget_text();
@@ -586,6 +610,10 @@ impl Editor {
 
     pub fn set_str(&mut self, path: &str, s: &str) {
         paths::set_opt_str(&mut self.draft, path, s);
+    }
+
+    pub fn set_str_mode(&mut self, path: &str, s: &str, optional: bool) {
+        paths::set_str(&mut self.draft, path, s, optional);
     }
 
     pub fn count(&self, path: &str) -> usize {
@@ -626,7 +654,7 @@ pub struct State {
     pub system_error: Option<String>,
 
     pub toasts: Vec<Toast>,
-    next_toast: u64,
+    pub(crate) next_toast: u64,
     /// A "Run now" in flight, by project.
     pub triggering: Option<String>,
     /// The force toggle beside "Run now".
@@ -646,6 +674,8 @@ pub struct State {
     pub clock: f64,
     /// Set after the first frame, so network work starts once there is something to show.
     pub ready: bool,
+    /// True for static `--scene` fixtures: keeps `poll` from talking to any network daemon.
+    pub demo: bool,
 }
 
 impl State {
@@ -690,6 +720,7 @@ impl State {
             asked_system: false,
             clock: 0.0,
             ready: false,
+            demo: false,
         };
         state.ui_server = TextEdit::new(state.conn.server.clone());
         state.ui_token = TextEdit::new(state.conn.token.clone());
@@ -704,17 +735,29 @@ impl State {
     /// Adopts the settings fields' URL and token and refreshes everything.
     pub fn reconnect(&mut self, tx: &mut Tx) {
         // The Connection fields edit `ui_*`; take what the user typed.
+        let prev_server = self.live.server.clone();
         self.conn = conn_from_fields(&self.ui_server.text, &self.ui_token.text);
         self.live = self.conn.clone();
         self.live.server = normalize_server(&self.live.server);
         store_token(&self.live.token);
         self.link = Link::Connecting;
+        self.demo = false;
         self.loaded = false;
         self.projects_error = None;
         self.run_error = None;
         self.runs_error = None;
         self.system_error = None;
+        if self.live.server != prev_server {
+            self.projects.clear();
+            self.runs.clear();
+            self.runs_for = None;
+            self.run = None;
+            self.open_step = None;
+            self.logs.clear();
+            self.system = None;
+        }
         self.editor = Editor {
+            page: self.editor.page,
             text: HashMap::new(),
             ..Editor::default()
         };
@@ -722,6 +765,7 @@ impl State {
         self.next_projects = 0.0;
         self.next_runs = 0.0;
         self.next_run = 0.0;
+        self.next_log = 0.0;
         self.next_system = 0.0;
         self.asked_system = false;
         self.request_projects();
@@ -1068,6 +1112,13 @@ impl State {
             }
             Answer::Run(run) => {
                 let open = self.open_step.filter(|i| *i < run.steps.len());
+                let step_finished = open.is_some_and(|idx| {
+                    self.run
+                        .as_ref()
+                        .and_then(|r| r.steps.get(idx))
+                        .is_some_and(|s| s.status.is_live())
+                        && !run.steps[idx].status.is_live()
+                });
                 let changed = self
                     .run
                     .as_ref()
@@ -1076,8 +1127,19 @@ impl State {
                 self.open_step = open;
                 self.run = Some(*run);
                 self.run_error = None;
-                self.request_next_log();
-                changed
+                if step_finished {
+                    if let (Some(r), Some(idx)) = (self.run.clone(), open) {
+                        let mode = self
+                            .logs
+                            .get(&(r.id.clone(), idx))
+                            .and_then(|e| e.mode)
+                            .unwrap_or(LogMode::Tail);
+                        self.request_log(&r.id, idx, mode);
+                    }
+                } else {
+                    self.request_next_log();
+                }
+                changed || step_finished
             }
             Answer::Log {
                 run,
@@ -1108,7 +1170,10 @@ impl State {
             }
             Answer::Triggered => {
                 self.triggering = None;
-                let project = self.current_project_name().unwrap_or_default();
+                let project = match &call {
+                    Call::Trigger { project, .. } => project.clone(),
+                    _ => self.current_project_name().unwrap_or_default(),
+                };
                 self.toast(
                     tx,
                     ToastKind::Success,
@@ -1142,12 +1207,15 @@ impl State {
                 self.editor.new_project = false;
                 self.editor.loaded = true;
                 self.after_draft_change();
-                self.toast(
-                    tx,
-                    ToastKind::Success,
-                    "Config saved",
-                    "Written to config.toml; idle workers reloaded. Running pipelines finish on the old config.",
-                );
+                let body = if outcome.restart_required.is_empty() {
+                    "Written to config.toml; idle workers reloaded. Running pipelines finish on the old config.".to_string()
+                } else {
+                    format!(
+                        "Written to config.toml; restart needed for {}.",
+                        outcome.restart_required.join(", ")
+                    )
+                };
+                self.toast(tx, ToastKind::Success, "Config saved", &body);
                 true
             }
             Answer::System(info) => {
@@ -1200,7 +1268,9 @@ impl State {
 
     fn load_workflows_for(&mut self, project: usize, path: &str) {
         let name = self.editor.s(&format!("project[{project}].name"));
-        self.request_workflows(path, name, None);
+        let repo_path = self.editor.s(&format!("project[{project}].repo_path"));
+        let repo_path = (!repo_path.trim().is_empty()).then_some(repo_path);
+        self.request_workflows(path, name, repo_path);
     }
 
     /// Each answer's `Call` is chosen by the requesting code, except a read the daemon answers
@@ -1228,7 +1298,7 @@ impl State {
         };
         let entry = self.logs.get(&(run.id.clone(), index));
         let live = step.status.is_live();
-        let stale = !live || self.clock >= self.next_log;
+        let stale = live && self.clock >= self.next_log;
         if entry.is_some() && !stale {
             return;
         }
@@ -1244,10 +1314,19 @@ impl State {
         self.clock = clock;
         let mut changed = false;
 
+        if self.demo {
+            if !self.toasts.is_empty() {
+                let before = self.toasts.len();
+                self.toasts.retain(|t| t.until > self.clock);
+                changed |= before != self.toasts.len();
+            }
+            return changed;
+        }
+
         for (call, result) in self.bus.drain() {
-            let wanted = self.wants(&call);
-            let applied = self.answer(call, result, tx);
-            changed |= wanted && applied;
+            if self.wants(&call) {
+                changed |= self.answer(call, result, tx);
+            }
         }
 
         // `poll` runs only after the first frame, which is exactly when a live window may start
@@ -1485,9 +1564,11 @@ impl State {
     }
 
     pub fn duplicate_project(&mut self, i: usize, tx: &mut Tx) {
-        let Some(source) = paths::get(&self.editor.draft, &format!("project[{i}]")).cloned() else {
+        let Some(mut source) = paths::get(&self.editor.draft, &format!("project[{i}]")).cloned()
+        else {
             return;
         };
+        scrub_masked_project_secrets(&mut source);
         let n = self.editor.count("project");
         paths::set(&mut self.editor.draft, &format!("project[{n}]"), source);
         let name = self.editor.s(&format!("project[{n}].name"));
@@ -1497,6 +1578,7 @@ impl State {
             &format!("{name}-copy"),
         );
         self.editor.project = Some(n);
+        self.editor.new_project = true;
         self.editor.reseed();
         self.refresh(tx);
     }
@@ -1514,6 +1596,7 @@ impl State {
         };
         self.editor.confirm_delete = None;
         self.editor.new_project = false;
+        self.editor.workflows_for = None;
         self.editor.reseed();
         self.refresh(tx);
     }
@@ -1532,6 +1615,7 @@ impl State {
                     other => other,
                 };
                 // Field text follows its project, so a swap must not leave stale values behind.
+                self.editor.workflows_for = None;
                 self.editor.reseed();
             }
         }
@@ -1561,6 +1645,9 @@ impl State {
         );
         self.editor.step = Some((project, deploy, n));
         self.editor.reseed();
+        if act {
+            self.load_workflows_for(project, &step_path(project, deploy, n));
+        }
         self.refresh(tx);
     }
 
@@ -1572,6 +1659,7 @@ impl State {
             }
         }
         self.editor.step = None;
+        self.editor.workflows_for = None;
         self.editor.reseed();
         self.refresh(tx);
     }
@@ -1597,6 +1685,7 @@ impl State {
                     Some((p, d, s)) if p == project && d == deploy && s == j => Some((p, d, i)),
                     other => other,
                 };
+                self.editor.workflows_for = None;
                 self.editor.reseed();
             }
         }
@@ -1618,6 +1707,7 @@ impl State {
         self.editor.draft = self.editor.base.clone();
         self.editor.error = None;
         self.editor.field = None;
+        self.editor.workflows_for = None;
         self.editor.reseed();
         self.toast(
             tx,
@@ -1625,6 +1715,32 @@ impl State {
             "Changes discarded",
             "The form shows the saved config again.",
         );
+    }
+}
+
+/// Drops or blanks masked `"********"` secrets in a duplicated project so saving the copy does not
+/// persist literal placeholder text (the daemon only unmasks by matching an existing project).
+fn scrub_masked_project_secrets(project: &mut Value) {
+    let Some(obj) = project.as_object_mut() else {
+        return;
+    };
+    if obj.get("discord_webhook_url").and_then(Value::as_str) == Some(crate::config::MASK) {
+        obj.remove("discord_webhook_url");
+    }
+    for phase in ["ci", "deploy"] {
+        let Some(steps) = obj.get_mut(phase).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for step in steps {
+            let Some(secrets) = step.get_mut("secrets").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for val in secrets.values_mut() {
+                if val.as_str() == Some(crate::config::MASK) {
+                    *val = Value::String(String::new());
+                }
+            }
+        }
     }
 }
 
@@ -1727,6 +1843,102 @@ mod tests {
         assert_eq!(e.s("server.listen"), "0.0.0.0:1");
         e.draft = e.base.clone();
         assert!(!e.dirty());
+    }
+
+    #[test]
+    fn trigger_toast_names_project_from_projects_view() {
+        let mut s = State::new(Conn {
+            server: "127.0.0.1:7990".into(),
+            token: "tok".into(),
+        });
+        let mut tx = Tx::default();
+        s.apply(
+            Call::Trigger {
+                project: "alpha".into(),
+                force: false,
+            },
+            Answer::Triggered,
+            &mut tx,
+        );
+        assert_eq!(s.toasts.len(), 1);
+        assert_eq!(s.toasts[0].title, "Queued");
+        assert!(
+            s.toasts[0].body.starts_with("alpha:"),
+            "got toast body {:?}",
+            s.toasts[0].body
+        );
+    }
+
+    #[test]
+    fn finished_step_logs_do_not_repoll_until_explicit() {
+        use crate::model::{Phase, Run, RunStatus, Step, StepKind, StepStatus};
+
+        let mut s = State::new(Conn::default());
+        let mut tx = Tx::default();
+        s.open_run("r1", &mut tx);
+        s.open_step = Some(0);
+        s.run = Some(Run {
+            id: "r1".into(),
+            project: "alpha".into(),
+            status: RunStatus::Success,
+            steps: vec![Step {
+                phase: Phase::Ci,
+                name: "Build".into(),
+                status: StepStatus::Success,
+                kind: StepKind::Shell,
+                ..Step::default()
+            }],
+            ..Run::default()
+        });
+        s.logs.insert(
+            ("r1".into(), 0),
+            LogState {
+                text: "done\n".into(),
+                loading: false,
+                error: None,
+                mode: Some(LogMode::Tail),
+            },
+        );
+        s.clock = 100.0;
+        s.next_log = 10.0;
+        s.request_next_log();
+        // Because the step is finished and already has an entry, next_log stays untouched.
+        assert_eq!(s.next_log, 10.0);
+    }
+
+    #[test]
+    fn duplicate_project_scrubs_masked_secrets_and_marks_new() {
+        let mut s = State::new(Conn::default());
+        let mut tx = Tx::default();
+        s.editor.loaded = true;
+        s.editor.base = serde_json::json!({
+            "project": [{
+                "name": "alpha",
+                "branch": "master",
+                "repo_path": "/tmp/alpha",
+                "discord_webhook_url": crate::config::MASK,
+                "ci": [{
+                    "name": "CI",
+                    "kind": "act",
+                    "workflow": ".github/workflows/ci.yml",
+                    "secrets": {"MY_SECRET": crate::config::MASK, "RAW": "plain"}
+                }]
+            }]
+        });
+        s.editor.draft = s.editor.base.clone();
+        s.duplicate_project(0, &mut tx);
+        assert!(s.editor.new_project);
+        assert_eq!(s.editor.project, Some(1));
+        assert_eq!(s.editor.s("project[1].name"), "alpha-copy");
+        assert!(paths::get(&s.editor.draft, "project[1].discord_webhook_url").is_none());
+        assert_eq!(
+            paths::get_str(&s.editor.draft, "project[1].ci[0].secrets.MY_SECRET"),
+            ""
+        );
+        assert_eq!(
+            paths::get_str(&s.editor.draft, "project[1].ci[0].secrets.RAW"),
+            "plain"
+        );
     }
 }
 

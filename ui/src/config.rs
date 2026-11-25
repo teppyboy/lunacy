@@ -267,6 +267,9 @@ pub struct ConfigOutcome {
     pub ok: Option<bool>,
     #[serde(default)]
     pub reloaded: Option<bool>,
+    /// Fields whose change requires restarting the daemon (stripped from `config.extra`).
+    #[serde(default)]
+    pub restart_required: Vec<String>,
 }
 
 /// Splits a `shell`-style argv string the way a shell-less command line would: whitespace
@@ -369,7 +372,7 @@ mod tests {
             cfg.general.extra.get("log_level").and_then(Value::as_str),
             Some("debug")
         );
-        assert_eq!(cfg.projects[0].extra.get("contexts").is_some(), true);
+        assert!(cfg.projects[0].extra.get("contexts").is_some());
         assert_eq!(
             cfg.projects[0].ci[0]
                 .extra
@@ -409,12 +412,29 @@ mod tests {
     #[test]
     fn every_editable_field_survives_the_mask_rule() {
         // A secret the daemon masked goes back verbatim, which the daemon reads as "keep".
-        let mut cfg = Config::default();
-        cfg.github = Some(Github {
-            token: Some(MASK.into()),
-            ..Github::default()
-        });
+        let cfg = Config {
+            github: Some(Github {
+                token: Some(MASK.into()),
+                ..Github::default()
+            }),
+            ..Config::default()
+        };
         let json = serde_json::to_value(&cfg).unwrap();
         assert_eq!(json["github"]["token"], MASK);
+    }
+
+    #[test]
+    fn restart_required_is_stripped_from_saved_config() {
+        let payload = serde_json::json!({
+            "general": {"poll_interval": 300, "log_level": "info"},
+            "server": {"listen": "127.0.0.1:7878", "token": "********"},
+            "project": [],
+            "restart_required": ["server.listen"]
+        });
+        let outcome: ConfigOutcome = serde_json::from_value(payload).unwrap();
+        assert_eq!(outcome.restart_required, vec!["server.listen"]);
+        assert!(!outcome.config.extra.contains_key("restart_required"));
+        let back = serde_json::to_value(&outcome.config).unwrap();
+        assert!(back.get("restart_required").is_none());
     }
 }

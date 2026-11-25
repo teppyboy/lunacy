@@ -182,6 +182,8 @@ pub struct Project {
     pub current_run: Option<Run>,
     #[serde(default)]
     pub last_run: Option<Run>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 impl Project {
@@ -244,6 +246,8 @@ pub struct SystemInfo {
     pub version: String,
     #[serde(default)]
     pub config_path: String,
+    #[serde(default)]
+    pub state_dir: Option<String>,
     #[serde(default)]
     pub act: ToolInfo,
     #[serde(default)]

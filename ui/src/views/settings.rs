@@ -135,7 +135,8 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32) -> El {
                     .control_size(ControlSize::Small)
                     .disabled(!dirty)
                     .on_press_tx(|s: &mut State, tx: &mut Tx| s.discard(tx))
-                    .build(k),
+                    .build(k)
+                    .key("settings-discard"),
             )
             .child(
                 Button::new(if e.saving { "Saving…" } else { "Save" })
@@ -145,7 +146,8 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32) -> El {
                     .shortcut("cmd+s")
                     .show_shortcut()
                     .on_press_tx(|s: &mut State, _tx: &mut Tx| s.save())
-                    .build(k),
+                    .build(k)
+                    .key("settings-save"),
             );
     }
     bar
@@ -205,14 +207,15 @@ fn general(s: &State, k: &Kit) -> El {
         "State directory",
         Some("Run history and logs live here. Empty uses the platform's data directory."),
     ));
-    c = c.child(text_field(
+    c = c.child(u64_field(
         s,
         k,
         "general.poll_interval",
         "Poll interval (seconds)",
         Some("How often each project's remote is fetched. A project may override it."),
+        true,
     ));
-    c = c.child(text_field(
+    c = c.child(argv_field(
         s,
         k,
         "general.shell",
@@ -285,7 +288,8 @@ fn github(s: &State, k: &Kit) -> El {
                     .set_str("github.mode", if picked == 0 { "checks" } else { "status" });
                 tx.instant();
             })
-            .build(k),
+            .build(k)
+            .key("github-mode"),
     ));
     c = c.child(secret_field(
         s,
@@ -297,20 +301,21 @@ fn github(s: &State, k: &Kit) -> El {
 
     c = c.child(widgets::divider(k));
     c = c.child(widgets::section(k, "GitHub App", Some("Optional. The App's installation writes check runs, which the UI links as \"View on GitHub\".")));
-    c = c.child(text_field(s, k, "github.app.app_id", "App ID", None));
-    c = c.child(secret_field(
+    c = c.child(u64_field(s, k, "github.app.app_id", "App ID", None, false));
+    c = c.child(pem_secret_field(
         s,
         k,
         "github.app.private_key",
         "Private key",
         Some("The multi-line PEM from the App's settings page."),
     ));
-    c = c.child(text_field(
+    c = c.child(u64_field(
         s,
         k,
         "github.app.installation_id",
         "Installation ID",
         None,
+        false,
     ));
     c = c.child(secret_field(
         s,
@@ -339,6 +344,7 @@ fn discord(s: &State, k: &Kit) -> El {
     ));
     c = c.child(toggle_row(
         k,
+        "discord-notify-on-start",
         "Notify on start",
         Some("Also post when a run begins, not only when it ends."),
         crate::paths::get_bool(&e.draft, "discord.notify_on_start"),
@@ -355,26 +361,26 @@ fn act(s: &State, k: &Kit) -> El {
     let e = &s.editor;
     let mut c = col().w_full().gap(18.0);
     c = c.child(widgets::section(k, "act", Some("The runner for GitHub Actions steps: how it is invoked and which image each `runs-on` maps to.")));
-    c = c.child(text_field(
+    c = c.child(argv_field(
         s,
         k,
         "act.command",
         "Command",
         Some("Usually just `act`. Use `wsl.exe -e act` on Windows to run it inside WSL."),
     ));
-    c = c.child(text_field(
+    c = c.child(list_field(
         s,
         k,
         "act.args",
         "Extra arguments",
         Some("One per line, e.g. `--pull=false`."),
     ));
-    c = c.child(text_field(
+    c = c.child(table_field(
         s,
         k,
         "act.platforms",
         "Platforms",
-        Some("`runs-on: image`, one per line. Unlisted labels use act's own default image."),
+        Some("`runs-on=image`, one per line. Unlisted labels use act's own default image."),
     ));
     c = c.child(text_field(
         s,
@@ -391,7 +397,7 @@ fn act(s: &State, k: &Kit) -> El {
 }
 
 /// A text field bound to a config path, with inline error and help.
-fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
+pub(crate) fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
     let seeded = crate::paths::get_str(&s.editor.draft, path);
     let edit = s
         .editor
@@ -419,23 +425,190 @@ fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -
                 .get(&owner)
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
-            let was_empty = text.trim().is_empty();
-            s.editor.set_str(&owner, &text);
             let optional = is_optional(&owner);
-            if optional && was_empty {
-                crate::paths::set(&mut s.editor.draft, &owner, serde_json::Value::Null);
-            }
+            s.editor.set_str_mode(&owner, &text, optional);
+            let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
+            s.editor.sync_seeded(&owner, now_seeded);
             tx.instant();
         })
         .build(k);
-    let mut f = Field::new().label(label).control(input);
+    let mut f = Field::new().label(label).control(input.key("control"));
     if let Some(help) = help {
         f = f.prefix(help);
     }
     if let Some(error) = error {
         f = f.suffix(error);
     }
-    f.build(k)
+    f.build(k).key(format!("field-{path}"))
+}
+
+/// An unsigned integer field bound to a config path (`u64` or `Option<u64>`).
+pub(crate) fn u64_field(
+    s: &State,
+    k: &Kit,
+    path: &str,
+    label: &str,
+    help: Option<&str>,
+    required_zero: bool,
+) -> El {
+    let seeded = crate::paths::get_str(&s.editor.draft, path);
+    let edit = s
+        .editor
+        .text
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| TextEdit::new(seeded.clone()));
+    let invalid = s.editor.invalid(path);
+    let error = s.editor.error_for(path).map(str::to_string);
+    let owner = path.to_string();
+    let field = path.to_string();
+    let input = TextInput::new(&edit)
+        .label(label)
+        .placeholder(label)
+        .width(None)
+        .invalid(invalid)
+        .on_edit(move |s: &mut State| {
+            let seeded = crate::paths::get_str(&s.editor.draft, &field);
+            s.editor.text_for(&field, seeded)
+        })
+        .on_change(move |s: &mut State, tx: &mut Tx| {
+            let text = s
+                .editor
+                .text
+                .get(&owner)
+                .map(|e| e.text.clone())
+                .unwrap_or_default();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                let n = required_zero.then_some(0);
+                crate::paths::set_u64(&mut s.editor.draft, &owner, n);
+            } else if let Ok(n) = trimmed.parse::<u64>() {
+                crate::paths::set_u64(&mut s.editor.draft, &owner, Some(n));
+            } else {
+                crate::paths::set(
+                    &mut s.editor.draft,
+                    &owner,
+                    serde_json::Value::String(trimmed.to_string()),
+                );
+            }
+            prune_github_if_empty(&mut s.editor.draft, &owner);
+            let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
+            s.editor.sync_seeded(&owner, now_seeded);
+            tx.instant();
+        })
+        .build(k);
+    let mut f = Field::new().label(label).control(input.key("control"));
+    if let Some(help) = help {
+        f = f.prefix(help);
+    }
+    if let Some(error) = error {
+        f = f.suffix(error);
+    }
+    f.build(k).key(format!("field-{path}"))
+}
+
+/// An argv array field (`Option<Vec<String>>`), formatted with `join_argv` and parsed with `split_argv`.
+pub(crate) fn argv_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
+    let seeded = crate::config::join_argv(&argv_vec(&s.editor.draft, path));
+    let edit = s
+        .editor
+        .text
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| TextEdit::new(seeded.clone()));
+    let invalid = s.editor.invalid(path);
+    let error = s.editor.error_for(path).map(str::to_string);
+    let owner = path.to_string();
+    let field = path.to_string();
+    let input = TextInput::new(&edit)
+        .label(label)
+        .placeholder(label)
+        .width(None)
+        .invalid(invalid)
+        .on_edit(move |s: &mut State| {
+            let seeded = crate::config::join_argv(&argv_vec(&s.editor.draft, &field));
+            s.editor.text_for(&field, seeded)
+        })
+        .on_change(move |s: &mut State, tx: &mut Tx| {
+            let text = s
+                .editor
+                .text
+                .get(&owner)
+                .map(|e| e.text.clone())
+                .unwrap_or_default();
+            let argv = crate::config::split_argv(&text);
+            if argv.is_empty() {
+                crate::paths::set(&mut s.editor.draft, &owner, serde_json::Value::Null);
+            } else {
+                let items = argv.into_iter().map(serde_json::Value::String).collect();
+                crate::paths::set(&mut s.editor.draft, &owner, serde_json::Value::Array(items));
+            }
+            let now_seeded = crate::config::join_argv(&argv_vec(&s.editor.draft, &owner));
+            s.editor.sync_seeded(&owner, now_seeded);
+            tx.instant();
+        })
+        .build(k);
+    let mut f = Field::new().label(label).control(input.key("control"));
+    if let Some(help) = help {
+        f = f.prefix(help);
+    }
+    if let Some(error) = error {
+        f = f.suffix(error);
+    }
+    f.build(k).key(format!("field-{path}"))
+}
+
+fn argv_vec(v: &serde_json::Value, path: &str) -> Vec<String> {
+    crate::paths::array(v, path)
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect()
+}
+
+/// A line-per-item `Vec<String>` list bound to a config path.
+pub(crate) fn list_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
+    let seeded = crate::paths::get_list_text(&s.editor.draft, path);
+    let edit = s
+        .editor
+        .text
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| TextEdit::new(seeded.clone()));
+    let invalid = s.editor.invalid(path);
+    let error = s.editor.error_for(path).map(str::to_string);
+    let owner = path.to_string();
+    let field = path.to_string();
+    let input = TextArea::new(&edit)
+        .label(label)
+        .width(None)
+        .rows(2)
+        .auto_grow(2, 8)
+        .invalid(invalid)
+        .on_edit(move |s: &mut State| {
+            let seeded = crate::paths::get_list_text(&s.editor.draft, &field);
+            s.editor.text_for(&field, seeded)
+        })
+        .on_change(move |s: &mut State, tx: &mut Tx| {
+            let text = s
+                .editor
+                .text
+                .get(&owner)
+                .map(|e| e.text.clone())
+                .unwrap_or_default();
+            crate::paths::set_list(&mut s.editor.draft, &owner, &text);
+            let now_seeded = crate::paths::get_list_text(&s.editor.draft, &owner);
+            s.editor.sync_seeded(&owner, now_seeded);
+            tx.instant();
+        })
+        .build(k);
+    let mut f = Field::new().label(label).control(input.key("control"));
+    if let Some(help) = help {
+        f = f.prefix(help);
+    }
+    if let Some(error) = error {
+        f = f.suffix(error);
+    }
+    f.build(k).key(format!("field-{path}"))
 }
 
 /// A masked secret field: `********` means "keep what is stored".
@@ -474,11 +647,66 @@ fn secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>)
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             s.editor.set_str(&owner, &text);
+            prune_github_if_empty(&mut s.editor.draft, &owner);
+            let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
+            s.editor.sync_seeded(&owner, now_seeded);
             tx.instant();
         })
         .build(k);
-    let _ = stored;
-    let mut f = Field::new().label(label).control(input);
+    secret_field_wrap(k, path, label, help, stored, error, input)
+}
+
+/// Multi-line secret area (for PEM keys where newlines must survive editing).
+fn pem_secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
+    let seeded = crate::paths::get_str(&s.editor.draft, path);
+    let stored = seeded == crate::config::MASK;
+    let edit = s
+        .editor
+        .text
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| TextEdit::new(seeded.clone()));
+    let invalid = s.editor.invalid(path);
+    let error = s.editor.error_for(path).map(str::to_string);
+    let owner = path.to_string();
+    let field = path.to_string();
+    let input = TextArea::new(&edit)
+        .label(label)
+        .width(None)
+        .rows(3)
+        .auto_grow(2, 10)
+        .invalid(invalid)
+        .on_edit(move |s: &mut State| {
+            let seeded = crate::paths::get_str(&s.editor.draft, &field);
+            s.editor.text_for(&field, seeded)
+        })
+        .on_change(move |s: &mut State, tx: &mut Tx| {
+            let text = s
+                .editor
+                .text
+                .get(&owner)
+                .map(|e| e.text.clone())
+                .unwrap_or_default();
+            s.editor.set_str(&owner, &text);
+            prune_github_if_empty(&mut s.editor.draft, &owner);
+            let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
+            s.editor.sync_seeded(&owner, now_seeded);
+            tx.instant();
+        })
+        .build(k);
+    secret_field_wrap(k, path, label, help, stored, error, input)
+}
+
+fn secret_field_wrap(
+    k: &Kit,
+    path: &str,
+    label: &str,
+    help: Option<&str>,
+    stored: bool,
+    error: Option<String>,
+    input: El,
+) -> El {
+    let mut f = Field::new().label(label).control(input.key("control"));
     let note = match (stored, help) {
         (true, Some(h)) => format!(
             "{h} A stored secret shows as `********`; leave it to keep it, or type a new one."
@@ -496,32 +724,27 @@ fn secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>)
     if let Some(error) = error {
         f = f.suffix(error);
     }
-    f.build(k)
+    f.build(k).key(format!("field-{path}"))
+}
+
+fn prune_github_if_empty(draft: &mut serde_json::Value, path: &str) {
+    if path.starts_with("github.app.") {
+        crate::paths::prune_empty_object(draft, "github.app");
+    }
+    if path.starts_with("github.") {
+        crate::paths::prune_empty_object(draft, "github");
+    }
 }
 
 /// Optional config fields: an empty value is removed rather than stored as `""`.
 fn is_optional(path: &str) -> bool {
-    matches!(
-        path,
-        "general.state_dir"
-            | "general.shell"
-            | "server.public_url"
-            | "server.web_root"
-            | "server.token"
-            | "github.mode"
-            | "github.token"
-            | "github.app.private_key"
-            | "github.app.webhook_secret"
-            | "github.app.installation_id"
-            | "github.app.app_id"
-            | "discord.webhook_url"
-            | "act.command"
-            | "act.lock_file"
-    )
+    !matches!(path, "server.listen")
+        && !matches!(crate::paths::leaf(path), "name" | "branch" | "repo_path")
 }
 
 fn toggle_row(
     k: &Kit,
+    key: &str,
     label: &str,
     help: Option<&str>,
     on: bool,
@@ -551,7 +774,8 @@ fn toggle_row(
                 .label(label)
                 .hide_label()
                 .on_toggle_tx(flip)
-                .build(k),
+                .build(k)
+                .key(key),
         )
 }
 
@@ -560,7 +784,22 @@ fn toggle_row(
 
 fn projects_list(s: &State, k: &Kit) -> El {
     let e = &s.editor;
+    if !e.loaded {
+        return widgets::empty_state(
+            k,
+            "Reading the config…",
+            "The daemon has not answered yet. Check the connection in the banner.",
+        );
+    }
     let mut c = col().w_full().px(22.0).py(18.0).gap(12.0);
+    if let Some(field) = &e.field {
+        let message = e.error.clone().unwrap_or_default();
+        c = c.child(widgets::notice(
+            k,
+            theme::status(k).failure,
+            &format!("{field}: {message}"),
+        ));
+    }
     c = c.child(widgets::section(
         k,
         "Projects",
@@ -584,7 +823,8 @@ fn projects_list(s: &State, k: &Kit) -> El {
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Regular)
                 .on_press_tx(|s: &mut State, tx: &mut Tx| s.add_project(tx))
-                .build(k),
+                .build(k)
+                .key("projects-add"),
         ),
     );
     c
@@ -642,7 +882,8 @@ fn project_card(s: &State, k: &Kit, i: usize) -> El {
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_project_form(Some(i), tx))
-                .build(k),
+                .build(k)
+                .key(format!("project-edit-{i}")),
         );
     let _ = card;
     card
@@ -656,14 +897,16 @@ fn up_down(k: &Kit, i: usize) -> El {
                 .label("Move up")
                 .control_size(ControlSize::Small)
                 .on_press_tx(move |s: &mut State, tx: &mut Tx| s.move_project(i, false, tx))
-                .build(k),
+                .build(k)
+                .key(format!("project-up-{i}")),
         )
         .child(
             rune_kit::IconButton::new(&rune_kit::glyphs::CHEVRON_DOWN)
                 .label("Move down")
                 .control_size(ControlSize::Small)
                 .on_press_tx(move |s: &mut State, tx: &mut Tx| s.move_project(i, true, tx))
-                .build(k),
+                .build(k)
+                .key(format!("project-down-{i}")),
         )
 }
 
@@ -671,6 +914,13 @@ fn up_down(k: &Kit, i: usize) -> El {
 fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
     let _ = cx;
     let e = &s.editor;
+    if !e.loaded {
+        return widgets::empty_state(
+            k,
+            "Reading the config…",
+            "The daemon has not answered yet. Check the connection in the banner.",
+        );
+    }
     let Some(i) = e.project else {
         return projects_list(s, k);
     };
@@ -682,6 +932,15 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
         .py(18.0)
         .gap(20.0);
 
+    if let Some(field) = &e.field {
+        let message = e.error.clone().unwrap_or_default();
+        c = c.child(widgets::notice(
+            k,
+            theme::status(k).failure,
+            &format!("{field}: {message}"),
+        ));
+    }
+
     c = c.child(
         row()
             .w_full()
@@ -692,7 +951,8 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
                     .variant(ButtonVariant::Ghost)
                     .control_size(ControlSize::Small)
                     .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_project_form(None, tx))
-                    .build(k),
+                    .build(k)
+                    .key("project-all"),
             )
             .child(el().grow(1.0))
             .child(
@@ -700,7 +960,8 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
                     .variant(ButtonVariant::Ghost)
                     .control_size(ControlSize::Small)
                     .on_press_tx(move |s: &mut State, tx: &mut Tx| s.duplicate_project(i, tx))
-                    .build(k),
+                    .build(k)
+                    .key("project-duplicate"),
             )
             .child(
                 Button::new("Delete")
@@ -710,7 +971,8 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
                         s.editor.confirm_delete = Some(i);
                         tx.instant();
                     })
-                    .build(k),
+                    .build(k)
+                    .key("project-delete"),
             ),
     );
 
@@ -740,14 +1002,16 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
                             s.editor.confirm_delete = None;
                             tx.instant();
                         })
-                        .build(k),
+                        .build(k)
+                        .key("project-delete-cancel"),
                 )
                 .child(
                     Button::new("Delete")
                         .variant(ButtonVariant::Danger)
                         .control_size(ControlSize::Small)
                         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.delete_project(i, tx))
-                        .build(k),
+                        .build(k)
+                        .key("project-delete-confirm"),
                 ),
         );
     }
@@ -804,12 +1068,13 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
                 ("in-place", "Reset in place"),
             ],
         ),
-        text_field(
+        u64_field(
             s,
             k,
             &format!("{base}.poll_interval"),
             "Poll interval (seconds)",
             Some("Empty uses the global interval."),
+            false,
         ),
     ));
     c = c.child(secret_field(
@@ -851,12 +1116,13 @@ fn select_field(s: &State, k: &Kit, path: &str, label: &str, options: &[(&str, &
             s.editor.set_str(&owner, picked);
             tx.instant();
         },
-    );
-    widgets::labelled(k, label, None, pick)
+    )
+    .key(format!("select-{path}"));
+    widgets::labelled(k, label, None, pick).key(format!("field-{path}"))
 }
 
 /// A `KEY=value`-per-line table bound to a config path.
-fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
+pub(crate) fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
     let seeded = crate::paths::get_table_text(&s.editor.draft, path);
     let edit = s
         .editor
@@ -883,14 +1149,16 @@ fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) 
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             crate::paths::set_table(&mut s.editor.draft, &owner, &text);
+            let now_seeded = crate::paths::get_table_text(&s.editor.draft, &owner);
+            s.editor.sync_seeded(&owner, now_seeded);
             tx.instant();
         })
         .build(k);
-    let mut f = Field::new().label(label).control(input);
+    let mut f = Field::new().label(label).control(input.key("control"));
     if let Some(help) = help {
         f = f.prefix(help);
     }
-    f.build(k)
+    f.build(k).key(format!("field-{path}"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -900,10 +1168,16 @@ fn connection_page(s: &State, k: &Kit) -> El {
     let mut c = col().w_full().px(22.0).py(18.0).gap(18.0);
     c = c.child(widgets::section(k, "Connection", Some("Where this window looks for the daemon. Not written to config.toml; in a browser the token is remembered for this site.")));
     c = c.child(widgets::pair(
-        text_input_bound(k, "Server URL", &s.ui_server, |s: &mut State| {
-            &mut s.ui_server
+        text_input_bound(
+            k,
+            "conn-server",
+            "Server URL",
+            &s.ui_server,
+            |s: &mut State| &mut s.ui_server,
+        ),
+        text_input_bound(k, "conn-token", "Token", &s.ui_token, |s: &mut State| {
+            &mut s.ui_token
         }),
-        text_input_bound(k, "Token", &s.ui_token, |s: &mut State| &mut s.ui_token),
     ));
     c = c.child(
         row()
@@ -914,7 +1188,8 @@ fn connection_page(s: &State, k: &Kit) -> El {
                     .variant(ButtonVariant::Submit)
                     .control_size(ControlSize::Regular)
                     .on_press_tx(|s: &mut State, tx: &mut Tx| s.reconnect(tx))
-                    .build(k),
+                    .build(k)
+                    .key("conn-connect"),
             )
             .children(
                 (cfg!(target_arch = "wasm32")).then_some(
@@ -925,7 +1200,8 @@ fn connection_page(s: &State, k: &Kit) -> El {
                             s.ui_server = TextEdit::new(crate::state::default_server());
                             tx.instant();
                         })
-                        .build(k),
+                        .build(k)
+                        .key("conn-origin"),
                 ),
             ),
     );
@@ -972,6 +1248,7 @@ fn connection_page(s: &State, k: &Kit) -> El {
 
 fn text_input_bound(
     k: &Kit,
+    key: &str,
     label: &str,
     edit: &TextEdit,
     access: fn(&mut State) -> &mut TextEdit,
@@ -982,5 +1259,9 @@ fn text_input_bound(
         .width(None)
         .on_edit(access)
         .build(k);
-    Field::new().label(label).control(input).build(k)
+    Field::new()
+        .label(label)
+        .control(input.key("control"))
+        .build(k)
+        .key(key)
 }

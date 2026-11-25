@@ -80,7 +80,8 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32) -> El {
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_projects(tx))
-                .build(k),
+                .build(k)
+                .key("project-back"),
         )
         .child(
             Button::new(if triggering { "Starting…" } else { "Run now" })
@@ -93,12 +94,17 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32) -> El {
                     "Queue a run for the current upstream commit"
                 })
                 .on_press_tx(move |s: &mut State, _tx: &mut Tx| s.trigger(&name))
-                .build(k),
+                .build(k)
+                .key("project-run-now"),
         )
 }
 
 fn body(s: &State, k: &Kit, project: &Project) -> El {
     let mut c = col().w_full().gap(18.0).pb(28.0);
+
+    if let Some(err) = &project.last_error {
+        c = c.child(widgets::notice(k, theme::status(k).error, err));
+    }
 
     if let Some(run) = &project.current_run {
         c = c.child(current_run(k, run));

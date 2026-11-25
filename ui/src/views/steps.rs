@@ -9,6 +9,7 @@ use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, Field, Kit, TextArea}
 
 use crate::state::{phase_key, step_path, State};
 use crate::theme;
+use crate::views::settings::{argv_field, list_field, table_field, text_field, u64_field};
 use crate::widgets;
 
 /// The hosts the daemon understands, in the order the chips show them.
@@ -43,6 +44,7 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool) -> El {
             c = c.child(step_form(s, k, project, deploy, i));
         }
     }
+    let phase_name = crate::state::phase_key(deploy);
     c = c.child(
         row()
             .w_full()
@@ -54,7 +56,8 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool) -> El {
                     .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                         s.add_step(project, deploy, false, tx)
                     })
-                    .build(k),
+                    .build(k)
+                    .key(format!("add-shell-{phase_name}")),
             )
             .child(
                 Button::new("Add act step")
@@ -63,7 +66,8 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool) -> El {
                     .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                         s.add_step(project, deploy, true, tx)
                     })
-                    .build(k),
+                    .build(k)
+                    .key(format!("add-act-{phase_name}")),
             ),
     );
 
@@ -99,8 +103,9 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
         }
     }
 
+    let phase_name = crate::state::phase_key(deploy);
     row()
-        .key(format!("step-row-{i}"))
+        .key(format!("step-row-{phase_name}-{i}"))
         .w_full()
         .padding(10.0)
         .gap(10.0)
@@ -170,7 +175,8 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
                         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                             s.move_step(project, deploy, i, false, tx)
                         })
-                        .build(k),
+                        .build(k)
+                        .key(format!("step-up-{phase_name}-{i}")),
                 )
                 .child(
                     rune_kit::IconButton::new(&glyphs::CHEVRON_DOWN)
@@ -179,7 +185,8 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
                         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                             s.move_step(project, deploy, i, true, tx)
                         })
-                        .build(k),
+                        .build(k)
+                        .key(format!("step-down-{phase_name}-{i}")),
                 )
                 .child(
                     rune_kit::IconButton::new(&glyphs::CLOSE)
@@ -188,7 +195,8 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
                         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                             s.remove_step(project, deploy, i, tx)
                         })
-                        .build(k),
+                        .build(k)
+                        .key(format!("step-remove-{phase_name}-{i}")),
                 ),
         )
 }
@@ -240,7 +248,8 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
                         s.editor.step = None;
                         tx.instant();
                     })
-                    .build(k),
+                    .build(k)
+                    .key("step-done"),
             ),
     );
 
@@ -269,12 +278,18 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
                     }
                     if s.editor.s(&format!("{kind_path}.workflow")).is_empty() {
                         let repo_project = s.editor.s(&format!("project[{project}].name"));
-                        s.request_workflows(&kind_path, repo_project, None);
+                        let repo_path = s.editor.s(&format!("project[{project}].repo_path"));
+                        s.request_workflows(
+                            &kind_path,
+                            repo_project,
+                            (!repo_path.trim().is_empty()).then_some(repo_path),
+                        );
                     }
                 }
                 tx.instant();
             })
-            .build(k),
+            .build(k)
+            .key("step-kind"),
     ));
 
     if is_act {
@@ -295,12 +310,13 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
     c = c.child(host_note(s, k, &path));
     c = c.child(widgets::divider(k));
     c = c.child(widgets::pair(
-        text_field(
+        u64_field(
             s,
             k,
             &format!("{path}.timeout"),
             "Timeout (seconds)",
             Some("Kill the step after this long. Empty waits forever."),
+            false,
         ),
         text_field(
             s,
@@ -311,7 +327,7 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
         ),
     ));
     if !is_act {
-        c = c.child(text_field(
+        c = c.child(argv_field(
             s,
             k,
             &format!("{path}.shell"),
@@ -339,9 +355,9 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
             k,
             &format!("{path}.platforms"),
             "Platform images",
-            Some("`runs-on: image`, one per line. Empty uses the global mapping."),
+            Some("`runs-on=image`, one per line. Empty uses the global mapping."),
         ));
-        c = c.child(text_field(
+        c = c.child(list_field(
             s,
             k,
             &format!("{path}.args"),
@@ -391,17 +407,19 @@ fn shell_fields(s: &State, k: &Kit, path: &str) -> El {
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             s.editor.set_str(&owner, &text);
+            let now_seeded = s.editor.s(&owner);
+            s.editor.sync_seeded(&owner, now_seeded);
             tx.instant();
         })
         .build(k);
     let mut f = Field::new()
         .label("Command")
         .prefix("Run with the configured shell. Output is captured per step.")
-        .control(input);
+        .control(input.key("control"));
     if let Some(error) = error {
         f = f.suffix(error);
     }
-    f.build(k)
+    f.build(k).key(format!("field-{path}.run"))
 }
 
 fn act_fields(s: &State, k: &Kit, project: usize, path: &str) -> El {
@@ -421,6 +439,7 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str) -> El {
     let workflow_owner = format!("{path}.workflow");
     let job_owner = format!("{path}.job");
     let project_name = e.s(&format!("project[{project}].name"));
+    let project_repo = e.s(&format!("project[{project}].repo_path"));
     let key = path.to_string();
 
     let workflow_pairs: Vec<(String, String)> = files
@@ -449,22 +468,30 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str) -> El {
                 .control_size(ControlSize::Small)
                 .disabled(e.workflows_loading)
                 .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-                    s.request_workflows(&key, project_name.clone(), None);
+                    s.request_workflows(
+                        &key,
+                        project_name.clone(),
+                        (!project_repo.trim().is_empty()).then_some(project_repo.clone()),
+                    );
                     tx.instant();
                 })
-                .build(k),
+                .build(k)
+                .key("workflows-refresh"),
             ),
     );
-    c = c.child(widgets::choice_row(
-        k,
-        &workflow_pairs,
-        Some(current_workflow.as_str()),
-        None,
-        move |s: &mut State, picked: &str, tx: &mut Tx| {
-            s.editor.set_str(&workflow_field, picked);
-            tx.instant();
-        },
-    ));
+    c = c.child(
+        widgets::choice_row(
+            k,
+            &workflow_pairs,
+            Some(current_workflow.as_str()),
+            None,
+            move |s: &mut State, picked: &str, tx: &mut Tx| {
+                s.editor.set_str(&workflow_field, picked);
+                tx.instant();
+            },
+        )
+        .key("step-workflows"),
+    );
     c = c.child(text_field(
         s,
         k,
@@ -522,7 +549,8 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str) -> El {
                     s.editor.set_str(&pick_path, picked);
                     tx.instant();
                 },
-            ),
+            )
+            .key("step-jobs"),
         ));
     }
 
@@ -565,6 +593,8 @@ fn secrets_table(s: &State, k: &Kit, path: &str) -> El {
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             crate::paths::set_table(&mut s.editor.draft, &owner, &text);
+            let now_seeded = crate::paths::get_table_text(&s.editor.draft, &owner);
+            s.editor.sync_seeded(&owner, now_seeded);
             tx.instant();
         })
         .build(k);
@@ -573,90 +603,11 @@ fn secrets_table(s: &State, k: &Kit, path: &str) -> El {
         .prefix(
             "`KEY=value`, one per line. A stored value shows as `********`; leave it to keep it.",
         )
-        .control(input);
+        .control(input.key("control"));
     if let Some(error) = s.editor.error_for(path) {
         f = f.suffix(error.to_string());
     }
-    f.build(k)
-}
-
-fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
-    let seeded = crate::paths::get_str(&s.editor.draft, path);
-    let edit = s
-        .editor
-        .text
-        .get(path)
-        .cloned()
-        .unwrap_or_else(|| TextEdit::new(seeded.clone()));
-    let invalid = s.editor.invalid(path);
-    let error = s.editor.error_for(path).map(str::to_string);
-    let owner = path.to_string();
-    let field = path.to_string();
-    let input = rune_kit::TextInput::new(&edit)
-        .label(label)
-        .placeholder(label)
-        .width(None)
-        .invalid(invalid)
-        .on_edit(move |s: &mut State| {
-            let seeded = crate::paths::get_str(&s.editor.draft, &field);
-            s.editor.text_for(&field, seeded)
-        })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
-            let text = s
-                .editor
-                .text
-                .get(&owner)
-                .map(|e| e.text.clone())
-                .unwrap_or_default();
-            s.editor.set_str(&owner, &text);
-            tx.instant();
-        })
-        .build(k);
-    let mut f = Field::new().label(label).control(input);
-    if let Some(help) = help {
-        f = f.prefix(help);
-    }
-    if let Some(error) = error {
-        f = f.suffix(error);
-    }
-    f.build(k)
-}
-
-fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
-    let seeded = crate::paths::get_table_text(&s.editor.draft, path);
-    let edit = s
-        .editor
-        .text
-        .get(path)
-        .cloned()
-        .unwrap_or_else(|| TextEdit::new(seeded.clone()));
-    let owner = path.to_string();
-    let field = path.to_string();
-    let input = TextArea::new(&edit)
-        .label(label)
-        .width(None)
-        .rows(2)
-        .auto_grow(2, 8)
-        .on_edit(move |s: &mut State| {
-            let seeded = crate::paths::get_table_text(&s.editor.draft, &field);
-            s.editor.text_for(&field, seeded)
-        })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
-            let text = s
-                .editor
-                .text
-                .get(&owner)
-                .map(|e| e.text.clone())
-                .unwrap_or_default();
-            crate::paths::set_table(&mut s.editor.draft, &owner, &text);
-            tx.instant();
-        })
-        .build(k);
-    let mut f = Field::new().label(label).control(input);
-    if let Some(help) = help {
-        f = f.prefix(help);
-    }
-    f.build(k)
+    f.build(k).key(format!("field-{path}"))
 }
 
 // ---------------------------------------------------------------------------------------------

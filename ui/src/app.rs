@@ -31,7 +31,6 @@ pub fn build() -> rune::App<State> {
     // Web: the runtime's handle is captured here so `spawn_local` answers can land in `poll`.
     #[cfg(target_arch = "wasm32")]
     let app = {
-        use rune::App as RuneApp;
         let handle = app.handle();
         app.init(move || {
             let mut s = init();
@@ -175,6 +174,11 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
             s.reconnect(tx);
             true
         }
+        // Cmd/Ctrl+, opens Settings.
+        Key::Command(',') => {
+            s.open_settings(SettingsPage::General, tx);
+            true
+        }
         Key::Escape => {
             if s.editor.step.is_some() {
                 s.editor.step = None;
@@ -278,7 +282,8 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32) -> El {
                                 s.open_settings(SettingsPage::General, tx);
                             }
                         })
-                        .build(k),
+                        .build(k)
+                        .key("titlebar-settings"),
                 ),
         )
         .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
@@ -349,14 +354,16 @@ fn banner(s: &State, k: &Kit, hair: f32) -> Option<El> {
                     .on_press_tx(|s: &mut State, tx: &mut Tx| {
                         s.open_settings(SettingsPage::Connection, tx)
                     })
-                    .build(k),
+                    .build(k)
+                    .key("banner-connection"),
             )
             .child(
                 rune_kit::Button::new("Retry")
                     .variant(rune_kit::ButtonVariant::Outline)
                     .control_size(rune_kit::ControlSize::Small)
                     .on_press_tx(|s: &mut State, tx: &mut Tx| s.reconnect(tx))
-                    .build(k),
+                    .build(k)
+                    .key("banner-retry"),
             ),
     )
 }
@@ -547,7 +554,7 @@ fn toast_layer(s: &State, k: &Kit) -> Option<El> {
                         ),
                 )
                 .child(
-                    el().key("toast-close")
+                    el().key(format!("toast-close-{id}"))
                         .size(18.0, 18.0)
                         .center()
                         .radius(k.radius.xs)

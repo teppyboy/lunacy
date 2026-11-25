@@ -69,16 +69,23 @@ fn path(base: &str, call: &Call) -> String {
         Call::SaveConfig(_) => net::join(base, "/api/config"),
         Call::System => net::join(base, "/api/system"),
         Call::Workflows {
-            project: Some(name),
-            ..
-        } => net::join(base, &format!("/api/projects/{}/workflows", net::seg(name))),
-        Call::Workflows {
+            project,
             repo_path: Some(path),
-            ..
-        } => net::join(
-            base,
-            &format!("/api/projects/_/workflows?repo_path={}", net::seg(path)),
-        ),
+        } => {
+            let name = project.as_deref().filter(|s| !s.is_empty()).unwrap_or("_");
+            net::join(
+                base,
+                &format!(
+                    "/api/projects/{}/workflows?repo_path={}",
+                    net::seg(name),
+                    net::seg(path)
+                ),
+            )
+        }
+        Call::Workflows {
+            project: Some(name),
+            repo_path: None,
+        } => net::join(base, &format!("/api/projects/{}/workflows", net::seg(name))),
         // Nothing to ask for: the caller has no project name and no repo path yet.
         Call::Workflows { .. } => net::join(base, "/api/projects/_/workflows"),
         Call::Health => net::join(base, "/api/health"),
@@ -289,6 +296,16 @@ mod tests {
                 }
             ),
             "http://127.0.0.1:7878/api/projects/_/workflows?repo_path=%2Fsrv%2Fx"
+        );
+        assert_eq!(
+            path(
+                b,
+                &Call::Workflows {
+                    project: Some("unsaved".into()),
+                    repo_path: Some("/srv/x".into())
+                }
+            ),
+            "http://127.0.0.1:7878/api/projects/unsaved/workflows?repo_path=%2Fsrv%2Fx"
         );
     }
 }

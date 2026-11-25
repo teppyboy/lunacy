@@ -114,7 +114,8 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32) -> El {
                 .on_press_tx(move |_: &mut State, tx: &mut Tx| {
                     let _ = tx.open_url(&link);
                 })
-                .build(k),
+                .build(k)
+                .key("run-github"),
         );
     }
     meta = meta.child(
@@ -122,7 +123,8 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32) -> El {
             .variant(ButtonVariant::Ghost)
             .control_size(ControlSize::Small)
             .on_press_tx(|s: &mut State, tx: &mut Tx| s.back(tx))
-            .build(k),
+            .build(k)
+            .key("run-back"),
     );
 
     let failed = run.failed_step.clone().filter(|_| {
@@ -225,7 +227,8 @@ fn step_row(s: &State, k: &Kit, run: &Run, step: &Step, index: usize, host: Opti
     let selected = s.open_step == Some(index);
     let ink = theme::status(k).for_step(step.status);
     let skipped = step.status == StepStatus::Skipped;
-    let reason = widgets::skipped_reason(&step.only_on, host);
+    let only_on = effective_only_on(s, run, step);
+    let reason = widgets::skipped_reason(&only_on, host);
     let has_substeps = !step.substeps.is_empty();
     let run_id = run.id.clone();
 
@@ -248,6 +251,12 @@ fn step_row(s: &State, k: &Kit, run: &Run, step: &Step, index: usize, host: Opti
                 .color(k.c.text_faint)
                 .nowrap()
                 .truncate(),
+        );
+    } else if skipped {
+        label_col = label_col.child(
+            text("Skipped".to_string())
+                .font(k.ty.small)
+                .color(k.c.text_faint),
         );
     } else if let Some(ms) = step.duration_ms {
         label_col = label_col.child(text(duration(ms)).font(k.ty.small).color(k.c.text_faint));
@@ -323,6 +332,7 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32) -> El {
         return widgets::empty_state(k, "Pick a step", "Its output appears here.");
     };
     let host = s.system.as_ref().map(|x| x.os.clone());
+    let only_on = effective_only_on(s, run, step);
     let state = s.logs.get(&(run.id.clone(), index));
 
     let mut head = row()
@@ -350,7 +360,7 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32) -> El {
                         None => Some(
                             text(widgets::step_status_label(
                                 step.status,
-                                &step.only_on,
+                                &only_on,
                                 host.as_deref(),
                             ))
                             .font(k.ty.small)
@@ -380,7 +390,8 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32) -> El {
                 tx.instant();
             }
         })
-        .build(k),
+        .build(k)
+        .key("run-log-mode"),
     );
 
     let mut body = col().w_full().gap(0.0);
@@ -423,37 +434,41 @@ fn substeps_block(k: &Kit, substeps: &[Substep], host: Option<&str>) -> El {
         .gap(8.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted);
     block = block.child(widgets::caption(k, "GITHUB ACTIONS"));
-    for (job, steps) in jobs {
-        let mut job_block = col().w_full().gap(2.0).child(
-            row()
-                .w_full()
-                .gap(6.0)
-                .center_y()
-                .child(icon(&glyphs::TRIANGLE_DOWN, 12.0).color(k.c.icon_faint))
-                .child(
-                    text(job.to_string())
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_base)
-                        .nowrap()
-                        .truncate(),
-                ),
-        );
-        for sub in steps {
-            job_block = job_block.child(substep_row(k, sub, host));
+    for (job_idx, (job, steps)) in jobs.into_iter().enumerate() {
+        let mut job_block = col()
+            .key(format!("substeps-job-{job_idx}"))
+            .w_full()
+            .gap(2.0)
+            .child(
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .center_y()
+                    .child(icon(&glyphs::TRIANGLE_DOWN, 12.0).color(k.c.icon_faint))
+                    .child(
+                        text(job.to_string())
+                            .font(k.ty.small_medium)
+                            .color(k.c.text_base)
+                            .nowrap()
+                            .truncate(),
+                    ),
+            );
+        for (sub_idx, sub) in steps.into_iter().enumerate() {
+            job_block = job_block.child(substep_row(k, sub, sub_idx, host));
         }
         block = block.child(job_block);
     }
     block
 }
 
-fn substep_row(k: &Kit, sub: &Substep, host: Option<&str>) -> El {
+fn substep_row(k: &Kit, sub: &Substep, index: usize, host: Option<&str>) -> El {
     let ink = theme::status(k).for_step(sub.status);
     let mut duration = String::new();
     if let Some(ms) = sub.duration_ms {
         duration = widgets::duration(ms);
     }
     row()
-        .key(format!("substep-{}", sub.name))
+        .key(format!("substep-{index}-{}", sub.name))
         .w_full()
         .min_h(22.0)
         .pl(22.0)
@@ -517,6 +532,42 @@ fn log_block(k: &Kit, step: &Step, state: Option<&LogState>) -> El {
     }
     let _ = step;
     block
+}
+
+fn effective_only_on(s: &State, run: &Run, step: &Step) -> Vec<String> {
+    if !step.only_on.is_empty() {
+        return step.only_on.clone();
+    }
+    if step.status != StepStatus::Skipped || !s.editor.loaded {
+        return Vec::new();
+    }
+    let phase_key = match step.phase {
+        crate::model::Phase::Ci => "ci",
+        crate::model::Phase::Deploy => "deploy",
+    };
+    let projects = crate::paths::array(&s.editor.base, "project");
+    let Some(project) = projects
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(run.project.as_str()))
+    else {
+        return Vec::new();
+    };
+    let steps = project
+        .get(phase_key)
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    steps
+        .iter()
+        .find(|cfg| cfg.get("name").and_then(|v| v.as_str()) == Some(step.name.as_str()))
+        .and_then(|cfg| cfg.get("only_on"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Unused import guard: `Icon` names the type of `status_glyph`'s icons.

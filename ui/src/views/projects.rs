@@ -91,7 +91,8 @@ fn header(s: &State, k: &Kit, hair: f32) -> El {
                     s.force = !s.force;
                     tx.instant();
                 })
-                .build(k),
+                .build(k)
+                .key("projects-force"),
         )
         .child(
             text("Force triggers")
@@ -105,7 +106,8 @@ fn header(s: &State, k: &Kit, hair: f32) -> El {
                 .on_press_tx(|s: &mut State, tx: &mut Tx| {
                     s.open_settings(crate::state::SettingsPage::Projects, tx)
                 })
-                .build(k),
+                .build(k)
+                .key("projects-settings"),
         )
 }
 
@@ -165,7 +167,8 @@ fn card_row(s: &State, k: &Kit, project: &Project) -> El {
                 "Queue a run for the current upstream commit"
             })
             .on_press_tx(move |s: &mut State, _tx: &mut Tx| s.trigger(&name))
-            .build(k),
+            .build(k)
+            .key(format!("run-now-{}", project.name)),
     );
 
     let mut card = col()
@@ -229,6 +232,15 @@ fn card_row(s: &State, k: &Kit, project: &Project) -> El {
             .truncate(),
         ),
     );
+    if let Some(err) = &project.last_error {
+        card = card.child(
+            text(err.clone())
+                .font(k.ty.small)
+                .color(theme::status(k).error)
+                .nowrap()
+                .truncate(),
+        );
+    }
     card
 }
 

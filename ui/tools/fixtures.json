@@ -5,6 +5,7 @@
     "os": "linux",
     "version": "0.1.0",
     "config_path": "/home/you/.config/lunacy/config.toml",
+    "state_dir": "/home/you/.local/state/lunacy",
     "act": {
       "path": "/usr/local/bin/act",
       "version": "0.2.97"
@@ -538,6 +539,7 @@
     "general": {
       "state_dir": "/home/you/.local/state/lunacy",
       "poll_interval": 300,
+      "log_level": "info",
       "shell": [
         "bash",
         "-lc"
@@ -546,7 +548,6 @@
     "server": {
       "listen": "127.0.0.1:7878",
       "token": "********",
-      "public_url": null,
       "web_root": "ui/dist"
     },
     "github": {
@@ -588,15 +589,23 @@
         "env": {
           "NODE_OPTIONS": "--max-old-space-size=4096"
         },
+        "contexts": {
+          "ci": "lunacy/ci",
+          "deploy": "lunacy/deploy"
+        },
         "discord_webhook_url": "********",
+        "platforms": {},
         "ci": [
           {
             "name": "Install dependencies",
             "kind": "shell",
             "run": "npm ci",
             "timeout": 900,
-            "env": {},
-            "only_on": []
+            "platforms": {},
+            "args": [],
+            "secrets": {},
+            "vars": {},
+            "env": {}
           },
           {
             "name": "act · CI",
@@ -614,13 +623,17 @@
               "GITHUB_TOKEN": "********"
             },
             "vars": {},
-            "only_on": []
+            "env": {}
           },
           {
             "name": "Package for Windows",
             "kind": "shell",
             "run": "cargo build --release --target x86_64-pc-windows-gnu",
             "timeout": 1800,
+            "platforms": {},
+            "args": [],
+            "secrets": {},
+            "vars": {},
             "env": {},
             "only_on": [
               "windows"
@@ -633,8 +646,11 @@
             "kind": "shell",
             "run": "rsync -az --delete ui/dist/ edge:/srv/lunarum/",
             "timeout": 300,
-            "env": {},
-            "only_on": []
+            "platforms": {},
+            "args": [],
+            "secrets": {},
+            "vars": {},
+            "env": {}
           }
         ]
       },
@@ -647,14 +663,22 @@
         "checkout": "none",
         "poll_interval": 300,
         "env": {},
+        "contexts": {
+          "ci": "lunacy/ci",
+          "deploy": "lunacy/deploy"
+        },
+        "platforms": {},
         "ci": [
           {
             "name": "Validate zsh config",
             "kind": "shell",
             "run": "zsh -n zsh/.zshrc",
             "timeout": 60,
-            "env": {},
-            "only_on": []
+            "platforms": {},
+            "args": [],
+            "secrets": {},
+            "vars": {},
+            "env": {}
           }
         ],
         "deploy": [
@@ -663,6 +687,10 @@
             "kind": "shell",
             "run": "./install.sh --force",
             "timeout": 120,
+            "platforms": {},
+            "args": [],
+            "secrets": {},
+            "vars": {},
             "env": {},
             "only_on": [
               "linux",
@@ -676,10 +704,26 @@
         "repo_path": "/home/you/src/blog",
         "remote": "origin",
         "branch": "main",
-        "github_repo": null,
         "checkout": "none",
         "env": {},
-        "ci": [],
+        "contexts": {
+          "ci": "lunacy/ci",
+          "deploy": "lunacy/deploy"
+        },
+        "platforms": {},
+        "ci": [
+          {
+            "name": "Build site",
+            "kind": "shell",
+            "run": "zola build",
+            "timeout": 120,
+            "platforms": {},
+            "args": [],
+            "secrets": {},
+            "vars": {},
+            "env": {}
+          }
+        ],
         "deploy": []
       }
     ]

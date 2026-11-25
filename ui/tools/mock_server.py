@@ -180,6 +180,7 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("%s %s\n" % (self.address_string(), format % args))
 
     def _cors(self) -> None:
+        # Mirror docs/api.md; localhost-only mock using Bearer auth (no cookies).
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
@@ -374,35 +375,57 @@ class Handler(BaseHTTPRequestHandler):
     def put_config(self, body: Json) -> None:
         """The daemon's validation, as far as the UI can trip it."""
         store = self.mock.store
+        general = body.get("general") or {}
+        if general.get("poll_interval", 300) == 0:
+            self._error(400, "must be at least 1 second", "general.poll_interval")
+            return
+        server = body.get("server")
+        if server is not None and not (server.get("listen") or "").strip():
+            self._error(400, "must not be empty", "server.listen")
+            return
         projects: list[Json] = body.get("project") or []
         seen = set()
         for i, project in enumerate(projects):
             name = (project.get("name") or "").strip()
             if not name:
-                self._error(400, "project name is required", "project[%d].name" % i)
+                self._error(400, "project name is required", f"project[{i}].name")
                 return
             if name in seen:
-                self._error(400, "duplicate project name %r" % name, "project[%d].name" % i)
+                self._error(400, f"duplicate project name {name!r}", f"project[{i}].name")
                 return
             seen.add(name)
+            if not (project.get("repo_path") or "").strip():
+                self._error(400, "must not be empty", f"project[{i}].repo_path")
+                return
+            if not (project.get("branch") or "").strip():
+                self._error(400, "must not be empty", f"project[{i}].branch")
+                return
+            ci_steps: list[Json] = project.get("ci") or []
+            deploy_steps: list[Json] = project.get("deploy") or []
+            if not ci_steps and not deploy_steps:
+                self._error(400, "project has neither ci nor deploy steps", f"project[{i}].ci")
+                return
             for phase in ("ci", "deploy"):
                 steps: list[Json] = project.get(phase) or []
                 for j, step in enumerate(steps):
-                    prefix = "project[%d].%s[%d]" % (i, phase, j)
+                    prefix = f"project[{i}].{phase}[{j}]"
                     if not (step.get("name") or "").strip():
-                        self._error(400, "step name is required", prefix + ".name")
+                        self._error(400, "step name is required", f"{prefix}.name")
                         return
                     if (step.get("kind") or "shell") == "act":
                         if not (step.get("workflow") or "").strip():
-                            self._error(400, "act step needs a workflow", prefix + ".workflow")
+                            self._error(400, "act step needs a workflow", f"{prefix}.workflow")
                             return
                     elif not (step.get("run") or "").strip():
-                        self._error(400, "step needs a run line", prefix + ".run")
+                        self._error(400, "step needs a run line", f"{prefix}.run")
+                        return
+                    if step.get("timeout") == 0:
+                        self._error(400, "must be at least 1", f"{prefix}.timeout")
                         return
                     for os_name in step.get("only_on") or []:
                         if os_name not in OS_NAMES:
                             self._error(
-                                400, "only_on takes linux, windows or macos", prefix + ".only_on"
+                                400, "only_on takes linux, windows or macos", f"{prefix}.only_on"
                             )
                             return
         store.config = body

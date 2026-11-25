@@ -120,6 +120,7 @@ pub fn load(s: &mut State, view: View) {
     s.projects = projects();
     s.loaded = true;
     s.ready = true;
+    s.demo = true;
     s.view = view.clone();
 
     let cfg = config();
@@ -212,6 +213,8 @@ pub fn rejected(s: &mut State) {
 /// The projects list with a toast, as a run start or a trigger failure shows it.
 pub fn with_toast(s: &mut State) {
     load(s, View::Projects);
+    s.toasts.clear();
+    s.next_toast = 2;
     s.toasts.push(crate::state::Toast {
         id: 1,
         title: "Run started".into(),

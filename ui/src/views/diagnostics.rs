@@ -60,7 +60,8 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>) -> El {
                                 s.request_system();
                                 tx.instant();
                             })
-                            .build(k),
+                            .build(k)
+                            .key("diagnostics-refresh"),
                     ),
             )
             .child(
@@ -80,6 +81,10 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>) -> El {
         "Config file",
         widgets::value(k, &info.config_path),
     ));
+    if let Some(state_dir) = &info.state_dir {
+        daemon = daemon.child(widgets::divider(k));
+        daemon = daemon.child(widgets::kv(k, "State dir", widgets::value(k, state_dir)));
+    }
     daemon = daemon.child(widgets::divider(k));
     daemon = daemon.child(widgets::kv(
         k,

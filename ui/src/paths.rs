@@ -45,12 +45,16 @@ pub fn get<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 /// Sets `path`, creating objects and arrays on the way. A `Null` value removes the key, so
 /// optional fields can be cleared without inventing an empty string.
 pub fn set(v: &mut Value, path: &str, value: Value) {
+    if value.is_null() && get(v, path).is_none() {
+        return;
+    }
     let keys = parse(path);
     let Some((last, prefix)) = keys.split_last() else {
         return;
     };
     let mut cur = v;
-    for key in prefix {
+    for (idx, key) in prefix.iter().enumerate() {
+        let next_is_index = matches!(prefix.get(idx + 1).unwrap_or(last), Key::Index(_));
         cur = match key {
             Key::Name(n) => {
                 let entry = cur
@@ -58,7 +62,11 @@ pub fn set(v: &mut Value, path: &str, value: Value) {
                     .map(|o| o.entry(n.clone()).or_insert(Value::Null));
                 let Some(entry) = entry else { return };
                 if !entry.is_object() && !entry.is_array() {
-                    *entry = Value::Object(Map::new());
+                    *entry = if next_is_index {
+                        Value::Array(Vec::new())
+                    } else {
+                        Value::Object(Map::new())
+                    };
                 }
                 entry
             }
@@ -71,7 +79,11 @@ pub fn set(v: &mut Value, path: &str, value: Value) {
                 }
                 let slot = &mut arr[*i];
                 if !slot.is_object() && !slot.is_array() {
-                    *slot = Value::Object(Map::new());
+                    *slot = if next_is_index {
+                        Value::Array(Vec::new())
+                    } else {
+                        Value::Object(Map::new())
+                    };
                 }
                 slot
             }
@@ -141,6 +153,16 @@ pub fn set_u64(v: &mut Value, path: &str, n: Option<u64>) {
     match n {
         Some(n) => set(v, path, Value::from(n)),
         None => set(v, path, Value::Null),
+    }
+}
+
+/// Removes `path` if it is currently an empty JSON object (`{}`).
+pub fn prune_empty_object(v: &mut Value, path: &str) {
+    if get(v, path)
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        set(v, path, Value::Null);
     }
 }
 
@@ -311,5 +333,23 @@ mod tests {
         assert!(same_field("server.listen", "server.listen"));
         assert!(same_field("project[0].ci", "project[0].ci"));
         assert!(!same_field("project[0].ci", "project[1].ci"));
+    }
+
+    #[test]
+    fn null_set_skips_missing_and_prunes_empty_objects() {
+        let mut v = json!({"general": {"poll_interval": 300}});
+        set(&mut v, "github.app.private_key", Value::Null);
+        assert!(v.get("github").is_none());
+
+        set_str(&mut v, "github.app.private_key", "pem", true);
+        assert!(v["github"]["app"]["private_key"] == "pem");
+        set_str(&mut v, "github.app.private_key", "", true);
+        prune_empty_object(&mut v, "github.app");
+        prune_empty_object(&mut v, "github");
+        assert!(v.get("github").is_none());
+
+        // Required strings keep empty string instead of deleting key.
+        set_str(&mut v, "project[0].name", "", false);
+        assert_eq!(v["project"][0]["name"], "");
     }
 }

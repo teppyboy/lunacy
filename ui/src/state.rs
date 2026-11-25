@@ -88,6 +88,14 @@ pub fn normalize_server(raw: &str) -> String {
     with_scheme.trim_end_matches('/').to_string()
 }
 
+/// The connection the Settings fields describe. A pasted token often brings a newline.
+pub fn conn_from_fields(server: &str, token: &str) -> Conn {
+    Conn {
+        server: normalize_server(server),
+        token: token.trim().to_string(),
+    }
+}
+
 /// Launch settings: `--server URL --token T`, then `LUNACY_SERVER` / `LUNACY_TOKEN`.
 pub fn conn_from_env() -> Conn {
     let mut conn = Conn {
@@ -643,9 +651,11 @@ pub struct State {
 impl State {
     pub fn new(conn: Conn) -> State {
         let mut state = State {
+            // Requests read `live`; start from the launch connection (flags, env, or the
+            // browser's saved token) so the first poll is already authenticated.
             live: Conn {
-                server: String::new(),
-                token: String::new(),
+                server: normalize_server(&conn.server),
+                token: conn.token.clone(),
             },
             conn,
             ui_server: TextEdit::new(""),
@@ -693,6 +703,8 @@ impl State {
 
     /// Adopts the settings fields' URL and token and refreshes everything.
     pub fn reconnect(&mut self, tx: &mut Tx) {
+        // The Connection fields edit `ui_*`; take what the user typed.
+        self.conn = conn_from_fields(&self.ui_server.text, &self.ui_token.text);
         self.live = self.conn.clone();
         self.live.server = normalize_server(&self.live.server);
         store_token(&self.live.token);
@@ -1662,6 +1674,23 @@ mod tests {
         assert_eq!(normalize_server("127.0.0.1:7878"), "http://127.0.0.1:7878");
         assert_eq!(normalize_server("http://host:1/"), "http://host:1");
         assert_eq!(normalize_server("  "), "");
+    }
+
+    #[test]
+    fn the_launch_token_is_sent_from_the_first_request() {
+        let s = State::new(Conn {
+            server: "127.0.0.1:7878".into(),
+            token: "abc".into(),
+        });
+        assert_eq!(s.token(), "abc");
+        assert_eq!(s.server(), "http://127.0.0.1:7878");
+    }
+
+    #[test]
+    fn connection_fields_become_the_connection() {
+        let c = conn_from_fields("lunacy.example:443/", "  abc123\n");
+        assert_eq!(c.server, "http://lunacy.example:443");
+        assert_eq!(c.token, "abc123");
     }
 
     #[test]

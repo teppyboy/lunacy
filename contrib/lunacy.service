@@ -20,8 +20,9 @@ RestartSec=10s
 # A pipeline is killed on `systemctl stop`; give it a moment to report.
 KillMode=mixed
 TimeoutStopSec=30s
-# act needs the Docker socket and the deploy scripts need git.
-SupplementaryGroups=docker
+# act needs the Docker socket: put the user in the `docker` group. A user unit
+# cannot set SupplementaryGroups= (it fails with status=216/GROUP).
+# Without lingering the daemon stops at logout: `loginctl enable-linger $USER`.
 StandardOutput=journal
 StandardError=journal
 

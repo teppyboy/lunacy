@@ -129,7 +129,7 @@ fn check(path: PathBuf) -> Result<()> {
             "github: mode={:?} api={} token={} app={}",
             g.effective_mode(),
             g.api_url(),
-            if g.token.as_deref().map(|t| !t.is_empty()).unwrap_or(false) {
+            if g.token_value().is_some_and(|t| !t.is_empty()) {
                 "set"
             } else {
                 "unset"
@@ -140,11 +140,7 @@ fn check(path: PathBuf) -> Result<()> {
     if let Some(d) = cfg.discord.as_ref() {
         println!(
             "discord: webhook={} notify_on_start={}",
-            if d.webhook_url
-                .as_deref()
-                .map(|u| !u.is_empty())
-                .unwrap_or(false)
-            {
+            if d.webhook_url_value().is_some() {
                 "set"
             } else {
                 "unset"

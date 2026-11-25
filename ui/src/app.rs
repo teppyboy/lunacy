@@ -43,7 +43,9 @@ pub fn build() -> rune::App<State> {
 }
 
 fn init() -> State {
-    State::new(crate::state::conn_from_env())
+    let mut s = State::new(crate::state::conn_from_env());
+    s.load_prefs();
+    s
 }
 
 /// One named scene: `--scene` and `tools/shots.sh` pick by name.
@@ -151,6 +153,31 @@ pub const SCENES: &[Scene] = &[
             },
         )
     }),
+    ("settings-appearance", |s| {
+        crate::demo::load(
+            s,
+            View::Settings {
+                page: SettingsPage::Appearance,
+            },
+        )
+    }),
+    ("settings-appearance-oled", |s| {
+        crate::demo::load(
+            s,
+            View::Settings {
+                page: SettingsPage::Appearance,
+            },
+        );
+        s.theme_mode = crate::theme::ThemeMode::Oled;
+    }),
+    ("run-oled", |s| {
+        let id = crate::demo::failed_run()
+            .or_else(|| crate::demo::runs().into_iter().next())
+            .map(|r| r.id)
+            .unwrap_or_default();
+        crate::demo::load(s, View::Run { id });
+        s.theme_mode = crate::theme::ThemeMode::Oled;
+    }),
     ("offline", crate::demo::offline),
     ("unauthorized", crate::demo::unauthorized),
     ("toast", crate::demo::with_toast),
@@ -159,8 +186,27 @@ pub const SCENES: &[Scene] = &[
 // ---------------------------------------------------------------------------------------------
 // Keys
 
+fn is_cmd_key(ev: &KeyEvent, ch: char) -> bool {
+    let mut buf = [0u8; 4];
+    let target = ch.encode_utf8(&mut buf);
+    ev.is_command(ch)
+        || ((ev.mods.cmd || ev.mods.ctrl) && matches!(&ev.key, Key::Text(t) if t == target))
+}
+
 /// Global keys the focused control didn't take.
 fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if is_cmd_key(ev, '=') || is_cmd_key(ev, '+') {
+        s.step_zoom(1, tx);
+        return true;
+    }
+    if is_cmd_key(ev, '-') || is_cmd_key(ev, '_') {
+        s.step_zoom(-1, tx);
+        return true;
+    }
+    if is_cmd_key(ev, '0') {
+        s.set_user_zoom(None, tx);
+        return true;
+    }
     match ev.key {
         // Ctrl/Cmd+S saves the config, wherever the form is scrolled to.
         Key::Command('s') => {
@@ -241,7 +287,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .unwrap_or_else(|| cx.touch_controls());
     let layout_w = root_size.map_or(if compact { 390.0 } else { 1180.0 }, |sz| sz[0]);
     let dark = cx.system_dark();
-    let k = theme::kit_for(dark, compact);
+    let k = theme::kit_mode(s.theme_mode, dark, compact);
     let scale = cx.env().scale;
     let hair = theme::hair(scale);
     let safe = cx.safe_area().map(|v| (v / zoom).max(0.0));
@@ -380,7 +426,7 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
                 compact,
             )),
     )
-    .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+    .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
 }
 
 /// The connection chip: dot and label on desktop; compact 44×44 dot pill on phones.
@@ -594,22 +640,24 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
         .shrink()
         .gap(0.0)
         .fill(k.c.layer_01)
-        .border_sides([0.0, 0.0, 0.0, hair], k.c.border_muted)
-        .child(
+        .border_sides([0.0, 0.0, 0.0, hair], k.c.border_base)
+        .child(widgets::scroll_bar(
             col()
+                .key("rail-scroll")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
                 .scroll(ScrollSpec::default())
                 .child(list),
-        )
+            k,
+        ))
         .child(
             col()
                 .w_full()
                 .px(14.0)
                 .py(10.0)
                 .gap(2.0)
-                .border_sides([hair, 0.0, 0.0, 0.0], k.c.border_muted)
+                .border_sides([hair, 0.0, 0.0, 0.0], k.c.border_base)
                 .child(
                     // Two lines rather than one truncated "daemon 0....": the
                     // rail is 196px, so the address wraps under the version.
@@ -637,7 +685,7 @@ fn drawer_overlay(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4]) 
         .px(14.0)
         .gap(8.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
         .child(widgets::dot(k.c.text_accent, 9.0))
         .child(
             text("lunacy")
@@ -665,7 +713,7 @@ fn drawer_overlay(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4]) 
         .pb(safe[2])
         .pl(safe[3])
         .fill(k.c.layer_01)
-        .border_sides([0.0, 0.0, 0.0, hair], k.c.border_base)
+        .border_sides([0.0, 0.0, 0.0, hair], k.c.border_strong)
         .child(drawer_head)
         .child(rail(s, k, hair, true).w_full().grow(1.0).min_h(0.0));
     el().key("drawer-layer")
@@ -817,8 +865,8 @@ mod tests {
         setup(&mut state);
         let mut rt = Runtime::new(state, view, (w, h), Env::new(true, 1.0));
         for _ in 0..5 {
-            rt.frame(0.016);
             rt.settle_all();
+            rt.frame(0.016);
         }
         rt
     }
@@ -1004,6 +1052,14 @@ mod tests {
                     },
                 )
             });
+            assert_responsive_scene("settings-appearance", w, h, |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Appearance,
+                    },
+                )
+            });
             assert_responsive_scene("settings-step-editor", w, h, |s| {
                 crate::demo::editor_step(s);
             });
@@ -1058,5 +1114,315 @@ mod tests {
         }
         assert!(!rt.state.drawer_open);
         assert!(matches!(rt.state.view, View::Settings { .. }));
+    }
+
+    #[test]
+    fn b1_run_log_auto_scrolls_pauses_on_scroll_up_and_resumes_at_bottom() {
+        use crate::model::{Phase, Run, RunStatus, Step, StepKind, StepStatus};
+        use crate::state::{LogMode, LogState};
+
+        let make_lines = |prefix: &str, count: usize| -> String {
+            (1..=count)
+                .map(|i| format!("{prefix} line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut rt = setup_runtime(
+            |s| {
+                let run = Run {
+                    id: "r-log".into(),
+                    project: "alpha".into(),
+                    sha: "abcdef1".into(),
+                    status: RunStatus::Running,
+                    steps: vec![
+                        Step {
+                            phase: Phase::Ci,
+                            name: "Step 0".into(),
+                            kind: StepKind::Shell,
+                            status: StepStatus::Running,
+                            ..Step::default()
+                        },
+                        Step {
+                            phase: Phase::Ci,
+                            name: "Step 1".into(),
+                            kind: StepKind::Shell,
+                            status: StepStatus::Success,
+                            ..Step::default()
+                        },
+                    ],
+                    ..Run::default()
+                };
+                s.view = View::Run { id: "r-log".into() };
+                s.run = Some(run);
+                s.open_step = Some(0);
+                s.logs.insert(
+                    ("r-log".into(), 0),
+                    LogState {
+                        text: make_lines("s0", 120),
+                        loading: false,
+                        error: None,
+                        mode: Some(LogMode::Tail),
+                    },
+                );
+                s.logs.insert(
+                    ("r-log".into(), 1),
+                    LogState {
+                        text: make_lines("s1", 120),
+                        loading: false,
+                        error: None,
+                        mode: Some(LogMode::Tail),
+                    },
+                );
+            },
+            1180.0,
+            760.0,
+        );
+
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+        // Always-visible scrollbar wraps the viewport.
+        assert!(rt.find("run-log-scroll-scroll-area").is_some());
+
+        // Growth while at bottom keeps following bottom.
+        rt.update(|s, _| {
+            if let Some(e) = s.logs.get_mut(&("r-log".into(), 0)) {
+                e.text = make_lines("s0", 160);
+            }
+        });
+        for _ in 0..5 {
+            rt.frame(0.016);
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+
+        // User scrolls up: stop following.
+        let (lx, ly) = rt.find("run-log-scroll").expect("log viewport");
+        rt.wheel_xy(lx, ly, 0.0, 400.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(false));
+
+        // More lines arrive while scrolled up: keep reading position, do not jump back.
+        rt.update(|s, _| {
+            if let Some(e) = s.logs.get_mut(&("r-log".into(), 0)) {
+                e.text = make_lines("s0", 200);
+            }
+        });
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(false));
+
+        // User scrolls back to bottom: resumes following growth.
+        rt.wheel_xy(lx, ly, 0.0, -5000.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+        rt.update(|s, _| {
+            if let Some(e) = s.logs.get_mut(&("r-log".into(), 0)) {
+                e.text = make_lines("s0", 230);
+            }
+        });
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+
+        // Scroll up again, then switch to Step 1 -> jumps to bottom of Step 1.
+        rt.wheel_xy(lx, ly, 0.0, 400.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(false));
+        let (s1x, s1y) = rt.find("step-1").expect("step-1");
+        rt.pointer_down(s1x, s1y);
+        rt.pointer_up(s1x, s1y);
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.open_step, Some(1));
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+
+        // Scroll up again, then toggle Tail -> Full -> jumps to bottom.
+        let (lx, ly) = rt.find("run-log-scroll").expect("log viewport");
+        rt.wheel_xy(lx, ly, 0.0, 400.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(false));
+        let (fx, fy) = rt.find("run-log-mode/segment1").expect("Full toggle");
+        rt.pointer_down(fx, fy);
+        rt.pointer_up(fx, fy);
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+    }
+
+    #[test]
+    fn b2_scrollbars_mount_on_every_scroll_pane() {
+        let rt_projects = setup_runtime(|s| crate::demo::load(s, View::Projects), 1180.0, 760.0);
+        assert!(rt_projects.find("projects-scroll-scroll-area").is_some());
+        assert!(rt_projects.find("rail-scroll-scroll-area").is_some());
+
+        let rt_proj = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Project {
+                        name: "lunarum".into(),
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_proj.find("project-scroll-scroll-area").is_some());
+
+        let rt_set = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::General,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_set.find("settings-body-scroll-area").is_some());
+
+        let rid = crate::demo::runs().into_iter().next().expect("demo run").id;
+        let rt_run = setup_runtime(
+            move |s| crate::demo::load(s, View::Run { id: rid }),
+            1180.0,
+            760.0,
+        );
+        assert!(rt_run.find("run-steps-scroll-scroll-area").is_some());
+        assert!(rt_run.find("run-log-scroll-scroll-area").is_some());
+    }
+
+    #[test]
+    fn b4_oled_theme_surfaces_borders_and_selector() {
+        let oled = theme::kit_mode(theme::ThemeMode::Oled, false, false);
+        assert_eq!(oled.c.page.hex(), "#000000ff");
+        assert_eq!(oled.c.bg_deep.hex(), "#000000ff");
+        assert_eq!(oled.c.layer_01.hex(), "#08080aff");
+        let dark = theme::kit(true);
+        assert_eq!(theme::status(&oled).success, theme::status(&dark).success);
+
+        let mut rt = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Appearance,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        let (ox, oy) = rt
+            .find("appearance-theme/choice-oled")
+            .expect("OLED choice");
+        rt.pointer_down(ox, oy);
+        rt.pointer_up(ox, oy);
+        for _ in 0..3 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert_eq!(rt.state.theme_mode, theme::ThemeMode::Oled);
+        let root_fill = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("app-root"))
+            .expect("app-root")
+            .fill;
+        assert_eq!(root_fill.hex(), "#000000ff");
+    }
+
+    #[test]
+    fn b5_zoom_picker_and_keyboard_shortcuts_preserve_layout() {
+        let mut rt = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Appearance,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!((rt.zoom() - 1.1).abs() < 1e-4);
+
+        let (zx, zy) = rt
+            .find("appearance-zoom/choice-1.25")
+            .expect("1.25x choice");
+        rt.pointer_down(zx, zy);
+        rt.pointer_up(zx, zy);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert_eq!(rt.state.user_zoom, Some(1.25));
+        assert!((rt.zoom() - 1.25).abs() < 1e-4);
+
+        // Verify zoomed 1.25 layout at 1180x760 has zero horizontal overflow and no cut text on main settings labels.
+        let vw = rt.window_viewport().0 / rt.zoom();
+        for el in rt.elements() {
+            if el.exiting || el.inert {
+                continue;
+            }
+            if el.focusable
+                || matches!(
+                    el.role,
+                    "button" | "tab" | "checkbox" | "radio" | "switch" | "textbox"
+                )
+            {
+                assert!(
+                    el.rect[0] >= -0.5 && el.rect[0] + el.rect[2] <= vw + 0.5,
+                    "zoom 1.25 overflow on {:?} rect={:?} vw={vw}",
+                    el.key,
+                    el.rect
+                );
+            }
+        }
+
+        // Ctrl/Cmd+= -> 1.5, Ctrl/Cmd+- -> 1.25 -> 1.1, Ctrl/Cmd+0 -> None (responsive default 1.1)
+        let mut tx = rune::Tx::default();
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Command('='),
+                mods: Mods::default(),
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.user_zoom, Some(1.5));
+
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Command('-'),
+                mods: Mods::default(),
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.user_zoom, Some(1.25));
+
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Command('0'),
+                mods: Mods::default(),
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.user_zoom, None);
     }
 }

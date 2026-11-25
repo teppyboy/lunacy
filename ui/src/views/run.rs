@@ -45,14 +45,14 @@ pub fn view(s: &State, k: &Kit, id: &str, _cx: &mut Cx<State>, hair: f32, compac
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(steps_pane(s, k, run, true))
+            .child(steps_pane(s, k, run, hair, true))
             .child(log_pane(s, k, run, hair, true))
     } else {
         row()
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(steps_pane(s, k, run, false))
+            .child(steps_pane(s, k, run, hair, false))
             .child(log_pane(s, k, run, hair, false))
     };
 
@@ -72,7 +72,7 @@ fn header_shell(k: &Kit, hair: f32, compact: bool) -> El {
         .h(52.0)
         .px(if compact { 14.0 } else { 22.0 })
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
 }
 
 fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
@@ -146,7 +146,7 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
             .px(14.0)
             .py(12.0)
             .gap(8.0)
-            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
             .child(
                 row()
                     .w_full()
@@ -234,7 +234,7 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
         .px(22.0)
         .py(12.0)
         .gap(6.0)
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
         .child(
             row()
                 .w_full()
@@ -280,7 +280,7 @@ pub fn github_link(run: &Run, repo: Option<&str>) -> Option<String> {
 }
 
 /// The step list, on the left on desktop or stacked above the log on compact viewports.
-fn steps_pane(s: &State, k: &Kit, run: &Run, compact: bool) -> El {
+fn steps_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
     let host = s.system.as_ref().map(|x| x.os.clone());
     let mut phase = None;
     let mut list = col().w_full().gap(0.0);
@@ -301,6 +301,7 @@ fn steps_pane(s: &State, k: &Kit, run: &Run, compact: bool) -> El {
 
     if compact {
         let mut scroller = col()
+            .key("run-steps-scroll")
             .w_full()
             .min_h(0.0)
             .scroll(ScrollSpec::default())
@@ -313,8 +314,8 @@ fn steps_pane(s: &State, k: &Kit, run: &Run, compact: bool) -> El {
         let mut pane = col()
             .key("run-steps")
             .w_full()
-            .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted)
-            .child(scroller);
+            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+            .child(widgets::scroll_bar(scroller, k));
         if s.open_step.is_none() {
             pane = pane.grow(1.0).min_h(0.0);
         }
@@ -327,15 +328,17 @@ fn steps_pane(s: &State, k: &Kit, run: &Run, compact: bool) -> El {
         .shrink()
         .h_full()
         .min_h(0.0)
-        .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_muted)
-        .child(
+        .border_sides([0.0, 0.0, 0.0, hair], k.c.border_base)
+        .child(widgets::scroll_bar(
             col()
+                .key("run-steps-scroll")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
                 .scroll(ScrollSpec::default())
                 .child(list),
-        )
+            k,
+        ))
 }
 
 fn step_row(
@@ -416,14 +419,14 @@ fn step_row(
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             if s.open_step == Some(index) {
                 s.open_step = None;
+                s.stick_log_pending = false;
             } else {
                 s.open_step = Some(index);
-                let mode = s
-                    .logs
-                    .get(&(run_id.clone(), index))
-                    .and_then(|e| e.mode)
-                    .unwrap_or(LogMode::Tail);
+                let entry = s.logs.get(&(run_id.clone(), index));
+                let mode = entry.and_then(|e| e.mode).unwrap_or(LogMode::Tail);
+                s.stick_log_pending = entry.is_none_or(|e| e.text.is_empty());
                 s.request_log(&run_id, index, mode);
+                tx.scroll_to_bottom_instant("run-log-scroll");
             }
             tx.instant();
         })
@@ -473,7 +476,9 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
                 } else {
                     LogMode::Full
                 };
+                s.stick_log_pending = true;
                 s.request_log(&run_id, index, mode);
+                tx.scroll_to_bottom_instant("run-log-scroll");
                 tx.instant();
             }
         },
@@ -513,7 +518,7 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
         .py(9.0)
         .gap(10.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted);
+        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base);
     if compact {
         head = head.flex_wrap();
     }
@@ -535,15 +540,16 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
         .min_h(0.0)
         .h_full()
         .child(head)
-        .child(
+        .child(widgets::scroll_bar(
             col()
                 .key("run-log-scroll")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .scroll(ScrollSpec::default())
+                .scroll(ScrollSpec::stick_bottom())
                 .child(body),
-        )
+            k,
+        ))
 }
 
 /// The GitHub Actions tree an act step produces: one header per job, its steps indented under it.

@@ -150,6 +150,23 @@ pub fn conn_from_env() -> Conn {
 
 #[cfg(target_arch = "wasm32")]
 const TOKEN_KEY: &str = "lunacy.token";
+#[cfg(target_arch = "wasm32")]
+const THEME_STORAGE_KEY: &str = "lunacy.theme";
+#[cfg(target_arch = "wasm32")]
+const ZOOM_STORAGE_KEY: &str = "lunacy.zoom";
+#[cfg(not(target_arch = "wasm32"))]
+const PREFS_APP_ID: &str = "lunacy";
+#[cfg(not(target_arch = "wasm32"))]
+const PREF_THEME_KEY: &str = "theme";
+#[cfg(not(target_arch = "wasm32"))]
+const PREF_ZOOM_KEY: &str = "zoom";
+
+/// Supported discrete UI zoom stops shown in Appearance and stepped by `Ctrl/Cmd` `=`/`-`.
+pub const ZOOM_STEPS: [f32; 5] = [0.9, 1.0, 1.1, 1.25, 1.5];
+
+fn sanitize_zoom(z: f32) -> Option<f32> {
+    (z.is_finite() && (0.5..=2.5).contains(&z)).then_some(z)
+}
 
 #[cfg(target_arch = "wasm32")]
 fn local_storage() -> Option<web_sys::Storage> {
@@ -183,6 +200,89 @@ fn store_token(token: &str) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn store_token(_: &str) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn load_prefs_from(
+    prefs: &rune::prefs::Prefs,
+) -> (Option<crate::theme::ThemeMode>, Option<f32>) {
+    let theme = prefs
+        .get::<String>(PREF_THEME_KEY)
+        .as_deref()
+        .and_then(crate::theme::ThemeMode::parse);
+    let zoom = prefs.get::<f32>(PREF_ZOOM_KEY).and_then(sanitize_zoom);
+    (theme, zoom)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_theme_to(prefs: &mut rune::prefs::Prefs, mode: crate::theme::ThemeMode) {
+    let _ = prefs.set(PREF_THEME_KEY, mode.as_str());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_zoom_to(prefs: &mut rune::prefs::Prefs, zoom: Option<f32>) {
+    match zoom.and_then(sanitize_zoom) {
+        Some(z) => {
+            let _ = prefs.set(PREF_ZOOM_KEY, &z);
+        }
+        None => {
+            let _ = prefs.remove(PREF_ZOOM_KEY);
+        }
+    }
+}
+
+fn load_window_prefs() -> (Option<crate::theme::ThemeMode>, Option<f32>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Some(s) = local_storage() else {
+            return (None, None);
+        };
+        let theme = s
+            .get_item(THEME_STORAGE_KEY)
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(crate::theme::ThemeMode::parse);
+        let zoom = s
+            .get_item(ZOOM_STORAGE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<f32>().ok())
+            .and_then(sanitize_zoom);
+        (theme, zoom)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+        load_prefs_from(&prefs)
+    }
+}
+
+fn save_theme_pref(mode: crate::theme::ThemeMode) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(s) = local_storage() {
+        let _ = s.set_item(THEME_STORAGE_KEY, mode.as_str());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+        save_theme_to(&mut prefs, mode);
+    }
+}
+
+fn save_zoom_pref(zoom: Option<f32>) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(s) = local_storage() {
+        let _ = match zoom.and_then(sanitize_zoom) {
+            Some(z) => s.set_item(ZOOM_STORAGE_KEY, &format!("{z}")),
+            None => s.remove_item(ZOOM_STORAGE_KEY),
+        };
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+        save_zoom_to(&mut prefs, zoom);
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Requests
@@ -377,6 +477,7 @@ pub enum SettingsPage {
     Projects,
     Diagnostics,
     Connection,
+    Appearance,
 }
 
 impl SettingsPage {
@@ -390,6 +491,21 @@ impl SettingsPage {
         SettingsPage::Projects,
     ];
 
+    /// Window-local pages (not written to `config.toml`), in sidebar order.
+    pub const WINDOW: [SettingsPage; 3] = [
+        SettingsPage::Diagnostics,
+        SettingsPage::Connection,
+        SettingsPage::Appearance,
+    ];
+
+    /// Whether this page belongs to this window rather than `config.toml`.
+    pub fn is_local(self) -> bool {
+        matches!(
+            self,
+            SettingsPage::Diagnostics | SettingsPage::Connection | SettingsPage::Appearance
+        )
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             SettingsPage::General => "General",
@@ -400,6 +516,7 @@ impl SettingsPage {
             SettingsPage::Projects => "Projects",
             SettingsPage::Diagnostics => "Diagnostics",
             SettingsPage::Connection => "Connection",
+            SettingsPage::Appearance => "Appearance",
         }
     }
 
@@ -421,6 +538,7 @@ impl SettingsPage {
             SettingsPage::Connection => {
                 "This window's server URL and token, not part of config.toml."
             }
+            SettingsPage::Appearance => "Theme mode and interface scale for this window.",
         }
     }
 }
@@ -678,10 +796,14 @@ pub struct State {
     pub demo: bool,
     /// Compact navigation drawer open state (used below ~720pt width).
     pub drawer_open: bool,
+    /// User-chosen window theme (`System`, `Light`, `Dark`, or `Oled`).
+    pub theme_mode: crate::theme::ThemeMode,
     /// User-chosen UI zoom factor (`None` = responsive default: 1.0 compact, 1.1 desktop).
     pub user_zoom: Option<f32>,
     /// Tracks `(commit_gen, target_zoom)` so responsive default zoom never oscillates.
     pub(crate) zoom_track: std::cell::Cell<(u64, f32)>,
+    /// Re-scroll run log to bottom once the next active `Answer::Log` arrives (run open / Tail<->Full).
+    pub(crate) stick_log_pending: bool,
 }
 
 impl State {
@@ -728,15 +850,69 @@ impl State {
             ready: false,
             demo: false,
             drawer_open: false,
+            theme_mode: crate::theme::ThemeMode::System,
             user_zoom: None,
             zoom_track: std::cell::Cell::new((0, 1.0)),
+            stick_log_pending: false,
         };
         state.ui_server = TextEdit::new(state.conn.server.clone());
         state.ui_token = TextEdit::new(state.conn.token.clone());
         if let Some(id) = initial_run_id() {
             state.view = View::Run { id };
+            state.stick_log_pending = true;
         }
         state
+    }
+
+    /// Loads persisted window appearance and zoom preferences (`localStorage` on web, `Prefs` natively).
+    pub fn load_prefs(&mut self) {
+        let (theme, zoom) = load_window_prefs();
+        if let Some(mode) = theme {
+            self.theme_mode = mode;
+        }
+        if let Some(z) = zoom {
+            self.user_zoom = Some(z);
+        }
+    }
+
+    /// Updates window theme mode and persists it immediately.
+    pub fn set_theme_mode(&mut self, mode: crate::theme::ThemeMode, tx: &mut Tx) {
+        self.theme_mode = mode;
+        save_theme_pref(mode);
+        tx.instant();
+    }
+
+    /// Updates explicit UI zoom (`None` resets to the responsive default) and persists it.
+    pub fn set_user_zoom(&mut self, zoom: Option<f32>, tx: &mut Tx) {
+        let cleaned = zoom.and_then(sanitize_zoom);
+        self.user_zoom = cleaned;
+        save_zoom_pref(cleaned);
+        tx.instant();
+    }
+
+    /// Effective zoom currently shown in the UI.
+    pub fn current_zoom(&self) -> f32 {
+        self.user_zoom.unwrap_or_else(|| self.zoom_track.get().1)
+    }
+
+    /// Steps explicit UI zoom up (`delta > 0`) or down (`delta < 0`) along [`ZOOM_STEPS`].
+    pub fn step_zoom(&mut self, delta: i32, tx: &mut Tx) {
+        let cur = self.current_zoom();
+        let next = if delta > 0 {
+            ZOOM_STEPS
+                .iter()
+                .copied()
+                .find(|&z| z > cur + 0.01)
+                .unwrap_or(*ZOOM_STEPS.last().unwrap_or(&1.5))
+        } else {
+            ZOOM_STEPS
+                .iter()
+                .rev()
+                .copied()
+                .find(|&z| z < cur - 0.01)
+                .unwrap_or(*ZOOM_STEPS.first().unwrap_or(&0.9))
+        };
+        self.set_user_zoom(Some(next), tx);
     }
 
     // -- connection ------------------------------------------------------------------------
@@ -1120,6 +1296,7 @@ impl State {
                 true
             }
             Answer::Run(run) => {
+                let prev_open = self.open_step;
                 let open = self.open_step.filter(|i| *i < run.steps.len());
                 let step_finished = open.is_some_and(|idx| {
                     self.run
@@ -1136,6 +1313,10 @@ impl State {
                 self.open_step = open;
                 self.run = Some(*run);
                 self.run_error = None;
+                if prev_open != open && open.is_some() {
+                    self.stick_log_pending = true;
+                    tx.scroll_to_bottom_instant("run-log-scroll");
+                }
                 if step_finished {
                     if let (Some(r), Some(idx)) = (self.run.clone(), open) {
                         let mode = self
@@ -1156,8 +1337,8 @@ impl State {
                 text,
                 tail,
             } => {
-                let clock = self.clock;
-                let _ = clock;
+                let active =
+                    self.run.as_ref().is_some_and(|r| r.id == run) && self.open_step == Some(index);
                 match self.logs.get_mut(&(run, index)) {
                     Some(entry)
                         if entry.mode
@@ -1167,10 +1348,15 @@ impl State {
                                 LogMode::Full
                             }) =>
                     {
+                        let was_empty = entry.text.is_empty();
                         let grew = entry.text != text;
                         entry.text = text;
                         entry.loading = false;
                         entry.error = None;
+                        if active && (was_empty || self.stick_log_pending) {
+                            self.stick_log_pending = false;
+                            tx.scroll_to_bottom_instant("run-log-scroll");
+                        }
                         grew
                     }
                     // A tail answer for a log the reader asked in full: drop it.
@@ -1453,6 +1639,7 @@ impl State {
         self.drawer_open = false;
         self.run = None;
         self.open_step = None;
+        self.stick_log_pending = true;
         self.run_error = None;
         self.logs.clear();
         self.next_run = 0.0;
@@ -1485,9 +1672,7 @@ impl State {
         self.drawer_open = false;
         self.editor.page = page;
         self.set_hash("");
-        if !matches!(page, SettingsPage::Connection | SettingsPage::Diagnostics)
-            && !self.editor.loaded
-        {
+        if !page.is_local() && !self.editor.loaded {
             self.request_config();
         }
         if page == SettingsPage::Diagnostics {
@@ -1952,6 +2137,67 @@ mod tests {
             paths::get_str(&s.editor.draft, "project[1].ci[0].secrets.RAW"),
             "plain"
         );
+    }
+
+    #[test]
+    fn theme_and_zoom_prefs_round_trip() {
+        let dir = std::env::temp_dir().join(format!("lunacy-ui-prefs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("prefs.json");
+
+        {
+            let mut prefs = rune::prefs::Prefs::at(&path);
+            save_theme_to(&mut prefs, crate::theme::ThemeMode::Oled);
+            save_zoom_to(&mut prefs, Some(1.25));
+        }
+
+        let reopened = rune::prefs::Prefs::at(&path);
+        assert_eq!(
+            load_prefs_from(&reopened),
+            (Some(crate::theme::ThemeMode::Oled), Some(1.25))
+        );
+
+        {
+            let mut prefs = rune::prefs::Prefs::at(&path);
+            save_zoom_to(&mut prefs, None);
+        }
+        let reset = rune::prefs::Prefs::at(&path);
+        assert_eq!(
+            load_prefs_from(&reset),
+            (Some(crate::theme::ThemeMode::Oled), None)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_zoom_advances_clamps_and_resets() {
+        let mut s = State::new(Conn::default());
+        let mut tx = Tx::default();
+        s.zoom_track.set((1, 1.1));
+        assert_eq!(s.user_zoom, None);
+        assert!((s.current_zoom() - 1.1).abs() < 1e-4);
+
+        s.step_zoom(1, &mut tx);
+        assert_eq!(s.user_zoom, Some(1.25));
+        s.step_zoom(1, &mut tx);
+        assert_eq!(s.user_zoom, Some(1.5));
+        s.step_zoom(1, &mut tx);
+        assert_eq!(s.user_zoom, Some(1.5));
+
+        s.step_zoom(-1, &mut tx);
+        assert_eq!(s.user_zoom, Some(1.25));
+        s.step_zoom(-1, &mut tx);
+        assert_eq!(s.user_zoom, Some(1.1));
+        s.step_zoom(-1, &mut tx);
+        assert_eq!(s.user_zoom, Some(1.0));
+        s.step_zoom(-1, &mut tx);
+        assert_eq!(s.user_zoom, Some(0.9));
+        s.step_zoom(-1, &mut tx);
+        assert_eq!(s.user_zoom, Some(0.9));
+
+        s.set_user_zoom(None, &mut tx);
+        assert_eq!(s.user_zoom, None);
     }
 }
 

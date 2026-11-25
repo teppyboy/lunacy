@@ -19,29 +19,30 @@ pub fn view(
     hair: f32,
     compact: bool,
 ) -> El {
-    let content = col()
-        .key("settings-body")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .h_full()
-        .scroll(ScrollSpec::default())
-        .child(match page {
-            SettingsPage::Diagnostics => diagnostics::view(s, k, cx, compact),
-            SettingsPage::Connection => connection_page(s, k, compact),
-            SettingsPage::Projects if s.editor.project.is_some() => {
-                projects_detail(s, k, cx, compact)
-            }
-            SettingsPage::Projects => projects_list(s, k, compact),
-            other => config_page(s, k, other, cx, compact),
-        });
+    let content = widgets::scroll_bar(
+        col()
+            .key("settings-body")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .h_full()
+            .scroll(ScrollSpec::default())
+            .child(match page {
+                SettingsPage::Diagnostics => diagnostics::view(s, k, cx, compact),
+                SettingsPage::Connection => connection_page(s, k, compact),
+                SettingsPage::Appearance => appearance_page(s, k, cx, compact),
+                SettingsPage::Projects if s.editor.project.is_some() => {
+                    projects_detail(s, k, cx, compact)
+                }
+                SettingsPage::Projects => projects_list(s, k, compact),
+                other => config_page(s, k, other, cx, compact),
+            }),
+        k,
+    );
 
     let body = if compact {
         let mut strip = row().gap(6.0).center_y();
-        for p in SettingsPage::CONFIG
-            .into_iter()
-            .chain([SettingsPage::Diagnostics, SettingsPage::Connection])
-        {
+        for p in SettingsPage::CONFIG.into_iter().chain(SettingsPage::WINDOW) {
             strip = strip.child(page_chip(k, s, p));
         }
         col()
@@ -55,7 +56,7 @@ pub fn view(
                     .px(14.0)
                     .py(8.0)
                     .fill(k.c.layer_01)
-                    .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+                    .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
                     .scroll_x()
                     .child(strip),
             )
@@ -68,7 +69,7 @@ pub fn view(
             .gap(1.0)
             .py(10.0)
             .fill(k.c.layer_01)
-            .border_sides([0.0, 0.0, 0.0, hair], k.c.border_muted);
+            .border_sides([0.0, 0.0, 0.0, hair], k.c.border_base);
         pages = pages.child(
             row()
                 .w_full()
@@ -87,7 +88,7 @@ pub fn view(
                 .pb(8.0)
                 .child(widgets::caption(k, "THIS WINDOW")),
         );
-        for p in [SettingsPage::Diagnostics, SettingsPage::Connection] {
+        for p in SettingsPage::WINDOW {
             pages = pages.child(page_row(k, s, p));
         }
         row()
@@ -168,7 +169,7 @@ fn page_row(k: &Kit, s: &State, page: SettingsPage) -> El {
 /// The header with dirty state, Save, Discard and the ⌘S hint.
 fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) -> El {
     let e = &s.editor;
-    let local = matches!(page, SettingsPage::Connection | SettingsPage::Diagnostics);
+    let local = page.is_local();
     let dirty = e.dirty();
 
     let title_row = row()
@@ -205,7 +206,7 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) ->
             .px(14.0)
             .py(12.0)
             .gap(10.0)
-            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
             .child(
                 col().w_full().gap(2.0).child(title_row).child(
                     text(page.blurb())
@@ -234,7 +235,7 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) ->
         .py(12.0)
         .gap(10.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
         .child(
             col().gap(1.0).grow(1.0).child(title_row).child(
                 text(page.blurb())
@@ -988,7 +989,7 @@ fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
                 if invalid {
                     theme::status(k).failure
                 } else {
-                    k.c.border_muted
+                    k.c.border_base
                 },
             )
             .child(info)
@@ -1451,4 +1452,129 @@ fn text_input_bound(
         .control(input.key("control"))
         .build(k)
         .key(key)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Appearance (this window, not the daemon)
+
+fn format_zoom_value(z: f32) -> String {
+    if (z * 100.0 - (z * 10.0).round() * 10.0).abs() < 0.1 {
+        format!("{z:.1}")
+    } else {
+        format!("{z:.2}")
+    }
+}
+
+fn appearance_page(s: &State, k: &Kit, cx: &Cx<State>, compact: bool) -> El {
+    let mut c = col()
+        .w_full()
+        .px(if compact { 14.0 } else { 22.0 })
+        .py(if compact { 14.0 } else { 18.0 })
+        .gap(18.0);
+
+    c = c.child(widgets::section(
+        k,
+        "Appearance",
+        Some("Window theme and interface scale. Saved locally for this window or browser."),
+    ));
+
+    let theme_options: Vec<(String, String)> = theme::ThemeMode::ALL
+        .iter()
+        .map(|m| (m.as_str().to_string(), m.label().to_string()))
+        .collect();
+    c = c.child(widgets::labelled(
+        k,
+        "Theme",
+        Some(match s.theme_mode {
+            theme::ThemeMode::System => {
+                if cx.system_dark() {
+                    "Following system appearance (currently Dark)."
+                } else {
+                    "Following system appearance (currently Light)."
+                }
+            }
+            theme::ThemeMode::Light => "Always light surfaces.",
+            theme::ThemeMode::Dark => "Always standard dark surfaces.",
+            theme::ThemeMode::Oled => "True #000000 black canvas with stepped near-black cards.",
+        }),
+        widgets::choice_row_for(
+            k,
+            compact,
+            &theme_options,
+            Some(s.theme_mode.as_str()),
+            None,
+            |s: &mut State, picked: &str, tx: &mut Tx| {
+                if let Some(mode) = theme::ThemeMode::parse(picked) {
+                    s.set_theme_mode(mode, tx);
+                }
+            },
+        )
+        .key("appearance-theme"),
+    ));
+
+    c = c.child(widgets::divider(k));
+
+    let zoom_options: Vec<(String, String)> = crate::state::ZOOM_STEPS
+        .iter()
+        .map(|&z| {
+            let v = format_zoom_value(z);
+            (v.clone(), format!("{v}×"))
+        })
+        .collect();
+    let cur = s.current_zoom();
+    let active_zoom = crate::state::ZOOM_STEPS
+        .iter()
+        .copied()
+        .find(|&z| (z - cur).abs() < 0.02)
+        .map(format_zoom_value);
+    c = c.child(widgets::labelled(
+        k,
+        "Zoom",
+        Some("Interface scale across all screens. Shortcuts: Ctrl/Cmd+=, Ctrl/Cmd+-, Ctrl/Cmd+0."),
+        widgets::choice_row_for(
+            k,
+            compact,
+            &zoom_options,
+            active_zoom.as_deref(),
+            None,
+            |s: &mut State, picked: &str, tx: &mut Tx| {
+                if let Ok(z) = picked.parse::<f32>() {
+                    s.set_user_zoom(Some(z), tx);
+                }
+            },
+        )
+        .key("appearance-zoom"),
+    ));
+
+    let zoom_status = match s.user_zoom {
+        Some(z) => format!("Custom scale: {}×", format_zoom_value(z)),
+        None => format!(
+            "Automatic default ({:.1}× on {})",
+            cur,
+            if compact { "compact" } else { "desktop" }
+        ),
+    };
+    c = c.child(
+        row()
+            .w_full()
+            .gap(10.0)
+            .center_y()
+            .flex_wrap()
+            .child(
+                Button::new("Reset to default")
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Regular)
+                    .disabled(s.user_zoom.is_none())
+                    .on_press_tx(|s: &mut State, tx: &mut Tx| s.set_user_zoom(None, tx))
+                    .build(k)
+                    .key("appearance-zoom-reset"),
+            )
+            .child(
+                text(zoom_status)
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .wrap(),
+            ),
+    );
+    c
 }

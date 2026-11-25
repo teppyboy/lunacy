@@ -954,6 +954,63 @@ def test_responsive_layouts(sb: Sandbox, alpha_run_id: str) -> None:
             assert_tree_responsive("drawer", t_drawer, win_w=win_w, expect_compact=True, expect_zoom=zoom)
 
 
+def test_job_b_features(sb: Sandbox, alpha_run_id: str) -> None:
+    print("[e2e] Testing Job B (log auto-follow, scrollbars, OLED theme + zoom persistence)...")
+    t_home = sb.run_ui("jobb_home", [], at=1.1, size="1180x760")
+    assert has_key(t_home, "projects-scroll-scroll-area")
+    assert has_key(t_home, "rail-scroll-scroll-area")
+
+    # B1 & B2: run log starts at bottom, keeps bottom across Tail -> Full switch, mounts scrollbars + thumb.
+    sc = Script(1.0).tap("project-alpha", 0.7).tap(f"run-{alpha_run_id}", 0.7).tap("step-0", 0.8)
+    t_tail = sb.run_ui("jobb_log_tail", sc.events, at=sc.t + 0.3, size="1180x760")
+    assert has_key(t_tail, "run-steps-scroll-scroll-area")
+    assert has_key(t_tail, "run-log-scroll-scroll-area")
+    assert has_key(t_tail, "thumb")
+    vp = el_rect(find_el(t_tail, "run-log-scroll"))
+    lg = el_rect(find_el(t_tail, "log"))
+    assert abs((lg[1] + lg[3]) - (vp[1] + vp[3])) <= 2.5, f"Tail not at bottom: vp={vp} log={lg}"
+
+    sc_full = sc.tap("run-log-mode/segment1", 0.8)
+    t_full = sb.run_ui("jobb_log_full", sc_full.events, at=sc_full.t + 0.4, size="1180x760")
+    vp_f = el_rect(find_el(t_full, "run-log-scroll"))
+    lg_f = el_rect(find_el(t_full, "log"))
+    assert abs((lg_f[1] + lg_f[3]) - (vp_f[1] + vp_f[3])) <= 2.5, f"Full not at bottom: vp={vp_f} log={lg_f}"
+
+    # B4 & B5: OLED + 1.25x zoom in Appearance, persisted across restart, then Ctrl/Cmd+= & Ctrl/Cmd+0.
+    sc_set = (
+        Script(1.0)
+        .tap("titlebar-settings", 0.6)
+        .tap("settings-nav-Appearance", 0.4)
+        .tap("appearance-theme/choice-oled", 0.35)
+        .tap("appearance-zoom/choice-1.25", 0.4)
+    )
+    t_oled = sb.run_ui("jobb_oled_125", sc_set.events, at=sc_set.t + 0.4, size="1180x760")
+    assert find_el(t_oled, "app-root").get("fill") == "#000000ff"
+    assert has_key(t_oled, "settings-body-scroll-area")
+    assert_tree_responsive("appearance-oled-1.25", t_oled, win_w=1180.0, expect_compact=False, expect_zoom=1.25)
+
+    # Fresh UI instance in the same RUNE_DIRS_ROOT restores OLED + 1.25x.
+    t_persist = sb.run_ui("jobb_persist", [], at=1.2, size="1180x760")
+    assert find_el(t_persist, "app-root").get("fill") == "#000000ff"
+    assert_tree_responsive("persisted-oled-1.25", t_persist, win_w=1180.0, expect_compact=False, expect_zoom=1.25)
+
+    # Ctrl/Cmd+= steps 1.25 -> 1.5; then reset cleanly to System + default 1.1x for subsequent steps.
+    sc_15 = Script(1.0).key("=", cmd=True, after=0.4)
+    t_15 = sb.run_ui("jobb_zoom_15", sc_15.events, at=sc_15.t + 0.3, size="1180x760")
+    assert_tree_responsive("shortcut-1.5", t_15, win_w=1180.0, expect_compact=False, expect_zoom=1.5)
+
+    sc_reset = (
+        Script(1.0)
+        .key("0", cmd=True, after=0.4)
+        .tap("titlebar-settings", 0.6)
+        .tap("settings-nav-Appearance", 0.4)
+        .tap("appearance-theme/choice-system", 0.35)
+    )
+    t_rst = sb.run_ui("jobb_reset", sc_reset.events, at=sc_reset.t + 0.3, size="1180x760")
+    assert find_el(t_rst, "app-root").get("fill") != "#000000ff"
+    assert_tree_responsive("shortcut-reset-1.1", t_rst, win_w=1180.0, expect_compact=False, expect_zoom=1.1)
+
+
 def test_web_build(sb: Sandbox, alpha_run_id: str) -> None:
     print("[e2e] Testing web build (WASM + fetch) in headless Chrome over CDP...")
     t_home = sb.run_ui("web_coords_home", [], at=1.1, size="1180x760")
@@ -1016,6 +1073,7 @@ def main() -> int:
         alpha_run_id = test_contract(sb)
         test_native_flows(sb, alpha_run_id)
         test_responsive_layouts(sb, alpha_run_id)
+        test_job_b_features(sb, alpha_run_id)
         test_web_build(sb, alpha_run_id)
         print("[e2e] ALL CHECKS PASSED!")
         return 0

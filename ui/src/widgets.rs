@@ -53,6 +53,12 @@ pub fn project_pill(k: &Kit, state: ProjectState) -> El {
     pill(k, label, ink)
 }
 
+/// Always-visible draggable scrollbar styling for scrollable panels.
+pub fn scroll_bar(viewport: El, k: &Kit) -> El {
+    use rune_kit::ScrollBar;
+    viewport.scroll_bar_styled(rune_kit::ScrollBarStyle::from_kit(k).always_visible())
+}
+
 /// A card: a rounded, bordered surface with an optional title and body.
 pub fn card(k: &Kit) -> El {
     col()
@@ -60,7 +66,7 @@ pub fn card(k: &Kit) -> El {
         .gap(0.0)
         .radius(k.radius.lg)
         .fill(k.c.layer_01)
-        .border(theme::hair(1.0), k.c.border_muted)
+        .border(theme::hair(1.0), k.c.border_base)
 }
 
 /// A titled section inside a settings page.

@@ -20,9 +20,132 @@ pub struct Status {
     pub skipped: Color,
 }
 
+/// Theme mode chosen by the user for this window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+    Oled,
+}
+
+impl ThemeMode {
+    pub const ALL: [ThemeMode; 4] = [
+        ThemeMode::System,
+        ThemeMode::Light,
+        ThemeMode::Dark,
+        ThemeMode::Oled,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ThemeMode::System => "system",
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+            ThemeMode::Oled => "oled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "system" => Some(ThemeMode::System),
+            "light" => Some(ThemeMode::Light),
+            "dark" => Some(ThemeMode::Dark),
+            "oled" => Some(ThemeMode::Oled),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            ThemeMode::System => "System",
+            ThemeMode::Light => "Light",
+            ThemeMode::Dark => "Dark",
+            ThemeMode::Oled => "OLED",
+        }
+    }
+}
+
 /// The kit for the current appearance: the neutral tokens, light or dark.
 pub fn kit(dark: bool) -> Kit {
     Kit::neutral(dark)
+}
+
+/// The kit for the resolved window theme mode and responsive density (`compact` => ≥ 44 pt touch targets).
+pub fn kit_mode(mode: ThemeMode, system_dark: bool, compact: bool) -> Kit {
+    let (dark, oled) = match mode {
+        ThemeMode::System => (system_dark, false),
+        ThemeMode::Light => (false, false),
+        ThemeMode::Dark => (true, false),
+        ThemeMode::Oled => (true, true),
+    };
+    let mut k = kit_for(dark, compact);
+    if oled {
+        apply_oled(&mut k);
+    }
+    k
+}
+
+fn srgb_hex(rgb: u32) -> Color {
+    let ch = |u: u32| {
+        let c = (u & 0xff) as f32 / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    Color {
+        r: ch(rgb >> 16),
+        g: ch(rgb >> 8),
+        b: ch(rgb),
+        a: 1.0,
+    }
+}
+
+fn apply_oled(k: &mut Kit) {
+    // True black canvas with stepped near-black surfaces and crisp borders/rings.
+    k.c.page = Color::BLACK;
+    k.c.bg_deep = Color::BLACK;
+    k.c.bg_base = srgb_hex(0x0a0a0d);
+    k.c.layer_01 = srgb_hex(0x08080a);
+    k.c.layer_02 = srgb_hex(0x101014);
+    k.c.layer_03 = srgb_hex(0x18181f);
+    k.c.layer_04 = srgb_hex(0x22222b);
+
+    k.c.surface_base = k.c.layer_02;
+    k.c.surface_weak = k.c.layer_02;
+    k.c.surface_disabled = k.c.layer_02;
+    k.c.surface_raised = k.c.bg_base;
+    k.c.surface_raised_base = k.c.bg_base;
+    k.c.bg_button_neutral = k.c.layer_02;
+
+    k.c.hover = srgb_hex(0x18181f);
+    k.c.surface_hover = srgb_hex(0x18181f);
+    k.c.surface_raised_hover = srgb_hex(0x1d1d26);
+    k.c.pressed = srgb_hex(0x23232e);
+
+    k.c.border_muted = srgb_hex(0x24242c);
+    k.c.border_weak = srgb_hex(0x24242c);
+    k.c.border_disabled = srgb_hex(0x1e1e24);
+    k.c.border_base = srgb_hex(0x3a3a46);
+    k.c.border_hover = srgb_hex(0x4c4c5c);
+    k.c.std_border = srgb_hex(0x3a3a46);
+    k.c.border_strong = srgb_hex(0x58586a);
+
+    for list in [
+        &mut k.elevation.raised,
+        &mut k.elevation.floating,
+        &mut k.elevation.overlay,
+        &mut k.elevation.button_neutral,
+    ] {
+        for sh in list.iter_mut() {
+            if sh.spread > 0.0 {
+                sh.color = k.c.border_base;
+            }
+        }
+    }
 }
 
 /// The kit adjusted for compact / touch viewports: enlarged tap heights (≥ 44 pt) on buttons

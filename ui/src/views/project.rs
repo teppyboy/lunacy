@@ -22,7 +22,7 @@ pub fn view(s: &State, k: &Kit, name: &str, _cx: &mut Cx<State>, hair: f32, comp
         .h_full()
         .min_h(0.0)
         .child(header(s, k, project, hair, compact))
-        .child(
+        .child(widgets::scroll_bar(
             col()
                 .key("project-scroll")
                 .w_full()
@@ -32,7 +32,8 @@ pub fn view(s: &State, k: &Kit, name: &str, _cx: &mut Cx<State>, hair: f32, comp
                 .pt(16.0)
                 .scroll(ScrollSpec::default())
                 .child(body(s, k, project, compact)),
-        )
+            k,
+        ))
 }
 
 fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El {
@@ -71,7 +72,7 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
             .px(14.0)
             .py(12.0)
             .gap(10.0)
-            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
             .child(
                 col()
                     .w_full()
@@ -110,7 +111,7 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
         .py(14.0)
         .gap(12.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
         .child(
             col()
                 .gap(3.0)
@@ -177,7 +178,7 @@ fn body(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
             .w_full()
             .gap(0.0)
             .radius(k.radius.lg)
-            .border(1.0, k.c.border_muted);
+            .border(1.0, k.c.border_base);
         for (i, run) in s.runs.iter().enumerate() {
             rows = rows.child(run_row(k, run, i + 1 == s.runs.len(), compact));
         }

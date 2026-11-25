@@ -38,7 +38,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, hair: f32, compact: bool) -
         .h_full()
         .min_h(0.0)
         .child(header(s, k, hair, compact))
-        .child(
+        .child(widgets::scroll_bar(
             col()
                 .key("projects-scroll")
                 .w_full()
@@ -48,7 +48,8 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, hair: f32, compact: bool) -
                 .pt(16.0)
                 .scroll(ScrollSpec::default())
                 .child(body),
-        )
+            k,
+        ))
 }
 
 fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
@@ -94,7 +95,7 @@ fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
             .px(14.0)
             .py(12.0)
             .gap(10.0)
-            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
             .child(
                 row()
                     .w_full()
@@ -131,7 +132,7 @@ fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
         .py(14.0)
         .gap(12.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
         .child(
             col()
                 .gap(1.0)
@@ -247,7 +248,7 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         .gap(if compact { 10.0 } else { 8.0 })
         .radius(k.radius.lg)
         .fill(k.c.layer_01)
-        .border(hair_width(k), k.c.border_muted)
+        .border(hair_width(k), k.c.border_base)
         .hover(k.c.layer_02)
         .on_press_tx({
             let name = project.name.clone();

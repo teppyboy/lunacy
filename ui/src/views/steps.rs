@@ -185,7 +185,7 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact:
     let border_color = if invalid {
         theme::status(k).failure
     } else {
-        k.c.border_muted
+        k.c.border_base
     };
     let fill_color = if selected { k.c.layer_03 } else { k.c.layer_01 };
 
@@ -258,7 +258,7 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact
         .gap(16.0)
         .radius(k.radius.lg)
         .fill(k.c.layer_02)
-        .border(1.0, k.c.border_base);
+        .border(1.0, k.c.border_strong);
 
     c = c.child(
         row()

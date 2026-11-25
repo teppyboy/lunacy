@@ -181,7 +181,8 @@ pub fn load(s: &mut State, view: View) {
             s.editor.page = page;
             match page {
                 SettingsPage::Projects => s.editor.project = Some(0),
-                SettingsPage::Diagnostics | SettingsPage::Connection => {}
+                SettingsPage::Diagnostics | SettingsPage::Connection | SettingsPage::Appearance => {
+                }
                 _ => {}
             }
         }

@@ -129,8 +129,50 @@ pub fn conn_from_env() -> Conn {
             }
         }
     }
+    // Web: the token this browser saved last time (the page has no command line).
+    if conn.token.is_empty() {
+        if let Some(t) = stored_token() {
+            conn.token = t;
+        }
+    }
     conn
 }
+
+#[cfg(target_arch = "wasm32")]
+const TOKEN_KEY: &str = "lunacy.token";
+
+#[cfg(target_arch = "wasm32")]
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok()?
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stored_token() -> Option<String> {
+    local_storage()?
+        .get_item(TOKEN_KEY)
+        .ok()?
+        .filter(|t| !t.is_empty())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stored_token() -> Option<String> {
+    None
+}
+
+/// Web: remember the token in this browser so a reload or a GitHub link stays signed in.
+#[cfg(target_arch = "wasm32")]
+fn store_token(token: &str) {
+    if let Some(s) = local_storage() {
+        let _ = if token.is_empty() {
+            s.remove_item(TOKEN_KEY)
+        } else {
+            s.set_item(TOKEN_KEY, token)
+        };
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn store_token(_: &str) {}
 
 // ---------------------------------------------------------------------------------------------
 // Requests
@@ -343,12 +385,16 @@ impl SettingsPage {
             }
             SettingsPage::Github => "How check runs are reported: a token, or a GitHub App.",
             SettingsPage::Discord => "Webhook notifications when a pipeline starts or finishes.",
-            SettingsPage::Act => "The act binary, its image mapping, its arguments and the lock it holds.",
+            SettingsPage::Act => {
+                "The act binary, its image mapping, its arguments and the lock it holds."
+            }
             SettingsPage::Projects => {
                 "Repositories to watch, and the CI and deploy steps for each."
             }
             SettingsPage::Diagnostics => "The daemon's host, tools and config file.",
-            SettingsPage::Connection => "This window's server URL and token. Stored nowhere.",
+            SettingsPage::Connection => {
+                "This window's server URL and token, not part of config.toml."
+            }
         }
     }
 }
@@ -649,6 +695,7 @@ impl State {
     pub fn reconnect(&mut self, tx: &mut Tx) {
         self.live = self.conn.clone();
         self.live.server = normalize_server(&self.live.server);
+        store_token(&self.live.token);
         self.link = Link::Connecting;
         self.loaded = false;
         self.projects_error = None;

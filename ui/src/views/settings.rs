@@ -898,7 +898,7 @@ fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) 
 
 fn connection_page(s: &State, k: &Kit) -> El {
     let mut c = col().w_full().px(22.0).py(18.0).gap(18.0);
-    c = c.child(widgets::section(k, "Connection", Some("Where this window looks for the daemon. These settings are not written to config.toml.")));
+    c = c.child(widgets::section(k, "Connection", Some("Where this window looks for the daemon. Not written to config.toml; in a browser the token is remembered for this site.")));
     c = c.child(widgets::pair(
         text_input_bound(k, "Server URL", &s.ui_server, |s: &mut State| {
             &mut s.ui_server

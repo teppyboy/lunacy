@@ -162,6 +162,9 @@ struct ActLine {
     execution_time: Option<u64>,
     #[serde(rename = "raw_output", default)]
     raw_output: Option<bool>,
+    /// "Pre" / "Main" / "Post"; absent on setup/teardown lines.
+    #[serde(default)]
+    stage: Option<String>,
 }
 
 /// Live progress accumulator built from act's JSON lines.
@@ -229,7 +232,18 @@ impl ActProgress {
             return parsed.msg;
         }
 
-        if let Some(step_name) = &parsed.step {
+        // A composite action reports its inner steps under the outer step's name with a
+        // longer stepID (`["1","0"]`), and Pre/Post stages reuse the step name. Only the
+        // top-level Main step is a row, like the Actions UI; a failing Pre/Post still is.
+        let nested = step_id.is_some_and(|ids| ids.len() > 1);
+        let side_stage = matches!(parsed.stage.as_deref(), Some("Pre" | "Post"));
+        let failed = parsed
+            .step_result
+            .as_deref()
+            .is_some_and(|r| r != "success" && r != "skipped");
+        let ignored = nested || (side_stage && !failed);
+
+        if let Some(step_name) = parsed.step.as_ref().filter(|_| !ignored) {
             if is_bookkeeping {
                 // `stepResult` for these carries no `stepID`, so remember the name.
                 if !self.bookkeeping_steps.contains(step_name) {
@@ -530,6 +544,42 @@ not json at all
         );
         assert!(human[4].starts_with("[Audit dependencies] "), "{human:?}");
         assert!(human[5].starts_with("[Audit dependencies] "), "{human:?}");
+    }
+
+    #[test]
+    fn composite_and_pre_post_steps_are_one_row() {
+        // Recorded from act 0.2.97: a composite action (`Set up thing`) with two inner
+        // steps, plus its Post stage; lunarum's `Set up Flutter` showed up six times.
+        let lines = [
+            r#"{"job":"T/b","jobID":"b","stage":"Pre","step":"Set up thing","stepID":["1"],"msg":"⭐ Run Pre Set up thing"}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Pre","step":"Set up thing","stepID":["1"],"stepResult":"success","executionTime":1000000}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Main","step":"Set up thing","stepID":["1"],"msg":"⭐ Run Main Set up thing"}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Main","step":"Set up thing","stepID":["1","0"],"msg":"⭐ Run Main Inner one"}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Main","step":"Set up thing","stepID":["1","0"],"stepResult":"success","executionTime":5000000}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Main","step":"Set up thing","stepID":["1","1"],"msg":"⭐ Run Main Inner two"}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Main","step":"Set up thing","stepID":["1","1"],"stepResult":"success","executionTime":5000000}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Main","step":"Set up thing","stepID":["1"],"stepResult":"success","executionTime":28000000}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Main","step":"After","stepID":["2"],"msg":"⭐ Run Main After"}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Main","step":"After","stepID":["2"],"stepResult":"success","executionTime":6000000}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Post","step":"Set up thing","stepID":["1"],"msg":"⭐ Run Post Set up thing"}"#,
+            r#"{"job":"T/b","jobID":"b","stage":"Post","step":"Set up thing","stepID":["1"],"stepResult":"success","executionTime":20000}"#,
+        ];
+        let mut p = ActProgress::new();
+        for l in lines {
+            p.feed(l);
+        }
+        let rows: Vec<_> = p
+            .substeps()
+            .into_iter()
+            .map(|s| (s.name, s.status, s.duration_ms))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Set up thing".to_string(), StepStatus::Success, Some(28)),
+                ("After".to_string(), StepStatus::Success, Some(6)),
+            ]
+        );
     }
 
     #[test]

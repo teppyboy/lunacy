@@ -28,7 +28,7 @@ ureq = { version = "3", default-features = false, features = ["json", "rustls"] 
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Headers", "History", "Location", "Request", "RequestInit", "Response", "Window"] }
+web-sys = { version = "0.3", features = ["Headers", "History", "Location", "Request", "RequestInit", "Response", "Storage", "Window"] }
 
 [patch.crates-io]
 wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }

@@ -28,4 +28,6 @@ fi
 
 args=(lunacy-ui --out dist)
 [ "${1:-}" = "--dev" ] && args+=(--dev) || args+=(--opt)
-exec "$RUNE/scripts/web-build.sh" "${args[@]}"
+"$RUNE/scripts/web-build.sh" "${args[@]}"
+# Our own page: absolute asset paths (deep links), a /runs/{id} redirect, readable errors.
+cp web/index.html dist/index.html

@@ -10,12 +10,12 @@ use crate::state::State;
 use crate::theme;
 use crate::widgets;
 
-pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>) -> El {
+pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     let mut c = col()
         .key("diagnostics")
         .w_full()
-        .px(22.0)
-        .py(18.0)
+        .px(if compact { 14.0 } else { 22.0 })
+        .py(if compact { 14.0 } else { 18.0 })
         .gap(20.0);
 
     if let Some(error) = &s.system_error {
@@ -30,6 +30,34 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>) -> El {
     };
 
     // The host OS, as the page's headline: it decides which `only_on` steps run.
+    let mut host_row = row().w_full().gap(10.0).center_y();
+    if compact {
+        host_row = host_row.flex_wrap();
+    }
+    host_row = host_row
+        .child(
+            text(widgets::os_name(&info.os))
+                .key("daemon-os")
+                .font(rune::TextStyle {
+                    size: 19.0,
+                    ..k.ty.ui_medium
+                })
+                .color(k.c.text_base),
+        )
+        .child(widgets::pill(k, info.os.clone(), k.c.text_accent))
+        .child(el().grow(1.0))
+        .child(
+            Button::new("Refresh")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                    s.request_system();
+                    tx.instant();
+                })
+                .build(k)
+                .key("diagnostics-refresh"),
+        );
+
     c = c.child(
         col()
             .w_full()
@@ -39,31 +67,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>) -> El {
             .fill(k.c.layer_01)
             .border(1.0, k.c.border_base)
             .child(widgets::caption(k, "DAEMON HOST"))
-            .child(
-                row()
-                    .w_full()
-                    .gap(10.0)
-                    .center_y()
-                    .child(
-                        text(widgets::os_name(&info.os))
-                            .key("daemon-os")
-                            .font(rune::TextStyle { size: 19.0, ..k.ty.ui_medium })
-                            .color(k.c.text_base),
-                    )
-                    .child(widgets::pill(k, info.os.clone(), k.c.text_accent))
-                    .child(el().grow(1.0))
-                    .child(
-                        Button::new("Refresh")
-                            .variant(ButtonVariant::Outline)
-                            .control_size(ControlSize::Small)
-                            .on_press_tx(|s: &mut State, tx: &mut Tx| {
-                                s.request_system();
-                                tx.instant();
-                            })
-                            .build(k)
-                            .key("diagnostics-refresh"),
-                    ),
-            )
+            .child(host_row)
             .child(
                 text("Steps limited with `only_on` run only when this host is in their list; elsewhere they are recorded as skipped.".to_string())
                 .font(k.ty.small)
@@ -74,22 +78,34 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>) -> El {
 
     c = c.child(widgets::section(k, "Daemon", None));
     let mut daemon = col().w_full().gap(0.0);
-    daemon = daemon.child(widgets::kv(k, "Version", widgets::value(k, &info.version)));
-    daemon = daemon.child(widgets::divider(k));
-    daemon = daemon.child(widgets::kv(
+    daemon = daemon.child(widgets::kv_for(
         k,
+        compact,
+        "Version",
+        widgets::value_for(k, compact, &info.version),
+    ));
+    daemon = daemon.child(widgets::divider(k));
+    daemon = daemon.child(widgets::kv_for(
+        k,
+        compact,
         "Config file",
-        widgets::value(k, &info.config_path),
+        widgets::value_for(k, compact, &info.config_path),
     ));
     if let Some(state_dir) = &info.state_dir {
         daemon = daemon.child(widgets::divider(k));
-        daemon = daemon.child(widgets::kv(k, "State dir", widgets::value(k, state_dir)));
+        daemon = daemon.child(widgets::kv_for(
+            k,
+            compact,
+            "State dir",
+            widgets::value_for(k, compact, state_dir),
+        ));
     }
     daemon = daemon.child(widgets::divider(k));
-    daemon = daemon.child(widgets::kv(
+    daemon = daemon.child(widgets::kv_for(
         k,
+        compact,
         "Server URL",
-        widgets::value(k, &s.server_display()),
+        widgets::value_for(k, compact, &s.server_display()),
     ));
     c = c.child(daemon);
 
@@ -101,15 +117,23 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>) -> El {
     let mut tools = col().w_full().gap(0.0);
     tools = tools.child(tool_row(
         k,
+        compact,
         "act",
         info.act.path.as_deref(),
         info.act.version.as_deref(),
     ));
     tools = tools.child(widgets::divider(k));
-    tools = tools.child(tool_row(k, "git", None, info.git.version.as_deref()));
-    tools = tools.child(widgets::divider(k));
-    tools = tools.child(widgets::kv(
+    tools = tools.child(tool_row(
         k,
+        compact,
+        "git",
+        None,
+        info.git.version.as_deref(),
+    ));
+    tools = tools.child(widgets::divider(k));
+    tools = tools.child(widgets::kv_for(
+        k,
+        compact,
         "docker",
         match (info.docker.ok, info.docker.error.as_deref()) {
             (true, _) => widgets::pill(k, "Available", theme::status(k).success),
@@ -122,7 +146,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>) -> El {
     c
 }
 
-fn tool_row(k: &Kit, name: &str, path: Option<&str>, version: Option<&str>) -> El {
+fn tool_row(k: &Kit, compact: bool, name: &str, path: Option<&str>, version: Option<&str>) -> El {
     let found = path.is_some() || version.is_some();
     let detail = match (path, version) {
         (Some(path), Some(version)) => format!("{version} · {path}"),
@@ -130,6 +154,37 @@ fn tool_row(k: &Kit, name: &str, path: Option<&str>, version: Option<&str>) -> E
         (None, Some(version)) => version.to_string(),
         (None, None) => "not found".to_string(),
     };
+    let status_pill = if found {
+        widgets::pill(k, "Found", theme::status(k).success)
+    } else {
+        widgets::pill(k, "Missing", theme::status(k).failure)
+    };
+    if compact {
+        return col()
+            .w_full()
+            .min_h(44.0)
+            .py(8.0)
+            .gap(4.0)
+            .child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        text(name.to_string())
+                            .font(k.ty.small_medium)
+                            .color(k.c.text_muted)
+                            .grow(1.0),
+                    )
+                    .child(status_pill),
+            )
+            .child(
+                text(detail)
+                    .font(k.ty.mono)
+                    .color(if found { k.c.text_base } else { k.c.text_faint })
+                    .wrap(),
+            );
+    }
     row()
         .w_full()
         .min_h(30.0)
@@ -149,9 +204,5 @@ fn tool_row(k: &Kit, name: &str, path: Option<&str>, version: Option<&str>) -> E
                 .truncate()
                 .grow(1.0),
         )
-        .child(if found {
-            widgets::pill(k, "Found", theme::status(k).success)
-        } else {
-            widgets::pill(k, "Missing", theme::status(k).failure)
-        })
+        .child(status_pill)
 }

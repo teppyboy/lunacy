@@ -676,6 +676,12 @@ pub struct State {
     pub ready: bool,
     /// True for static `--scene` fixtures: keeps `poll` from talking to any network daemon.
     pub demo: bool,
+    /// Compact navigation drawer open state (used below ~720pt width).
+    pub drawer_open: bool,
+    /// User-chosen UI zoom factor (`None` = responsive default: 1.0 compact, 1.1 desktop).
+    pub user_zoom: Option<f32>,
+    /// Tracks `(commit_gen, target_zoom)` so responsive default zoom never oscillates.
+    pub(crate) zoom_track: std::cell::Cell<(u64, f32)>,
 }
 
 impl State {
@@ -721,6 +727,9 @@ impl State {
             clock: 0.0,
             ready: false,
             demo: false,
+            drawer_open: false,
+            user_zoom: None,
+            zoom_track: std::cell::Cell::new((0, 1.0)),
         };
         state.ui_server = TextEdit::new(state.conn.server.clone());
         state.ui_token = TextEdit::new(state.conn.token.clone());
@@ -1420,6 +1429,7 @@ impl State {
 
     pub fn open_projects(&mut self, tx: &mut Tx) {
         self.view = View::Projects;
+        self.drawer_open = false;
         self.set_hash("");
         self.next_projects = 0.0;
         self.refresh(tx);
@@ -1429,6 +1439,7 @@ impl State {
         self.view = View::Project {
             name: name.to_string(),
         };
+        self.drawer_open = false;
         self.runs.clear();
         self.runs_for = None;
         self.runs_error = None;
@@ -1439,6 +1450,7 @@ impl State {
 
     pub fn open_run(&mut self, id: &str, tx: &mut Tx) {
         self.view = View::Run { id: id.to_string() };
+        self.drawer_open = false;
         self.run = None;
         self.open_step = None;
         self.run_error = None;
@@ -1470,6 +1482,7 @@ impl State {
 
     pub fn open_settings(&mut self, page: SettingsPage, tx: &mut Tx) {
         self.view = View::Settings { page };
+        self.drawer_open = false;
         self.editor.page = page;
         self.set_hash("");
         if !matches!(page, SettingsPage::Connection | SettingsPage::Diagnostics)

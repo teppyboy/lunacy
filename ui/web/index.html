@@ -15,6 +15,13 @@ html,body{margin:0;width:100%;height:100%;overflow:hidden;overscroll-behavior:no
      data-cfasync=false keeps Cloudflare Rocket Loader from rewriting the module. -->
 <script type="module" data-cfasync="false">
 const status = document.querySelector('#status');
+// Sign-in link: /#token=… stores the API token for this site and drops it from the address bar
+// (a fragment is never sent to the server), so a phone needs no pasting.
+const t = location.hash.match(/^#token=([^&]+)/);
+if (t) {
+  localStorage.setItem('lunacy.token', decodeURIComponent(t[1]).trim());
+  history.replaceState(null, '', location.pathname + location.search);
+}
 // /runs/{id} → #/runs/{id}, the route the app reads (GitHub check links use either).
 const m = location.pathname.match(/^\/runs\/([^/]+)\/?$/);
 if (m && !location.hash) history.replaceState(null, '', '/#/runs/' + m[1]);

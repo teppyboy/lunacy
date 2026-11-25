@@ -20,7 +20,7 @@ pub const HOSTS: [(&str, &str); 3] = [
 ];
 
 /// One phase's list of steps, with an editor under the selected one.
-pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool) -> El {
+pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool, compact: bool) -> El {
     let e = &s.editor;
     let array = format!("project[{project}].{}", phase_key(deploy));
     let count = e.count(&array);
@@ -38,10 +38,10 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool) -> El {
         c = c.child(widgets::notice(k, k.c.text_faint, "No steps yet."));
     }
     for i in 0..count {
-        c = c.child(step_row(s, k, project, deploy, i));
+        c = c.child(step_row(s, k, project, deploy, i, compact));
         // The editor opens under its own row, so the step it edits is still on screen.
         if e.step == Some((project, deploy, i)) {
-            c = c.child(step_form(s, k, project, deploy, i));
+            c = c.child(step_form(s, k, project, deploy, i, compact));
         }
     }
     let phase_name = crate::state::phase_key(deploy);
@@ -49,6 +49,7 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool) -> El {
         row()
             .w_full()
             .gap(8.0)
+            .flex_wrap()
             .child(
                 Button::new("Add shell step")
                     .variant(ButtonVariant::Outline)
@@ -74,7 +75,7 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool) -> El {
     c
 }
 
-fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
+fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact: bool) -> El {
     let e = &s.editor;
     let path = step_path(project, deploy, i);
     let name = e.s(&format!("{path}.name"));
@@ -96,7 +97,7 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
     let invalid = e.invalid(&path);
     let only_on = host_list(e, &path);
 
-    let mut chips = row().gap(4.0);
+    let mut chips = row().gap(4.0).flex_wrap();
     for (value, label) in HOSTS {
         if only_on.iter().any(|h| h == value) {
             chips = chips.child(widgets::pill(k, label, theme::status(k).running));
@@ -104,6 +105,116 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
     }
 
     let phase_name = crate::state::phase_key(deploy);
+    let badge = el()
+        .size(20.0, 20.0)
+        .center()
+        .radius(k.radius.xs)
+        .fill(k.c.layer_04)
+        .child(
+            icon(
+                if is_act {
+                    &glyphs::TRIANGLE_DOWN
+                } else {
+                    &glyphs::CARET_RIGHT
+                },
+                12.0,
+            )
+            .color(k.c.icon_muted),
+        );
+
+    let blank = name.is_empty();
+    let title_text = text(if blank {
+        "(unnamed step)".to_string()
+    } else {
+        name
+    })
+    .font(k.ty.small_medium)
+    .color(if blank { k.c.text_faint } else { k.c.text_base });
+    let summary_text = text(summary).font(k.ty.mono).color(k.c.text_muted);
+    let info = col()
+        .gap(2.0)
+        .grow(1.0)
+        .min_w(0.0)
+        .child(if compact {
+            title_text.wrap()
+        } else {
+            title_text.nowrap().truncate()
+        })
+        .child(if compact {
+            summary_text.wrap()
+        } else {
+            summary_text.nowrap().truncate()
+        });
+
+    let actions = row()
+        .gap(if compact { 4.0 } else { 2.0 })
+        .child(widgets::compact_icon(
+            rune_kit::IconButton::new(&glyphs::CHEVRON_UP)
+                .label("Move up")
+                .control_size(ControlSize::Small)
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    s.move_step(project, deploy, i, false, tx)
+                })
+                .build(k)
+                .key(format!("step-up-{phase_name}-{i}")),
+            compact,
+        ))
+        .child(widgets::compact_icon(
+            rune_kit::IconButton::new(&glyphs::CHEVRON_DOWN)
+                .label("Move down")
+                .control_size(ControlSize::Small)
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    s.move_step(project, deploy, i, true, tx)
+                })
+                .build(k)
+                .key(format!("step-down-{phase_name}-{i}")),
+            compact,
+        ))
+        .child(widgets::compact_icon(
+            rune_kit::IconButton::new(&glyphs::CLOSE)
+                .label("Remove step")
+                .control_size(ControlSize::Small)
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    s.remove_step(project, deploy, i, tx)
+                })
+                .build(k)
+                .key(format!("step-remove-{phase_name}-{i}")),
+            compact,
+        ));
+
+    let border_color = if invalid {
+        theme::status(k).failure
+    } else {
+        k.c.border_muted
+    };
+    let fill_color = if selected { k.c.layer_03 } else { k.c.layer_01 };
+
+    if compact {
+        return col()
+            .key(format!("step-row-{phase_name}-{i}"))
+            .w_full()
+            .min_h(44.0)
+            .padding(10.0)
+            .gap(8.0)
+            .radius(k.radius.md)
+            .fill(fill_color)
+            .border(1.0, border_color)
+            .hover(k.c.hover)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.select_step(project, deploy, i, tx))
+            .cursor(rune::Cursor::Pointer)
+            .child(row().w_full().gap(10.0).center_y().child(badge).child(info))
+            .child(
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .center_y()
+                    .flex_wrap()
+                    .children((!only_on.is_empty()).then_some(chips))
+                    .child(el().grow(1.0))
+                    .child(actions),
+            );
+    }
+
     row()
         .key(format!("step-row-{phase_name}-{i}"))
         .w_full()
@@ -111,94 +222,15 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
         .gap(10.0)
         .center_y()
         .radius(k.radius.md)
-        .fill(if selected { k.c.layer_03 } else { k.c.layer_01 })
-        .border(
-            1.0,
-            if invalid {
-                theme::status(k).failure
-            } else {
-                k.c.border_muted
-            },
-        )
+        .fill(fill_color)
+        .border(1.0, border_color)
         .hover(k.c.hover)
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.select_step(project, deploy, i, tx))
         .cursor(rune::Cursor::Pointer)
-        .child(
-            el().size(20.0, 20.0)
-                .center()
-                .radius(k.radius.xs)
-                .fill(k.c.layer_04)
-                .child(
-                    icon(
-                        if is_act {
-                            &glyphs::TRIANGLE_DOWN
-                        } else {
-                            &glyphs::CARET_RIGHT
-                        },
-                        12.0,
-                    )
-                    .color(k.c.icon_muted),
-                ),
-        )
-        .child(
-            col()
-                .gap(2.0)
-                .grow(1.0)
-                .child({
-                    let blank = name.is_empty();
-                    text(if blank {
-                        "(unnamed step)".to_string()
-                    } else {
-                        name
-                    })
-                    .font(k.ty.small_medium)
-                    .color(if blank { k.c.text_faint } else { k.c.text_base })
-                    .nowrap()
-                    .truncate()
-                })
-                .child(
-                    text(summary)
-                        .font(k.ty.mono)
-                        .color(k.c.text_muted)
-                        .nowrap()
-                        .truncate(),
-                ),
-        )
+        .child(badge)
+        .child(info)
         .children((!only_on.is_empty()).then_some(chips))
-        .child(
-            row()
-                .gap(2.0)
-                .child(
-                    rune_kit::IconButton::new(&glyphs::CHEVRON_UP)
-                        .label("Move up")
-                        .control_size(ControlSize::Small)
-                        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-                            s.move_step(project, deploy, i, false, tx)
-                        })
-                        .build(k)
-                        .key(format!("step-up-{phase_name}-{i}")),
-                )
-                .child(
-                    rune_kit::IconButton::new(&glyphs::CHEVRON_DOWN)
-                        .label("Move down")
-                        .control_size(ControlSize::Small)
-                        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-                            s.move_step(project, deploy, i, true, tx)
-                        })
-                        .build(k)
-                        .key(format!("step-down-{phase_name}-{i}")),
-                )
-                .child(
-                    rune_kit::IconButton::new(&glyphs::CLOSE)
-                        .label("Remove step")
-                        .control_size(ControlSize::Small)
-                        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-                            s.remove_step(project, deploy, i, tx)
-                        })
-                        .build(k)
-                        .key(format!("step-remove-{phase_name}-{i}")),
-                ),
-        )
+        .child(actions)
 }
 
 fn first_line(text_value: &str) -> String {
@@ -213,7 +245,7 @@ fn host_list(e: &crate::state::Editor, path: &str) -> Vec<String> {
         .collect()
 }
 
-fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
+fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact: bool) -> El {
     let path = step_path(project, deploy, i);
     let e = &s.editor;
     let kind = e.s(&format!("{path}.kind"));
@@ -233,6 +265,7 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
             .w_full()
             .gap(8.0)
             .center_y()
+            .flex_wrap()
             .child(text("Step").font(k.ty.ui_medium).color(k.c.text_base))
             .child(widgets::pill(
                 k,
@@ -267,9 +300,12 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
         k,
         "Kind",
         Some("A shell step runs a command on this machine. An act step runs a GitHub Actions job in Docker."),
-        rune_kit::SegmentedControl::new(&["Shell", "act (GitHub Actions)"], Some(if is_act { 1 } else { 0 }))
-            .fit()
-            .on_pick(move |s: &mut State, picked: usize, tx: &mut Tx| {
+        widgets::segmented(
+            k,
+            compact,
+            &["Shell", "act (GitHub Actions)"],
+            Some(if is_act { 1 } else { 0 }),
+            move |s: &mut State, picked: usize, tx: &mut Tx| {
                 let want = if picked == 1 { "act" } else { "shell" };
                 s.editor.set_str(&format!("{kind_path}.kind"), want);
                 if want == "act" {
@@ -287,13 +323,13 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
                     }
                 }
                 tx.instant();
-            })
-            .build(k)
-            .key("step-kind"),
+            },
+        )
+        .key("step-kind"),
     ));
 
     if is_act {
-        c = c.child(act_fields(s, k, project, &path));
+        c = c.child(act_fields(s, k, project, &path, compact));
     } else {
         c = c.child(shell_fields(s, k, &path));
     }
@@ -305,11 +341,12 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize) -> El {
         "Host OS",
         Some("Leave all off to run on every host. A step excluded here is recorded as skipped, not failed."),
     ));
-    c = c.child(only_on_chips(s, k, project, deploy, i, &path));
+    c = c.child(only_on_chips(s, k, project, deploy, i, &path, compact));
 
     c = c.child(host_note(s, k, &path));
     c = c.child(widgets::divider(k));
-    c = c.child(widgets::pair(
+    c = c.child(widgets::pair_for(
+        compact,
         u64_field(
             s,
             k,
@@ -393,7 +430,7 @@ fn shell_fields(s: &State, k: &Kit, path: &str) -> El {
         .label("Command")
         .width(None)
         .rows(3)
-        .auto_grow(2, 14)
+        .auto_grow(crate::theme::area_min_rows(k), 14)
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
             let seeded = s.editor.s(&field);
@@ -422,7 +459,7 @@ fn shell_fields(s: &State, k: &Kit, path: &str) -> El {
     f.build(k).key(format!("field-{path}.run"))
 }
 
-fn act_fields(s: &State, k: &Kit, project: usize, path: &str) -> El {
+fn act_fields(s: &State, k: &Kit, project: usize, path: &str, compact: bool) -> El {
     let e = &s.editor;
     let mut c = col().w_full().gap(16.0);
 
@@ -452,6 +489,7 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str) -> El {
             .w_full()
             .gap(8.0)
             .center_y()
+            .flex_wrap()
             .child(
                 text("Workflow".to_string())
                     .font(k.ty.small_medium)
@@ -480,8 +518,9 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str) -> El {
             ),
     );
     c = c.child(
-        widgets::choice_row(
+        widgets::choice_row_for(
             k,
+            compact,
             &workflow_pairs,
             Some(current_workflow.as_str()),
             None,
@@ -540,8 +579,9 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str) -> El {
             k,
             "Job",
             Some("Runs one job. Empty runs every job in the workflow."),
-            widgets::choice_row(
+            widgets::choice_row_for(
                 k,
+                compact,
                 &pairs,
                 Some(current_job.as_str()),
                 Some("Every job"),
@@ -579,7 +619,7 @@ fn secrets_table(s: &State, k: &Kit, path: &str) -> El {
         .label("Secrets")
         .width(None)
         .rows(3)
-        .auto_grow(2, 8)
+        .auto_grow(crate::theme::area_min_rows(k), 8)
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
             let seeded = crate::paths::get_table_text(&s.editor.draft, &field);
@@ -614,7 +654,15 @@ fn secrets_table(s: &State, k: &Kit, path: &str) -> El {
 // only_on
 
 /// The OS chips: three toggles over `only_on`. None selected means every host.
-fn only_on_chips(s: &State, k: &Kit, project: usize, deploy: bool, index: usize, path: &str) -> El {
+fn only_on_chips(
+    s: &State,
+    k: &Kit,
+    project: usize,
+    deploy: bool,
+    index: usize,
+    path: &str,
+    compact: bool,
+) -> El {
     let selected = host_list(&s.editor, path);
     let mut row_el = row().w_full().gap(8.0).flex_wrap();
     for (value, label) in HOSTS {
@@ -632,8 +680,9 @@ fn only_on_chips(s: &State, k: &Kit, project: usize, deploy: bool, index: usize,
                 .role("checkbox")
                 .label(label)
                 .a11y_value(if on { "checked" } else { "unchecked" })
-                .h(26.0)
-                .px(11.0)
+                .min_h(if compact { 44.0 } else { 26.0 })
+                .min_w(if compact { 44.0 } else { 0.0 })
+                .px(if compact { 14.0 } else { 11.0 })
                 .gap(6.0)
                 .center_y()
                 .radius(k.radius.md)

@@ -11,62 +11,135 @@ use crate::theme;
 use crate::views::{diagnostics, steps};
 use crate::widgets;
 
-pub fn view(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>, hair: f32) -> El {
-    let mut pages = col()
-        .w(212.0)
-        .shrink()
+pub fn view(
+    s: &State,
+    k: &Kit,
+    page: SettingsPage,
+    cx: &mut Cx<State>,
+    hair: f32,
+    compact: bool,
+) -> El {
+    let content = col()
+        .key("settings-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
         .h_full()
-        .gap(1.0)
-        .py(10.0)
-        .fill(k.c.layer_01)
-        .border_sides([0.0, 0.0, 0.0, hair], k.c.border_muted);
-    pages = pages.child(
+        .scroll(ScrollSpec::default())
+        .child(match page {
+            SettingsPage::Diagnostics => diagnostics::view(s, k, cx, compact),
+            SettingsPage::Connection => connection_page(s, k, compact),
+            SettingsPage::Projects if s.editor.project.is_some() => {
+                projects_detail(s, k, cx, compact)
+            }
+            SettingsPage::Projects => projects_list(s, k, compact),
+            other => config_page(s, k, other, cx, compact),
+        });
+
+    let body = if compact {
+        let mut strip = row().gap(6.0).center_y();
+        for p in SettingsPage::CONFIG
+            .into_iter()
+            .chain([SettingsPage::Diagnostics, SettingsPage::Connection])
+        {
+            strip = strip.child(page_chip(k, s, p));
+        }
+        col()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(
+                row()
+                    .key("settings-nav-strip")
+                    .w_full()
+                    .px(14.0)
+                    .py(8.0)
+                    .fill(k.c.layer_01)
+                    .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+                    .scroll_x()
+                    .child(strip),
+            )
+            .child(content)
+    } else {
+        let mut pages = col()
+            .w(212.0)
+            .shrink()
+            .h_full()
+            .gap(1.0)
+            .py(10.0)
+            .fill(k.c.layer_01)
+            .border_sides([0.0, 0.0, 0.0, hair], k.c.border_muted);
+        pages = pages.child(
+            row()
+                .w_full()
+                .px(16.0)
+                .pb(8.0)
+                .child(widgets::caption(k, "CONFIG")),
+        );
+        for p in SettingsPage::CONFIG {
+            pages = pages.child(page_row(k, s, p));
+        }
+        pages = pages.child(
+            row()
+                .w_full()
+                .px(16.0)
+                .pt(14.0)
+                .pb(8.0)
+                .child(widgets::caption(k, "THIS WINDOW")),
+        );
+        for p in [SettingsPage::Diagnostics, SettingsPage::Connection] {
+            pages = pages.child(page_row(k, s, p));
+        }
         row()
             .w_full()
-            .px(16.0)
-            .pb(8.0)
-            .child(widgets::caption(k, "CONFIG")),
-    );
-    for p in SettingsPage::CONFIG {
-        pages = pages.child(page_row(k, s, p));
-    }
-    pages = pages.child(
-        row()
-            .w_full()
-            .px(16.0)
-            .pt(14.0)
-            .pb(8.0)
-            .child(widgets::caption(k, "THIS WINDOW")),
-    );
-    for p in [SettingsPage::Diagnostics, SettingsPage::Connection] {
-        pages = pages.child(page_row(k, s, p));
-    }
+            .grow(1.0)
+            .min_h(0.0)
+            .child(pages)
+            .child(content)
+    };
 
     col()
         .key("settings")
         .w_full()
         .h_full()
         .min_h(0.0)
-        .child(save_bar(s, k, page, hair))
-        .child(
-            row().w_full().grow(1.0).min_h(0.0).child(pages).child(
-                col()
-                    .key("settings-body")
-                    .grow(1.0)
-                    .min_h(0.0)
-                    .h_full()
-                    .scroll(ScrollSpec::default())
-                    .child(match page {
-                        SettingsPage::Diagnostics => diagnostics::view(s, k, cx),
-                        SettingsPage::Connection => connection_page(s, k),
-                        SettingsPage::Projects if s.editor.project.is_some() => {
-                            projects_detail(s, k, cx)
-                        }
-                        SettingsPage::Projects => projects_list(s, k),
-                        other => config_page(s, k, other, cx),
-                    }),
-            ),
+        .child(save_bar(s, k, page, hair, compact))
+        .child(body)
+}
+
+fn page_chip(k: &Kit, s: &State, page: SettingsPage) -> El {
+    let selected = s.editor.page == page;
+    el().key(format!("settings-nav-{}", page.title()))
+        .role("tab")
+        .label(page.title())
+        .focus_selected(selected)
+        .h(44.0)
+        .min_w(44.0)
+        .px(14.0)
+        .center()
+        .radius(k.radius.md)
+        .fill(if selected { k.c.layer_04 } else { k.c.layer_02 })
+        .border(
+            1.0,
+            if selected {
+                k.c.border_strong
+            } else {
+                k.c.border_muted
+            },
         )
+        .hover(k.c.hover)
+        .child(
+            text(page.title())
+                .font(k.ty.small_medium)
+                .color(if selected {
+                    k.c.text_base
+                } else {
+                    k.c.text_muted
+                })
+                .nowrap(),
+        )
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_settings(page, tx))
+        .cursor(rune::Cursor::Pointer)
 }
 
 fn page_row(k: &Kit, s: &State, page: SettingsPage) -> El {
@@ -93,10 +166,67 @@ fn page_row(k: &Kit, s: &State, page: SettingsPage) -> El {
 }
 
 /// The header with dirty state, Save, Discard and the ⌘S hint.
-fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32) -> El {
+fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) -> El {
     let e = &s.editor;
     let local = matches!(page, SettingsPage::Connection | SettingsPage::Diagnostics);
     let dirty = e.dirty();
+
+    let title_row = row()
+        .gap(8.0)
+        .center_y()
+        .child(text(page.title()).font(k.ty.ui_medium).color(k.c.text_base))
+        .children(dirty.then(|| widgets::pill(k, "Unsaved", theme::status(k).error)));
+
+    let discard_btn = Button::new("Discard")
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .disabled(!dirty)
+        .on_press_tx(|s: &mut State, tx: &mut Tx| s.discard(tx))
+        .build(k)
+        .key("settings-discard");
+
+    let mut save_builder = Button::new(if e.saving { "Saving…" } else { "Save" })
+        .variant(ButtonVariant::Submit)
+        .control_size(ControlSize::Small)
+        .disabled(!dirty || e.saving || !e.loaded)
+        .shortcut("cmd+s");
+    if !compact {
+        save_builder = save_builder.show_shortcut();
+    }
+    let save_btn = save_builder
+        .on_press_tx(|s: &mut State, _tx: &mut Tx| s.save())
+        .build(k)
+        .key("settings-save");
+
+    if compact {
+        let mut bar = col()
+            .key("settings-bar")
+            .w_full()
+            .px(14.0)
+            .py(12.0)
+            .gap(10.0)
+            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+            .child(
+                col().w_full().gap(2.0).child(title_row).child(
+                    text(page.blurb())
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .wrap(),
+                ),
+            );
+        if !local {
+            bar = bar.child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .flex_wrap()
+                    .child(discard_btn.grow(1.0))
+                    .child(save_btn.grow(1.0)),
+            );
+        }
+        return bar;
+    }
+
     let mut bar = row()
         .key("settings-bar")
         .w_full()
@@ -106,49 +236,17 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32) -> El {
         .center_y()
         .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
         .child(
-            col()
-                .gap(1.0)
-                .grow(1.0)
-                .child(
-                    row()
-                        .gap(8.0)
-                        .center_y()
-                        .child(text(page.title()).font(k.ty.ui_medium).color(k.c.text_base))
-                        .children(
-                            dirty.then(|| widgets::pill(k, "Unsaved", theme::status(k).error)),
-                        ),
-                )
-                .child(
-                    text(page.blurb())
-                        .font(k.ty.small)
-                        .color(k.c.text_muted)
-                        .nowrap()
-                        .truncate(),
-                ),
+            col().gap(1.0).grow(1.0).child(title_row).child(
+                text(page.blurb())
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .nowrap()
+                    .truncate(),
+            ),
         );
 
     if !local {
-        bar = bar
-            .child(
-                Button::new("Discard")
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Small)
-                    .disabled(!dirty)
-                    .on_press_tx(|s: &mut State, tx: &mut Tx| s.discard(tx))
-                    .build(k)
-                    .key("settings-discard"),
-            )
-            .child(
-                Button::new(if e.saving { "Saving…" } else { "Save" })
-                    .variant(ButtonVariant::Submit)
-                    .control_size(ControlSize::Small)
-                    .disabled(!dirty || e.saving || !e.loaded)
-                    .shortcut("cmd+s")
-                    .show_shortcut()
-                    .on_press_tx(|s: &mut State, _tx: &mut Tx| s.save())
-                    .build(k)
-                    .key("settings-save"),
-            );
+        bar = bar.child(discard_btn).child(save_btn);
     }
     bar
 }
@@ -156,7 +254,7 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32) -> El {
 // ---------------------------------------------------------------------------------------------
 // Pages
 
-fn config_page(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>) -> El {
+fn config_page(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>, compact: bool) -> El {
     let e = &s.editor;
     if !e.loaded {
         return widgets::empty_state(
@@ -170,8 +268,8 @@ fn config_page(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>) -> El
     let mut body = col()
         .key("config-page")
         .w_full()
-        .px(22.0)
-        .py(18.0)
+        .px(if compact { 14.0 } else { 22.0 })
+        .py(if compact { 14.0 } else { 18.0 })
         .gap(22.0);
     if let Some(field) = &e.field {
         let message = e.error.clone().unwrap_or_default();
@@ -184,8 +282,8 @@ fn config_page(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>) -> El
     body = body.child(match page {
         SettingsPage::General => general(s, k),
         SettingsPage::Server => server(s, k),
-        SettingsPage::Github => github(s, k),
-        SettingsPage::Discord => discord(s, k),
+        SettingsPage::Github => github(s, k, compact),
+        SettingsPage::Discord => discord(s, k, compact),
         SettingsPage::Act => act(s, k),
         _ => col(),
     });
@@ -264,7 +362,7 @@ fn server(s: &State, k: &Kit) -> El {
     c
 }
 
-fn github(s: &State, k: &Kit) -> El {
+fn github(s: &State, k: &Kit, compact: bool) -> El {
     let e = &s.editor;
     let mut c = col().w_full().gap(18.0);
     c = c.child(widgets::section(k, "GitHub", Some("How a run is reported back to GitHub. A token is enough for commit statuses; an App gives check runs with per-step output.")));
@@ -281,15 +379,18 @@ fn github(s: &State, k: &Kit) -> El {
         k,
         "Reporting",
         Some("Check runs need an App; commit statuses work with any token that can write them."),
-        rune_kit::SegmentedControl::new(&["Checks (App)", "Status (token)"], mode_index)
-            .fit()
-            .on_pick(|s: &mut State, picked: usize, tx: &mut Tx| {
+        widgets::segmented(
+            k,
+            compact,
+            &["Checks (App)", "Status (token)"],
+            mode_index,
+            |s: &mut State, picked: usize, tx: &mut Tx| {
                 s.editor
                     .set_str("github.mode", if picked == 0 { "checks" } else { "status" });
                 tx.instant();
-            })
-            .build(k)
-            .key("github-mode"),
+            },
+        )
+        .key("github-mode"),
     ));
     c = c.child(secret_field(
         s,
@@ -327,7 +428,7 @@ fn github(s: &State, k: &Kit) -> El {
     c
 }
 
-fn discord(s: &State, k: &Kit) -> El {
+fn discord(s: &State, k: &Kit, compact: bool) -> El {
     let e = &s.editor;
     let mut c = col().w_full().gap(18.0);
     c = c.child(widgets::section(
@@ -344,6 +445,7 @@ fn discord(s: &State, k: &Kit) -> El {
     ));
     c = c.child(toggle_row(
         k,
+        compact,
         "discord-notify-on-start",
         "Notify on start",
         Some("Also post when a run begins, not only when it ends."),
@@ -582,7 +684,7 @@ pub(crate) fn list_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
         .label(label)
         .width(None)
         .rows(2)
-        .auto_grow(2, 8)
+        .auto_grow(crate::theme::area_min_rows(k), 8)
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
             let seeded = crate::paths::get_list_text(&s.editor.draft, &field);
@@ -674,7 +776,7 @@ fn pem_secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&s
         .label(label)
         .width(None)
         .rows(3)
-        .auto_grow(2, 10)
+        .auto_grow(crate::theme::area_min_rows(k), 10)
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
             let seeded = crate::paths::get_str(&s.editor.draft, &field);
@@ -744,6 +846,7 @@ fn is_optional(path: &str) -> bool {
 
 fn toggle_row(
     k: &Kit,
+    compact: bool,
     key: &str,
     label: &str,
     help: Option<&str>,
@@ -765,7 +868,7 @@ fn toggle_row(
     }
     row()
         .w_full()
-        .min_h(34.0)
+        .min_h(if compact { 44.0 } else { 34.0 })
         .gap(12.0)
         .center_y()
         .child(col_body)
@@ -775,6 +878,7 @@ fn toggle_row(
                 .hide_label()
                 .on_toggle_tx(flip)
                 .build(k)
+                .min_h(if compact { 44.0 } else { 0.0 })
                 .key(key),
         )
 }
@@ -782,7 +886,7 @@ fn toggle_row(
 // ---------------------------------------------------------------------------------------------
 // Projects
 
-fn projects_list(s: &State, k: &Kit) -> El {
+fn projects_list(s: &State, k: &Kit, compact: bool) -> El {
     let e = &s.editor;
     if !e.loaded {
         return widgets::empty_state(
@@ -791,7 +895,11 @@ fn projects_list(s: &State, k: &Kit) -> El {
             "The daemon has not answered yet. Check the connection in the banner.",
         );
     }
-    let mut c = col().w_full().px(22.0).py(18.0).gap(12.0);
+    let mut c = col()
+        .w_full()
+        .px(if compact { 14.0 } else { 22.0 })
+        .py(if compact { 14.0 } else { 18.0 })
+        .gap(12.0);
     if let Some(field) = &e.field {
         let message = e.error.clone().unwrap_or_default();
         c = c.child(widgets::notice(
@@ -815,7 +923,7 @@ fn projects_list(s: &State, k: &Kit) -> El {
         ));
     }
     for i in 0..e.count("project") {
-        c = c.child(project_card(s, k, i));
+        c = c.child(project_card(s, k, i, compact));
     }
     c = c.child(
         row().w_full().gap(8.0).child(
@@ -830,14 +938,72 @@ fn projects_list(s: &State, k: &Kit) -> El {
     c
 }
 
-fn project_card(s: &State, k: &Kit, i: usize) -> El {
+fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
     let e = &s.editor;
     let name = e.s(&format!("project[{i}].name"));
     let branch = e.s(&format!("project[{i}].branch"));
     let ci = e.count(&format!("project[{i}].ci"));
     let deploy = e.count(&format!("project[{i}].deploy"));
     let invalid = e.invalid(&format!("project[{i}].name"));
-    let card = row()
+    let info = col()
+        .gap(2.0)
+        .grow(1.0)
+        .child(
+            text(if name.is_empty() {
+                "(unnamed)".to_string()
+            } else {
+                name.clone()
+            })
+            .font(k.ty.small_medium)
+            .color(if name.is_empty() {
+                k.c.text_faint
+            } else {
+                k.c.text_base
+            })
+            .wrap(),
+        )
+        .child(
+            text(format!("{branch} · {ci} CI · {deploy} deploy"))
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .wrap(),
+        );
+    let edit_btn = Button::new("Edit")
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_project_form(Some(i), tx))
+        .build(k)
+        .key(format!("project-edit-{i}"));
+
+    if compact {
+        return col()
+            .key(format!("project-card-{i}"))
+            .w_full()
+            .padding(12.0)
+            .gap(10.0)
+            .radius(k.radius.md)
+            .fill(k.c.layer_02)
+            .border(
+                1.0,
+                if invalid {
+                    theme::status(k).failure
+                } else {
+                    k.c.border_muted
+                },
+            )
+            .child(info)
+            .child(
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .center_y()
+                    .child(up_down(k, i, true))
+                    .child(el().grow(1.0))
+                    .child(edit_btn),
+            );
+    }
+
+    row()
         .key(format!("project-card-{i}"))
         .w_full()
         .padding(12.0)
@@ -853,65 +1019,36 @@ fn project_card(s: &State, k: &Kit, i: usize) -> El {
                 k.c.border_muted
             },
         )
-        .child(
-            col()
-                .gap(2.0)
-                .grow(1.0)
-                .child(
-                    text(if name.is_empty() {
-                        "(unnamed)".to_string()
-                    } else {
-                        name.clone()
-                    })
-                    .font(k.ty.small_medium)
-                    .color(if name.is_empty() {
-                        k.c.text_faint
-                    } else {
-                        k.c.text_base
-                    }),
-                )
-                .child(
-                    text(format!("{branch} · {ci} CI · {deploy} deploy"))
-                        .font(k.ty.small)
-                        .color(k.c.text_muted),
-                ),
-        )
-        .child(up_down(k, i))
-        .child(
-            Button::new("Edit")
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_project_form(Some(i), tx))
-                .build(k)
-                .key(format!("project-edit-{i}")),
-        );
-    let _ = card;
-    card
+        .child(info)
+        .child(up_down(k, i, false))
+        .child(edit_btn)
 }
 
-fn up_down(k: &Kit, i: usize) -> El {
+fn up_down(k: &Kit, i: usize, compact: bool) -> El {
     row()
-        .gap(2.0)
-        .child(
+        .gap(if compact { 6.0 } else { 2.0 })
+        .child(widgets::compact_icon(
             rune_kit::IconButton::new(&rune_kit::glyphs::CHEVRON_UP)
                 .label("Move up")
                 .control_size(ControlSize::Small)
                 .on_press_tx(move |s: &mut State, tx: &mut Tx| s.move_project(i, false, tx))
                 .build(k)
                 .key(format!("project-up-{i}")),
-        )
-        .child(
+            compact,
+        ))
+        .child(widgets::compact_icon(
             rune_kit::IconButton::new(&rune_kit::glyphs::CHEVRON_DOWN)
                 .label("Move down")
                 .control_size(ControlSize::Small)
                 .on_press_tx(move |s: &mut State, tx: &mut Tx| s.move_project(i, true, tx))
                 .build(k)
                 .key(format!("project-down-{i}")),
-        )
+            compact,
+        ))
 }
 
 /// One project's form: identity, then its CI and deploy steps.
-fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
+fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El {
     let _ = cx;
     let e = &s.editor;
     if !e.loaded {
@@ -922,14 +1059,14 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
         );
     }
     let Some(i) = e.project else {
-        return projects_list(s, k);
+        return projects_list(s, k, compact);
     };
     let base = format!("project[{i}]");
     let mut c = col()
         .key("project-form")
         .w_full()
-        .px(22.0)
-        .py(18.0)
+        .px(if compact { 14.0 } else { 22.0 })
+        .py(if compact { 14.0 } else { 18.0 })
         .gap(20.0);
 
     if let Some(field) = &e.field {
@@ -941,44 +1078,91 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
         ));
     }
 
-    c = c.child(
-        row()
-            .w_full()
-            .gap(8.0)
-            .center_y()
-            .child(
-                Button::new("All projects")
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Small)
-                    .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_project_form(None, tx))
-                    .build(k)
-                    .key("project-all"),
-            )
-            .child(el().grow(1.0))
-            .child(
-                Button::new("Duplicate")
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Small)
-                    .on_press_tx(move |s: &mut State, tx: &mut Tx| s.duplicate_project(i, tx))
-                    .build(k)
-                    .key("project-duplicate"),
-            )
-            .child(
-                Button::new("Delete")
-                    .variant(ButtonVariant::Danger)
-                    .control_size(ControlSize::Small)
-                    .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-                        s.editor.confirm_delete = Some(i);
-                        tx.instant();
-                    })
-                    .build(k)
-                    .key("project-delete"),
-            ),
-    );
+    let all_btn = Button::new("All projects")
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_project_form(None, tx))
+        .build(k)
+        .key("project-all");
+    let dup_btn = Button::new("Duplicate")
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.duplicate_project(i, tx))
+        .build(k)
+        .key("project-duplicate");
+    let del_btn = Button::new("Delete")
+        .variant(ButtonVariant::Danger)
+        .control_size(ControlSize::Small)
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+            s.editor.confirm_delete = Some(i);
+            tx.instant();
+        })
+        .build(k)
+        .key("project-delete");
+
+    if compact {
+        c = c.child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .flex_wrap()
+                .center_y()
+                .child(all_btn)
+                .child(dup_btn)
+                .child(del_btn),
+        );
+    } else {
+        c = c.child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(all_btn)
+                .child(el().grow(1.0))
+                .child(dup_btn)
+                .child(del_btn),
+        );
+    }
 
     if e.confirm_delete == Some(i) {
         let label = e.s(&format!("{base}.name"));
-        c = c.child(
+        let msg = text(format!(
+            "Delete {label} and its steps? The config is only written on Save."
+        ))
+        .font(k.ty.small)
+        .color(theme::status(k).failure);
+        let cancel_btn = Button::new("Cancel")
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                s.editor.confirm_delete = None;
+                tx.instant();
+            })
+            .build(k)
+            .key("project-delete-cancel");
+        let confirm_btn = Button::new("Delete")
+            .variant(ButtonVariant::Danger)
+            .control_size(ControlSize::Small)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.delete_project(i, tx))
+            .build(k)
+            .key("project-delete-confirm");
+        c = c.child(if compact {
+            col()
+                .w_full()
+                .padding(12.0)
+                .gap(10.0)
+                .radius(k.radius.md)
+                .fill(theme::status(k).tint(theme::status(k).failure))
+                .child(msg.wrap())
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .flex_wrap()
+                        .child(cancel_btn.grow(1.0))
+                        .child(confirm_btn.grow(1.0)),
+                )
+        } else {
             row()
                 .w_full()
                 .padding(12.0)
@@ -986,38 +1170,15 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
                 .center_y()
                 .radius(k.radius.md)
                 .fill(theme::status(k).tint(theme::status(k).failure))
-                .child(
-                    text(format!(
-                        "Delete {label} and its steps? The config is only written on Save."
-                    ))
-                    .font(k.ty.small)
-                    .color(theme::status(k).failure)
-                    .grow(1.0),
-                )
-                .child(
-                    Button::new("Cancel")
-                        .variant(ButtonVariant::Ghost)
-                        .control_size(ControlSize::Small)
-                        .on_press_tx(|s: &mut State, tx: &mut Tx| {
-                            s.editor.confirm_delete = None;
-                            tx.instant();
-                        })
-                        .build(k)
-                        .key("project-delete-cancel"),
-                )
-                .child(
-                    Button::new("Delete")
-                        .variant(ButtonVariant::Danger)
-                        .control_size(ControlSize::Small)
-                        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.delete_project(i, tx))
-                        .build(k)
-                        .key("project-delete-confirm"),
-                ),
-        );
+                .child(msg.grow(1.0))
+                .child(cancel_btn)
+                .child(confirm_btn)
+        });
     }
 
     c = c.child(widgets::section(k, "Repository", None));
-    c = c.child(widgets::pair(
+    c = c.child(widgets::pair_for(
+        compact,
         text_field(
             s,
             k,
@@ -1040,7 +1201,8 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
         "Repository path",
         Some("The local clone the daemon fetches into and builds from."),
     ));
-    c = c.child(widgets::pair(
+    c = c.child(widgets::pair_for(
+        compact,
         text_field(
             s,
             k,
@@ -1056,10 +1218,12 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
             Some("`owner/name`, for commit links and checks."),
         ),
     ));
-    c = c.child(widgets::pair(
+    c = c.child(widgets::pair_for(
+        compact,
         select_field(
             s,
             k,
+            compact,
             &format!("{base}.checkout"),
             "Checkout",
             &[
@@ -1093,22 +1257,30 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>) -> El {
     ));
 
     c = c.child(widgets::divider(k));
-    c = c.child(steps::phase(s, k, i, false));
+    c = c.child(steps::phase(s, k, i, false, compact));
     c = c.child(widgets::divider(k));
-    c = c.child(steps::phase(s, k, i, true));
+    c = c.child(steps::phase(s, k, i, true, compact));
     c
 }
 
 /// A choice row bound to a config path.
-fn select_field(s: &State, k: &Kit, path: &str, label: &str, options: &[(&str, &str)]) -> El {
+fn select_field(
+    s: &State,
+    k: &Kit,
+    compact: bool,
+    path: &str,
+    label: &str,
+    options: &[(&str, &str)],
+) -> El {
     let current = crate::paths::get_str(&s.editor.draft, path);
     let pairs: Vec<(String, String)> = options
         .iter()
         .map(|(v, l)| (v.to_string(), l.to_string()))
         .collect();
     let owner = path.to_string();
-    let pick = widgets::choice_row(
+    let pick = widgets::choice_row_for(
         k,
+        compact,
         &pairs,
         Some(current.as_str()),
         None,
@@ -1136,7 +1308,7 @@ pub(crate) fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Opt
         .label(label)
         .width(None)
         .rows(3)
-        .auto_grow(2, 8)
+        .auto_grow(crate::theme::area_min_rows(k), 8)
         .on_edit(move |s: &mut State| {
             let seeded = crate::paths::get_table_text(&s.editor.draft, &field);
             s.editor.text_for(&field, seeded)
@@ -1164,10 +1336,15 @@ pub(crate) fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Opt
 // ---------------------------------------------------------------------------------------------
 // Connection (this window, not the daemon)
 
-fn connection_page(s: &State, k: &Kit) -> El {
-    let mut c = col().w_full().px(22.0).py(18.0).gap(18.0);
+fn connection_page(s: &State, k: &Kit, compact: bool) -> El {
+    let mut c = col()
+        .w_full()
+        .px(if compact { 14.0 } else { 22.0 })
+        .py(if compact { 14.0 } else { 18.0 })
+        .gap(18.0);
     c = c.child(widgets::section(k, "Connection", Some("Where this window looks for the daemon. Not written to config.toml; in a browser the token is remembered for this site.")));
-    c = c.child(widgets::pair(
+    c = c.child(widgets::pair_for(
+        compact,
         text_input_bound(
             k,
             "conn-server",
@@ -1183,6 +1360,7 @@ fn connection_page(s: &State, k: &Kit) -> El {
         row()
             .w_full()
             .gap(8.0)
+            .flex_wrap()
             .child(
                 Button::new("Connect")
                     .variant(ButtonVariant::Submit)
@@ -1207,13 +1385,15 @@ fn connection_page(s: &State, k: &Kit) -> El {
     );
     c = c.child(widgets::divider(k));
     c = c.child(widgets::section(k, "Status", None));
-    c = c.child(widgets::kv(
+    c = c.child(widgets::kv_for(
         k,
+        compact,
         "Server",
-        widgets::value(k, &s.server_display()),
+        widgets::value_for(k, compact, &s.server_display()),
     ));
-    c = c.child(widgets::kv(
+    c = c.child(widgets::kv_for(
         k,
+        compact,
         "State",
         match &s.link {
             crate::state::Link::Connecting => widgets::pill(k, "Connecting", k.c.text_muted),
@@ -1226,11 +1406,13 @@ fn connection_page(s: &State, k: &Kit) -> El {
             }
         },
     ));
-    c = c.child(widgets::kv(
+    c = c.child(widgets::kv_for(
         k,
+        compact,
         "Daemon version",
-        widgets::value(
+        widgets::value_for(
             k,
+            compact,
             if s.version.is_empty() {
                 "—"
             } else {
@@ -1238,10 +1420,15 @@ fn connection_page(s: &State, k: &Kit) -> El {
             },
         ),
     ));
-    c = c.child(widgets::kv(
+    c = c.child(widgets::kv_for(
         k,
+        compact,
         "Launch flags",
-        widgets::value(k, "--server URL --token T, or LUNACY_SERVER / LUNACY_TOKEN"),
+        widgets::value_for(
+            k,
+            compact,
+            "--server URL --token T, or LUNACY_SERVER / LUNACY_TOKEN",
+        ),
     ));
     c
 }

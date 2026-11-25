@@ -158,9 +158,14 @@ def el_rect(el: dict) -> tuple[float, float, float, float]:
     return (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
 
 
-def el_center(el: dict) -> dict[str, float]:
+def el_center(el: dict, tree: dict | None = None, window_w: float | None = None) -> dict[str, float]:
     x, y, w, h = el_rect(el)
-    return {"x": x + w / 2.0, "y": y + h / 2.0}
+    scale = 1.0
+    if tree is not None and window_w:
+        vp = tree.get("viewport") or []
+        if vp and vp[0]:
+            scale = window_w / float(vp[0])
+    return {"x": (x + w / 2.0) * scale, "y": (y + h / 2.0) * scale}
 
 
 # --------------------------------------------------------------------------- script builder
@@ -191,8 +196,8 @@ class Script:
         self.events.append({"t": self.t, "paste": text})
         return self.wait(after)
 
-    def wheel(self, key: str, dy: float, after: float = 0.35) -> "Script":
-        self.events.append({"t": self.t, "type": "wheel", "key": key, "dx": 0.0, "dy": dy})
+    def wheel(self, key: str, dy: float = 0.0, after: float = 0.35, dx: float = 0.0) -> "Script":
+        self.events.append({"t": self.t, "type": "wheel", "key": key, "dx": dx, "dy": dy})
         return self.wait(after)
 
     def mark(self, name: str, after: float = 0.10) -> "Script":
@@ -825,6 +830,130 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
     )
 
 
+def assert_tree_responsive(
+    label: str,
+    tree: dict,
+    *,
+    win_w: float,
+    expect_compact: bool,
+    expect_zoom: float,
+    extra_scroll_keys: tuple[str, ...] = ("settings-nav-strip",),
+) -> None:
+    vp = tree.get("viewport") or [0.0, 0.0]
+    vw = float(vp[0])
+    assert vw > 0.0, f"{label}: missing viewport {vp}"
+    actual_zoom = win_w / vw
+    assert abs(actual_zoom - expect_zoom) < 0.02, (
+        f"{label} @ {win_w}: expected zoom {expect_zoom}, got {actual_zoom:.3f} (vp={vp})"
+    )
+    assert has_key(tree, "titlebar-menu") == expect_compact, (
+        f"{label} @ {win_w}: titlebar-menu mismatch (expect_compact={expect_compact})"
+    )
+    assert has_key(tree, "rail") == (not expect_compact), (
+        f"{label} @ {win_w}: rail mismatch (expect_compact={expect_compact})"
+    )
+
+    nodes = elems(tree)
+    by_path = {str(x.get("path", "")): x for x in nodes if x.get("path")}
+    scroll_strip_paths = [
+        str(s.get("path", ""))
+        for sk in extra_scroll_keys
+        for s in find_els(tree, sk)
+        if s.get("path")
+    ]
+    interactive_roles = {"button", "tab", "checkbox", "radio", "switch", "textbox"}
+    for n in nodes:
+        if n.get("exiting") or n.get("inert"):
+            continue
+        x, _y, w, h = el_rect(n)
+        role = n.get("role", "")
+        key = n.get("key")
+        path = str(n.get("path", ""))
+        in_hscroll = any(path == sp or path.startswith(sp + "/") for sp in scroll_strip_paths)
+        interactive = bool(n.get("focusable")) or role in interactive_roles
+        if interactive and not in_hscroll:
+            assert x >= -0.5 and x + w <= vw + 0.5, (
+                f"{label} @ {win_w}: interactive overflow key={key!r} role={role!r} rect={[x, _y, w, h]} > vw={vw:.1f}"
+            )
+        if expect_compact and interactive and role != "link" and key != "drawer-scrim":
+            if role == "textbox" and key == "input" and "/" in path:
+                parent = by_path.get(path.rsplit("/", 1)[0])
+                tap_h = el_rect(parent)[3] if parent is not None else h
+            else:
+                tap_h = h
+            assert tap_h >= 43.9, (
+                f"{label} @ {win_w}: touch target < 44pt key={key!r} role={role!r} path={path!r} tap_h={tap_h:.1f}"
+            )
+        if key in extra_scroll_keys:
+            assert x >= -0.5 and x + w <= vw + 0.5, (
+                f"{label} @ {win_w}: scroll strip {key!r} overflows vw={vw:.1f}: {[x, _y, w, h]}"
+            )
+        txt = (n.get("text") or "").strip()
+        if expect_compact and txt and key != "titlebar-title" and not in_hscroll:
+            assert x >= -0.5 and x + w <= vw + 0.5, (
+                f"{label} @ {win_w}: text overflows vw={vw:.1f} key={key!r} text={txt!r} rect={[x, _y, w, h]}"
+            )
+
+
+def test_responsive_layouts(sb: Sandbox, alpha_run_id: str) -> None:
+    print("[e2e] Testing responsive layouts (390x844, 360x780, 768x1024, 1180x760)...")
+    profiles = [
+        ("390x844", 390.0, True, 1.0),
+        ("360x780", 360.0, True, 1.0),
+        ("768x1024", 768.0, True, 1.1),
+        ("1180x760", 1180.0, False, 1.1),
+    ]
+    for size, win_w, compact, zoom in profiles:
+        tag = size.replace("x", "_")
+
+        t_proj_list = sb.run_ui(f"resp_{tag}_projects", [], at=1.2, size=size)
+        assert has_key(t_proj_list, "project-alpha")
+        assert_tree_responsive("projects", t_proj_list, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
+
+        sc = Script(1.0).tap("project-alpha", 0.7)
+        t_proj = sb.run_ui(f"resp_{tag}_project", sc.events, at=sc.t + 0.3, size=size)
+        assert has_key(t_proj, f"run-{alpha_run_id}")
+        assert_tree_responsive("project", t_proj, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
+
+        sc = Script(1.0).tap("project-alpha", 0.7).tap(f"run-{alpha_run_id}", 0.7).tap("step-0", 0.7)
+        t_run = sb.run_ui(f"resp_{tag}_run", sc.events, at=sc.t + 0.4, size=size)
+        assert has_key(t_run, "log") and has_key(t_run, "run-log-mode")
+        assert_tree_responsive("run", t_run, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
+
+        sc = Script(1.0).tap("titlebar-settings", 0.7)
+        t_gen = sb.run_ui(f"resp_{tag}_settings_general", sc.events, at=sc.t + 0.3, size=size)
+        assert has_key(t_gen, "field-general.poll_interval")
+        assert_tree_responsive("settings-general", t_gen, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
+
+        sc = Script(1.0).tap("connection", 0.7)
+        t_conn = sb.run_ui(f"resp_{tag}_settings_conn", sc.events, at=sc.t + 0.3, size=size)
+        assert has_key(t_conn, "conn-server") and has_key(t_conn, "conn-token")
+        assert_tree_responsive("settings-connection", t_conn, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
+
+        sc = Script(1.0).tap("titlebar-settings", 0.7)
+        if win_w <= 420.0:
+            sc = sc.wheel("settings-nav-strip", dx=-240.0, after=0.35)
+        sc = sc.tap("settings-nav-Projects", 0.5).tap("project-edit-0", 0.4)
+        if compact:
+            sc = sc.wheel("settings-body", -450.0, 0.35).wheel("settings-body", -400.0, 0.35)
+        else:
+            sc = sc.wheel("settings-body", -350.0, 0.35)
+        sc = sc.tap("step-row-ci-0", 0.4)
+        t_step = sb.run_ui(f"resp_{tag}_step_editor", sc.events, at=sc.t + 0.3, size=size)
+        assert has_key(t_step, "step-form") and has_key(t_step, "step-kind")
+        assert_tree_responsive("settings-step-editor", t_step, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
+
+        t_unauth = sb.run_ui(f"resp_{tag}_unauth", [], at=1.0, token="wrong-token", size=size)
+        assert "Unauthorized" in " ".join(subtree_texts(t_unauth, "link-banner"))
+        assert_tree_responsive("unauthorized", t_unauth, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
+
+        if compact:
+            sc = Script(1.0).tap("titlebar-menu", 0.4)
+            t_drawer = sb.run_ui(f"resp_{tag}_drawer", sc.events, at=sc.t + 0.2, size=size)
+            assert has_key(t_drawer, "rail-drawer") and has_key(t_drawer, "nav-Settings")
+            assert_tree_responsive("drawer", t_drawer, win_w=win_w, expect_compact=True, expect_zoom=zoom)
+
+
 def test_web_build(sb: Sandbox, alpha_run_id: str) -> None:
     print("[e2e] Testing web build (WASM + fetch) in headless Chrome over CDP...")
     t_home = sb.run_ui("web_coords_home", [], at=1.1, size="1180x760")
@@ -835,9 +964,9 @@ def test_web_build(sb: Sandbox, alpha_run_id: str) -> None:
         size="1180x760",
     )
     coords = {
-        "settings": el_center(find_el(t_home, "titlebar-settings")),
-        "poll_input": el_center(find_el(t_set, "field-general.poll_interval/control")),
-        "save": el_center(find_el(t_set, "settings-save")),
+        "settings": el_center(find_el(t_home, "titlebar-settings"), t_home, 1180.0),
+        "poll_input": el_center(find_el(t_set, "field-general.poll_interval/control"), t_set, 1180.0),
+        "save": el_center(find_el(t_set, "settings-save"), t_set, 1180.0),
     }
 
     chrome_dir = sb.dir / "chrome"
@@ -886,6 +1015,7 @@ def main() -> int:
         sb.setup()
         alpha_run_id = test_contract(sb)
         test_native_flows(sb, alpha_run_id)
+        test_responsive_layouts(sb, alpha_run_id)
         test_web_build(sb, alpha_run_id)
         print("[e2e] ALL CHECKS PASSED!")
         return 0

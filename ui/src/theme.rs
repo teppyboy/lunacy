@@ -4,7 +4,7 @@
 //! preference and the kit's own tokens with no palette of its own.
 
 use rune::{oklch, Color};
-use rune_kit::Kit;
+use rune_kit::{ButtonMetrics, BySize, FieldMetrics, Kit};
 
 use crate::model::{ProjectState, RunStatus, StepStatus};
 
@@ -23,6 +23,33 @@ pub struct Status {
 /// The kit for the current appearance: the neutral tokens, light or dark.
 pub fn kit(dark: bool) -> Kit {
     Kit::neutral(dark)
+}
+
+/// The kit adjusted for compact / touch viewports: enlarged tap heights (≥ 44 pt) on buttons
+/// and text inputs while leaving desktop metrics unchanged.
+pub fn kit_for(dark: bool, compact: bool) -> Kit {
+    let mut k = kit(dark);
+    if compact {
+        let m = |height, padding_x, radius| ButtonMetrics {
+            height,
+            padding_x,
+            radius,
+            icon: 16.0,
+        };
+        k.metrics.button = Some(BySize {
+            mini: m(24.0, 8.0, k.radius.sm),
+            small: m(44.0, 12.0, k.radius.md),
+            regular: m(44.0, 14.0, k.radius.md),
+            large: m(44.0, 16.0, k.radius.lg),
+            extra_large: m(48.0, 18.0, k.radius.xl),
+        });
+        k.metrics.field = Some(FieldMetrics {
+            height: 44.0,
+            large_height: 44.0,
+            ..FieldMetrics::kit(&k)
+        });
+    }
+    k
 }
 
 pub fn status(k: &Kit) -> Status {
@@ -95,5 +122,14 @@ pub fn hair(scale: f32) -> f32 {
         1.0 / scale
     } else {
         1.0
+    }
+}
+
+/// Minimum row count for `TextArea::auto_grow` so touch targets stay ≥ 44 pt on compact layouts.
+pub fn area_min_rows(k: &Kit) -> usize {
+    if k.metrics.field.is_some_and(|f| f.height >= 44.0) {
+        3
+    } else {
+        2
     }
 }

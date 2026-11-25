@@ -94,14 +94,44 @@ pub fn labelled(k: &Kit, label: &str, help: Option<&str>, control: El) -> El {
     c
 }
 
-/// A row of two fields side by side.
+/// Expands small icon buttons to a 44×44 pt touch target on compact viewports.
+pub fn compact_icon(el: El, compact: bool) -> El {
+    if compact {
+        el.size(44.0, 44.0)
+    } else {
+        el
+    }
+}
+
+/// A simple 3-line hamburger icon for the compact navigation drawer toggle.
+pub fn hamburger(ink: Color) -> El {
+    let bar = || el().w(16.0).h(1.5).radius(0.75).fill(ink);
+    col()
+        .gap(3.5)
+        .center()
+        .a11y_hidden()
+        .child(bar())
+        .child(bar())
+        .child(bar())
+}
+
+/// A row of two fields side by side on desktop, stacked on compact viewports.
 pub fn pair(left: El, right: El) -> El {
-    row()
-        .w_full()
-        .gap(16.0)
-        .items_start()
-        .child(left.grow(1.0))
-        .child(right.grow(1.0))
+    pair_for(false, left, right)
+}
+
+/// Responsive `pair`: side-by-side columns above 720 pt, stacked vertically below.
+pub fn pair_for(compact: bool, left: El, right: El) -> El {
+    if compact {
+        col().w_full().gap(14.0).child(left).child(right)
+    } else {
+        row()
+            .w_full()
+            .gap(16.0)
+            .items_start()
+            .child(left.grow(1.0))
+            .child(right.grow(1.0))
+    }
 }
 
 /// Muted uppercase caption for a group of rows.
@@ -111,23 +141,45 @@ pub fn caption(k: &Kit, label: &str) -> El {
 
 /// A single-line read-only value, for diagnostics.
 pub fn value(k: &Kit, v: &str) -> El {
-    text(v.to_string())
-        .font(k.ty.mono)
-        .color(k.c.text_base)
-        .nowrap()
-        .truncate()
+    value_for(k, false, v)
+}
+
+/// Read-only diagnostic value: single-line truncated on desktop, wrapped on compact viewports.
+pub fn value_for(k: &Kit, compact: bool, v: &str) -> El {
+    let t = text(v.to_string()).font(k.ty.mono).color(k.c.text_base);
+    if compact {
+        t.wrap()
+    } else {
+        t.nowrap().truncate()
+    }
 }
 
 /// A key/value row for diagnostics: label on the left, value on the right.
 pub fn kv(k: &Kit, label: &str, value: El) -> El {
-    row()
-        .w_full()
-        .min_h(28.0)
-        .gap(16.0)
-        .center_y()
-        .justify_between()
-        .child(text(label).font(k.ty.small).color(k.c.text_muted).nowrap())
-        .child(value)
+    kv_for(k, false, label, value)
+}
+
+/// Responsive key/value row: horizontal on desktop, label above wrapped value on compact.
+pub fn kv_for(k: &Kit, compact: bool, label: &str, value: El) -> El {
+    if compact {
+        col()
+            .w_full()
+            .items_start()
+            .min_h(44.0)
+            .py(8.0)
+            .gap(4.0)
+            .child(text(label).font(k.ty.small).color(k.c.text_muted))
+            .child(value)
+    } else {
+        row()
+            .w_full()
+            .min_h(28.0)
+            .gap(16.0)
+            .center_y()
+            .justify_between()
+            .child(text(label).font(k.ty.small).color(k.c.text_muted).nowrap())
+            .child(value)
+    }
 }
 
 /// `1234 ms`, `1.2 s`, `2m 14s`.
@@ -380,6 +432,18 @@ pub fn choice_row<S: 'static>(
     placeholder: Option<&str>,
     on_pick: impl Fn(&mut S, &str, &mut Tx) + Clone + 'static,
 ) -> El {
+    choice_row_for(k, false, options, current, placeholder, on_pick)
+}
+
+/// Responsive `choice_row`: chips expand to ≥ 44 pt touch targets when `compact`.
+pub fn choice_row_for<S: 'static>(
+    k: &Kit,
+    compact: bool,
+    options: &[(String, String)],
+    current: Option<&str>,
+    placeholder: Option<&str>,
+    on_pick: impl Fn(&mut S, &str, &mut Tx) + Clone + 'static,
+) -> El {
     let mut r = row().w_full().gap(6.0).flex_wrap();
     if options.is_empty() {
         return r.child(
@@ -388,6 +452,7 @@ pub fn choice_row<S: 'static>(
                 .color(k.c.text_faint),
         );
     }
+    let chip_h = if compact { 44.0 } else { 26.0 };
     for (value, label) in options {
         let on = current == Some(value.as_str());
         let fill = if on { k.c.layer_04 } else { k.c.layer_01 };
@@ -398,8 +463,10 @@ pub fn choice_row<S: 'static>(
                 .role("radio")
                 .label(label.clone())
                 .a11y_value(if on { "selected" } else { "not selected" })
-                .h(26.0)
-                .px(10.0)
+                .min_h(chip_h)
+                .min_w(if compact { 44.0 } else { 0.0 })
+                .px(if compact { 14.0 } else { 10.0 })
+                .py(if compact { 8.0 } else { 0.0 })
                 .center_y()
                 .radius(k.radius.md)
                 .fill(fill)
@@ -414,7 +481,60 @@ pub fn choice_row<S: 'static>(
                 .hover(k.c.hover)
                 .cursor(rune::Cursor::Pointer)
                 .on_press_tx(move |s: &mut S, tx: &mut Tx| pick(s, &value, tx))
-                .child(text(label.clone()).font(k.ty.small_medium).color(if on {
+                .child(
+                    text(label.clone())
+                        .font(k.ty.small_medium)
+                        .color(if on { k.c.text_base } else { k.c.text_muted })
+                        .wrap(),
+                ),
+        );
+    }
+    r
+}
+
+/// Responsive segmented picker: kit `SegmentedControl` on desktop, ≥ 44 pt touch chips on compact.
+pub fn segmented<S: 'static>(
+    k: &Kit,
+    compact: bool,
+    labels: &[&str],
+    selected: Option<usize>,
+    on_pick: impl Fn(&mut S, usize, &mut Tx) + Clone + 'static,
+) -> El {
+    if !compact {
+        return rune_kit::SegmentedControl::new(labels, selected)
+            .fit()
+            .on_pick(on_pick)
+            .build(k);
+    }
+    let mut r = row().role("radiogroup").gap(6.0).flex_wrap();
+    for (i, label) in labels.iter().enumerate() {
+        let on = selected == Some(i);
+        let fill = if on { k.c.layer_04 } else { k.c.layer_01 };
+        let pick = on_pick.clone();
+        r = r.child(
+            el().key(format!("segment{i}"))
+                .role("radio")
+                .label(*label)
+                .a11y_value(if on { "selected" } else { "not selected" })
+                .min_h(44.0)
+                .min_w(44.0)
+                .px(14.0)
+                .py(8.0)
+                .center()
+                .radius(k.radius.md)
+                .fill(fill)
+                .border(
+                    1.0,
+                    if on {
+                        k.c.border_strong
+                    } else {
+                        k.c.border_muted
+                    },
+                )
+                .hover(k.c.hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press_tx(move |s: &mut S, tx: &mut Tx| pick(s, i, tx))
+                .child(text(*label).font(k.ty.small_medium).color(if on {
                     k.c.text_base
                 } else {
                     k.c.text_muted

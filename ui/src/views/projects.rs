@@ -8,10 +8,10 @@ use crate::state::State;
 use crate::theme;
 use crate::widgets::{self, ago, duration, mono_chip, short_sha};
 
-pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, hair: f32) -> El {
+pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, hair: f32, compact: bool) -> El {
     let mut list = col().w_full().gap(8.0).pb(24.0);
     for project in &s.projects {
-        list = list.child(card_row(s, k, project));
+        list = list.child(card_row(s, k, project, compact));
     }
 
     let body: El = if !s.loaded && s.projects.is_empty() {
@@ -37,21 +37,21 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, hair: f32) -> El {
         .w_full()
         .h_full()
         .min_h(0.0)
-        .child(header(s, k, hair))
+        .child(header(s, k, hair, compact))
         .child(
             col()
                 .key("projects-scroll")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .px(22.0)
+                .px(if compact { 14.0 } else { 22.0 })
                 .pt(16.0)
                 .scroll(ScrollSpec::default())
                 .child(body),
         )
 }
 
-fn header(s: &State, k: &Kit, hair: f32) -> El {
+fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
     let running = s
         .projects
         .iter()
@@ -68,6 +68,62 @@ fn header(s: &State, k: &Kit, hair: f32) -> El {
     } else {
         format!("{} projects", s.projects.len())
     };
+    let force_switch = rune_kit::Switch::new(s.force)
+        .label("Force")
+        .hide_label()
+        .on_toggle_tx(|s: &mut State, tx: &mut Tx| {
+            s.force = !s.force;
+            tx.instant();
+        })
+        .build(k)
+        .min_h(if compact { 44.0 } else { 0.0 })
+        .key("projects-force");
+    let settings_btn = Button::new("Settings")
+        .variant(ButtonVariant::Outline)
+        .control_size(ControlSize::Small)
+        .on_press_tx(|s: &mut State, tx: &mut Tx| {
+            s.open_settings(crate::state::SettingsPage::Projects, tx)
+        })
+        .build(k)
+        .key("projects-settings");
+
+    if compact {
+        return col()
+            .key("projects-header")
+            .w_full()
+            .px(14.0)
+            .py(12.0)
+            .gap(10.0)
+            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_muted)
+            .child(
+                row()
+                    .w_full()
+                    .gap(10.0)
+                    .center_y()
+                    .child(
+                        col()
+                            .gap(1.0)
+                            .grow(1.0)
+                            .child(text("Projects").font(k.ty.ui_medium).color(k.c.text_base))
+                            .child(text(counts).font(k.ty.small).color(k.c.text_muted)),
+                    )
+                    .child(settings_btn),
+            )
+            .child(
+                row()
+                    .w_full()
+                    .min_h(44.0)
+                    .gap(10.0)
+                    .center_y()
+                    .child(force_switch)
+                    .child(
+                        text("Force triggers")
+                            .font(k.ty.small)
+                            .color(k.c.text_muted),
+                    ),
+            );
+    }
+
     row()
         .key("projects-header")
         .w_full()
@@ -83,36 +139,17 @@ fn header(s: &State, k: &Kit, hair: f32) -> El {
                 .child(text(counts).font(k.ty.small).color(k.c.text_muted)),
         )
         .child(el().grow(1.0))
-        .child(
-            rune_kit::Switch::new(s.force)
-                .label("Force")
-                .hide_label()
-                .on_toggle_tx(|s: &mut State, tx: &mut Tx| {
-                    s.force = !s.force;
-                    tx.instant();
-                })
-                .build(k)
-                .key("projects-force"),
-        )
+        .child(force_switch)
         .child(
             text("Force triggers")
                 .font(k.ty.small)
                 .color(k.c.text_muted),
         )
-        .child(
-            Button::new("Settings")
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
-                .on_press_tx(|s: &mut State, tx: &mut Tx| {
-                    s.open_settings(crate::state::SettingsPage::Projects, tx)
-                })
-                .build(k)
-                .key("projects-settings"),
-        )
+        .child(settings_btn)
 }
 
 /// One project: name, remote, its latest run and what it is doing now.
-fn card_row(s: &State, k: &Kit, project: &Project) -> El {
+fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
     let state = project.state();
     let ink = theme::status(k).for_project(state);
     let run = project.current_run.as_ref().or(project.last_run.as_ref());
@@ -120,62 +157,94 @@ fn card_row(s: &State, k: &Kit, project: &Project) -> El {
     let triggering = s.triggering.as_deref() == Some(project.name.as_str());
     let directly = project.github_repo.clone();
 
-    let mut facts = row().w_full().gap(14.0).center_y();
+    let mut facts = if compact {
+        row().w_full().gap(8.0).flex_wrap().center_y()
+    } else {
+        row().w_full().gap(14.0).center_y()
+    };
     if let Some(run) = run {
+        let subj = text(if run.subject.is_empty() {
+            "no commit subject".to_string()
+        } else {
+            run.subject.clone()
+        })
+        .font(k.ty.small)
+        .color(k.c.text_muted);
+        let subj = if compact {
+            subj.wrap().grow(1.0)
+        } else {
+            subj.nowrap().truncate().grow(1.0)
+        };
         facts = facts.child(widgets::run_pill(k, run.status)).child(
             row()
                 .gap(6.0)
                 .center_y()
+                .grow(if compact { 1.0 } else { 0.0 })
                 .child(mono_chip(k, &short_sha(&run.sha)))
-                .child(
-                    text(if run.subject.is_empty() {
-                        "no commit subject".to_string()
-                    } else {
-                        run.subject.clone()
-                    })
-                    .font(k.ty.small)
-                    .color(k.c.text_muted)
-                    .nowrap()
-                    .truncate()
-                    .grow(1.0),
-                ),
+                .child(subj),
         );
     } else {
         facts = facts.child(widgets::pill(k, "Never run", k.c.text_faint));
     }
 
-    let mut right = row().gap(8.0).center_y();
+    let run_btn = Button::new(if triggering { "Starting…" } else { "Run now" })
+        .variant(ButtonVariant::Outline)
+        .control_size(ControlSize::Small)
+        .disabled(triggering || state == ProjectState::Running)
+        .help(if state == ProjectState::Running {
+            "Already running"
+        } else {
+            "Queue a run for the current upstream commit"
+        })
+        .on_press_tx(move |s: &mut State, _tx: &mut Tx| s.trigger(&name))
+        .build(k)
+        .key(format!("run-now-{}", project.name));
+
+    let mut meta_left = row().gap(8.0).flex_wrap().center_y();
     if project.pending_update() {
-        right = right.child(widgets::pill(k, "Update waiting", theme::status(k).running));
+        meta_left = meta_left.child(widgets::pill(k, "Update waiting", theme::status(k).running));
     }
     if let Some(run) = run {
-        right = right.child(
+        meta_left = meta_left.child(
             text(timing(k, run))
                 .font(k.ty.small)
                 .color(k.c.text_faint)
                 .nowrap(),
         );
     }
-    right = right.child(
-        Button::new(if triggering { "Starting…" } else { "Run now" })
-            .variant(ButtonVariant::Outline)
-            .control_size(ControlSize::Small)
-            .disabled(triggering || state == ProjectState::Running)
-            .help(if state == ProjectState::Running {
-                "Already running"
-            } else {
-                "Queue a run for the current upstream commit"
-            })
-            .on_press_tx(move |s: &mut State, _tx: &mut Tx| s.trigger(&name))
-            .build(k)
-            .key(format!("run-now-{}", project.name)),
-    );
+
+    let mut title_row = row()
+        .w_full()
+        .gap(10.0)
+        .center_y()
+        .child(widgets::dot(ink, 8.0))
+        .child(
+            text(project.name.clone())
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base),
+        )
+        .child(
+            text(project.branch.clone())
+                .font(k.ty.small)
+                .color(k.c.text_faint),
+        )
+        .child(el().grow(1.0));
+    if !compact {
+        title_row = title_row.children(directly.map(|repo| {
+            text(repo)
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .nowrap()
+                .truncate()
+        }));
+    }
+    title_row = title_row.child(widgets::project_pill(k, state));
 
     let mut card = col()
         .key(format!("project-{}", project.name))
         .w_full()
         .padding(14.0)
-        .gap(8.0)
+        .gap(if compact { 10.0 } else { 8.0 })
         .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(hair_width(k), k.c.border_muted)
@@ -185,33 +254,21 @@ fn card_row(s: &State, k: &Kit, project: &Project) -> El {
             move |s: &mut State, tx: &mut Tx| s.open_project(&name, tx)
         })
         .cursor(rune::Cursor::Pointer)
-        .child(
+        .child(title_row);
+
+    if compact {
+        card = card.child(facts).child(
             row()
                 .w_full()
-                .gap(10.0)
+                .gap(8.0)
+                .flex_wrap()
                 .center_y()
-                .child(widgets::dot(ink, 8.0))
-                .child(
-                    text(project.name.clone())
-                        .font(k.ty.ui_medium)
-                        .color(k.c.text_base),
-                )
-                .child(
-                    text(project.branch.clone())
-                        .font(k.ty.small)
-                        .color(k.c.text_faint),
-                )
-                .child(el().grow(1.0))
-                .children(directly.map(|repo| {
-                    text(repo)
-                        .font(k.ty.small)
-                        .color(k.c.text_faint)
-                        .nowrap()
-                        .truncate()
-                }))
-                .child(widgets::project_pill(k, state)),
-        )
-        .child(
+                .child(meta_left.grow(1.0))
+                .child(run_btn),
+        );
+    } else {
+        let right = meta_left.child(run_btn);
+        card = card.child(
             row()
                 .w_full()
                 .gap(10.0)
@@ -219,27 +276,29 @@ fn card_row(s: &State, k: &Kit, project: &Project) -> El {
                 .child(facts.grow(1.0))
                 .child(right),
         );
-    card = card.child(
-        row().w_full().gap(8.0).center_y().child(
-            text(format!(
-                "{} · {}",
-                project.repo_facts(),
-                project.checkout_facts()
-            ))
-            .font(k.ty.small)
-            .color(k.c.text_faint)
-            .nowrap()
-            .truncate(),
-        ),
-    );
+    }
+
+    let repo_line = text(format!(
+        "{} · {}",
+        project.repo_facts(),
+        project.checkout_facts()
+    ))
+    .font(k.ty.small)
+    .color(k.c.text_faint);
+    card = card.child(row().w_full().gap(8.0).center_y().child(if compact {
+        repo_line.wrap()
+    } else {
+        repo_line.nowrap().truncate()
+    }));
     if let Some(err) = &project.last_error {
-        card = card.child(
-            text(err.clone())
-                .font(k.ty.small)
-                .color(theme::status(k).error)
-                .nowrap()
-                .truncate(),
-        );
+        let err_el = text(err.clone())
+            .font(k.ty.small)
+            .color(theme::status(k).error);
+        card = card.child(if compact {
+            err_el.wrap()
+        } else {
+            err_el.nowrap().truncate()
+        });
     }
     card
 }

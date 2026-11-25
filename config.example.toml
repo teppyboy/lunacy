@@ -1,0 +1,151 @@
+# lunacy — local CI/deploy daemon
+#
+# Copy to config.toml and fill in the secrets. `lunacy check -c config.toml`
+# validates it (unknown keys are rejected, so typos fail loudly).
+
+[general]
+# Where run history, step logs, last-processed SHAs and the act lock live.
+# Defaults to the platform data dir (~/.local/share/lunacy on Linux,
+# %LOCALAPPDATA%\lunacy on Windows, ~/Library/Application Support/lunacy on macOS).
+# state_dir = "/home/tretrauit/.local/share/lunacy"
+poll_interval = 300      # seconds between `git fetch` checks, per project
+log_level = "info"       # trace | debug | info | warn | error
+# Shell argv used for `kind = "shell"` steps, project/step `shell` overrides it.
+# Unix default: ["bash", "-c"]; Windows default: ["cmd", "/C"].
+# shell = ["bash", "-c"]
+# shell = ["pwsh", "-NoProfile", "-Command"]   # PowerShell instead
+# shell = ["C:\\Program Files\\Git\\bin\\bash.exe", "-c"]  # Git Bash on Windows
+
+[server]
+# HTTP API + web UI. Remove the whole section to disable it.
+listen = "127.0.0.1:7878"
+# token = ""             # optional bearer token for every /api request
+# web_root = "ui/dist"   # serve the Rune web build at `/`
+# public_url = "http://127.0.0.1:7878"  # makes GitHub check runs link back here
+
+[github]
+# "status" = classic commit statuses (a PAT is enough).
+# "checks" = rich check runs with step tables; the Checks API only accepts a
+#            GitHub App installation token, so it needs [github.app].
+# Defaults to "checks" when [github.app] is set, "status" otherwise.
+mode = "status"
+# Fine-grained PAT with `Commit statuses: write` (and `Checks: write` for checks).
+token = "ghp_REPLACE_ME"
+# api_url = "https://api.github.com"   # GitHub Enterprise: https://ghe.example/api/v3
+
+# GitHub App, for mode = "checks" and for the "Re-run" button.
+# [github.app]
+# app_id = 123456
+# private_key_path = "/home/tretrauit/.config/lunacy/github-app.pem"
+# # private_key = """-----BEGIN RSA PRIVATE KEY-----..."""   # inline alternative
+# # installation_id = 12345678   # looked up via /repos/{owner}/{repo}/installation when omitted
+# webhook_secret = "REPLACE_ME"   # enables POST /api/github/webhook (re-run button)
+
+[discord]
+# webhook_url = "https://discord.com/api/webhooks/REPLACE/REPLACE"
+notify_on_start = false
+
+[act]
+# Global act defaults. `kind = "act"` steps use these unless they override.
+# command = ["act"]
+# On Windows, act running natively can mangle paths for some JS actions
+# (nektos/act#2645); then run it in WSL and lunacy translates the paths:
+# command = ["wsl.exe", "-e", "act"]
+# Self-hosted jobs always use this instead, because WSL is Linux:
+# native_command = ["act"]
+platforms = { "ubuntu-latest" = "catthehacker/ubuntu:act-latest" }
+# args = ["--pull=false"]
+
+# ---------------------------------------------------------------------------
+# lunarum: Flutter web frontend. CI = the `web` job of local-deploy-ci.yml
+# under act; deploy = the repository's own publish script.
+# ---------------------------------------------------------------------------
+[[project]]
+name = "lunarum"
+repo_path = "/home/tretrauit/workspace/lunarum"
+remote = "origin"
+branch = "master"
+github_repo = "teppyboy/lunarum"
+# The deploy script publishes into the live checkout and recreates the web
+# container from it, so it must run in repo_path itself. CI runs in act's own
+# clone, so nothing else needs a checkout.
+checkout = "none"
+poll_interval = 300
+env = { }
+
+[[project.ci]]
+name = "Web"
+kind = "act"
+workflow = ".github/workflows/local-deploy-ci.yml"
+job = "web"
+event = "push"
+timeout = 5400
+# scripts/local-ci.sh runs `with-act-lock.sh`, which serializes act across
+# lunarum and frostedge. lunacy replaces that with its own machine-wide lock,
+# so the lock is not taken twice.
+args = ["--pull=false"]
+
+[[project.ci]]
+name = "Windows build"
+kind = "act"
+workflow = ".github/workflows/flutter-ci.yml"
+job = "windows"
+event = "push"
+timeout = 5400
+# Only meaningful on a Windows host, where windows-* maps to -self-hosted.
+# Host prerequisites: Git, Node.js, Flutter 3.47.8, and Visual Studio 2022
+# Build Tools with the "Desktop development with C++" workload.
+only_on = ["windows"]
+
+[[project.deploy]]
+name = "Publish web"
+# scripts/local-web-deploy.sh does its own fetch, act CI, artifact sync and
+# health check on 127.0.0.1:47831. lunacy only triggers it.
+# NOTE: the script sends its own Discord embed through deploy-notification.py.
+# Set discord_webhook_url = "" below (or here) if you want only one message.
+run = "bash scripts/local-web-deploy.sh"
+timeout = 5400
+
+# ---------------------------------------------------------------------------
+# frostedge: Rust backend behind docker compose. CI = the `validate` job of
+# rust.yml under act; deploy = the repository's own deploy script.
+# ---------------------------------------------------------------------------
+[[project]]
+name = "frostedge"
+repo_path = "/home/tretrauit/workspace/web/frostedge"
+remote = "origin"
+branch = "master"
+github_repo = "teppyboy/frostedge"
+# deploy-local.sh refuses a dirty worktree, fetches, fast-forwards master and
+# runs `docker compose` itself, so it must run in repo_path.
+checkout = "none"
+poll_interval = 300
+
+[[project.ci]]
+name = "Validate"
+kind = "act"
+workflow = ".github/workflows/rust.yml"
+job = "validate"
+event = "pull_request"
+timeout = 5400
+# scripts/ci-act.sh pins this image by digest for reproducibility; lunacy
+# cannot pin per project, so update the digest here when you bump it.
+platforms = { "ubuntu-latest" = "catthehacker/ubuntu@sha256:1d8114fb9c1fa5de85c79a31dc6d24d2128753486e46e1cbad0de98d3f9ae966" }
+args = ["--pull=false"]
+vars = { "VCRAFT_CI_PG_PORT" = "5432", "VCRAFT_CI_REDIS_PORT" = "6379", "VCRAFT_CI_RUSTFS_PORT" = "9000" }
+# What scripts/ci-act.sh does that lunacy does not:
+#  - picks free loopback ports per run (the vars above are the fixed defaults);
+#  - builds event.json with pull_request base/head (lunacy writes a push-shaped
+#    event, which works for this job);
+#  - sweeps leftover act-Rust-CI-* containers and fails on leftovers;
+#  - injects RUST_TEST_NOCAPTURE and tees the log to a kept file;
+#  - applies CI_TIMEOUT (lunacy uses `timeout` above).
+# The commit-message step needs origin/master, which lunacy fetches on each poll.
+
+[[project.deploy]]
+name = "Deploy stack"
+# scripts/deploy-local.sh checks the worktree, fast-forwards master, rebuilds
+# compose, waits for 127.0.0.1:47830/api/v1/ready and records the deployed sha.
+# It sends its own Discord notification through deploy-notify.py.
+run = "bash scripts/deploy-local.sh"
+timeout = 3600

@@ -1,0 +1,29 @@
+# Linux system user unit. Install as ~/.config/systemd/user/lunacy.service:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lunacy
+#   journalctl --user -u lunacy -f
+#
+# For a system-wide unit, put it in /etc/systemd/system/, set User=, and drop
+# the `%h` paths.
+[Unit]
+Description=lunacy local CI/deploy daemon
+Documentation=https://github.com/teppyboy/lunacy
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/lunacy
+ExecStart=%h/.cargo/bin/lunacy run -c %h/.config/lunacy/config.toml
+Restart=on-failure
+RestartSec=10s
+# A pipeline is killed on `systemctl stop`; give it a moment to report.
+KillMode=mixed
+TimeoutStopSec=30s
+# act needs the Docker socket and the deploy scripts need git.
+SupplementaryGroups=docker
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

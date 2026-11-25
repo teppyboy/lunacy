@@ -376,6 +376,16 @@ fn act(s: &State, k: &Kit) -> El {
         "Platforms",
         Some("`runs-on: image`, one per line. Unlisted labels use act's own default image."),
     ));
+    c = c.child(text_field(
+        s,
+        k,
+        "act.lock_file",
+        "Lock file",
+        Some(
+            "The `flock` every act run takes, shared with scripts that call `flock` on it. \
+             Defaults to `act.lock` in the state dir; `~/` is expanded.",
+        ),
+    ));
     let _ = e;
     c
 }
@@ -506,6 +516,7 @@ fn is_optional(path: &str) -> bool {
             | "github.app.app_id"
             | "discord.webhook_url"
             | "act.command"
+            | "act.lock_file"
     )
 }
 

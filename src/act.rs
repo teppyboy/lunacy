@@ -418,13 +418,53 @@ pub fn build_args(
     }
 }
 
+/// All-zero sha: GitHub's "no previous commit", e.g. the first push of a branch.
+pub const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// Choose the `before` sha of a push event.
+///
+/// A workflow that reads commit messages over `before..after` treats an all-zero
+/// `before` as "walk from the repo root", which re-checks the whole history, so
+/// prefer the last sha lunacy processed when it is an ancestor of `after`, then
+/// the commit's first parent, and only then zeros (a root commit).
+pub fn pick_before(
+    last: Option<&str>,
+    last_is_ancestor: bool,
+    first_parent: Option<&str>,
+) -> String {
+    if let Some(last) = last {
+        if last_is_ancestor {
+            return last.to_string();
+        }
+    }
+    match first_parent {
+        Some(parent) => parent.to_string(),
+        None => ZERO_SHA.to_string(),
+    }
+}
+
 /// The `event.json` body act expects; the same shape lunarum's deploy worker builds.
-pub fn event_json(sha: &str, branch: &str, repo: Option<&str>) -> String {
+#[allow(clippy::too_many_arguments)]
+pub fn event_json(
+    sha: &str,
+    before: &str,
+    branch: &str,
+    repo: Option<&str>,
+    message: &str,
+    pusher: (&str, &str),
+) -> String {
     let repo = repo.unwrap_or("local/repo");
     let (owner, name) = repo.split_once('/').unwrap_or(("local", repo));
+    let (pusher_name, pusher_email) = pusher;
+    let head = serde_json::json!({
+        "id": sha,
+        "message": message,
+        "author": { "name": pusher_name, "email": pusher_email },
+        "committer": { "name": pusher_name, "email": pusher_email },
+    });
     serde_json::json!({
         "after": sha,
-        "before": "0000000000000000000000000000000000000000",
+        "before": before,
         "ref": format!("refs/heads/{branch}"),
         "repository": {
             "full_name": repo,
@@ -432,7 +472,10 @@ pub fn event_json(sha: &str, branch: &str, repo: Option<&str>) -> String {
             "owner": { "login": owner },
             "default_branch": branch,
         },
-        "head_commit": { "id": sha, "message": "" },
+        "head_commit": head,
+        "commits": [head],
+        "pusher": { "name": pusher_name, "email": pusher_email },
+        "sender": { "login": owner, "type": "User" },
     })
     .to_string()
 }
@@ -653,14 +696,44 @@ jobs:
 
     #[test]
     fn event_json_shape() {
-        let v: serde_json::Value =
-            serde_json::from_str(&event_json("abc123", "master", Some("teppyboy/lunarum")))
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&event_json(
+            "abc123",
+            "def456",
+            "master",
+            Some("teppyboy/lunarum"),
+            "feat: a thing",
+            ("Teppy", "teppy@example.invalid"),
+        ))
+        .unwrap();
         assert_eq!(v["after"], "abc123");
+        assert_eq!(v["before"], "def456");
         assert_eq!(v["head_commit"]["id"], "abc123");
+        assert_eq!(v["head_commit"]["message"], "feat: a thing");
+        assert_eq!(v["commits"][0]["id"], "abc123");
         assert_eq!(v["ref"], "refs/heads/master");
         assert_eq!(v["repository"]["full_name"], "teppyboy/lunarum");
         assert_eq!(v["repository"]["owner"]["login"], "teppyboy");
+        assert_eq!(v["pusher"]["email"], "teppy@example.invalid");
+        assert_eq!(v["sender"]["login"], "teppyboy");
+    }
+
+    #[test]
+    fn before_prefers_the_last_processed_ancestor() {
+        // A known ancestor wins: the range is exactly the new commits.
+        assert_eq!(
+            pick_before(Some("aaaa"), true, Some("bbbb")),
+            "aaaa".to_string()
+        );
+        // Not an ancestor (force push, or another branch): fall back to the parent.
+        assert_eq!(
+            pick_before(Some("aaaa"), false, Some("bbbb")),
+            "bbbb".to_string()
+        );
+        // Nothing processed yet: the first parent still gives a one-commit range.
+        assert_eq!(pick_before(None, false, Some("bbbb")), "bbbb".to_string());
+        // Root commit: zeros, which is what GitHub sends for a new branch.
+        assert_eq!(pick_before(None, false, None), ZERO_SHA.to_string());
+        assert_eq!(pick_before(Some("aaaa"), false, None), ZERO_SHA.to_string());
     }
 
     #[test]

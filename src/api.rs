@@ -275,7 +275,7 @@ fn authorize(state: &Arc<ApiState>, request: &tiny_http::Request) -> Result<(), 
         .config
         .server
         .as_ref()
-        .map(|s| s.token.clone())
+        .map(|s| s.token_value())
         .unwrap_or_default();
     if token.is_empty() {
         return Ok(());
@@ -732,7 +732,7 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
         .github
         .as_ref()
         .and_then(|g| g.app.as_ref())
-        .and_then(|a| a.webhook_secret.clone())
+        .and_then(|a| a.webhook_secret_value())
         .filter(|s| !s.is_empty() && s != MASK);
     let Some(secret) = secret else {
         return request

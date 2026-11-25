@@ -55,6 +55,7 @@ fn act_step_runs_the_workflow_and_records_substeps() {
             m
         },
         args: Vec::new(),
+        lock_file: None,
     });
 
     let project = ProjectCfg {

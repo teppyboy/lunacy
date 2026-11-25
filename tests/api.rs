@@ -150,6 +150,7 @@ fn start(token: &str) -> Server {
     cfg.server = Some(lunacy::config::ServerCfg {
         listen: "127.0.0.1:0".into(),
         token: token.into(),
+        token_file: None,
         web_root: None,
         public_url: None,
     });
@@ -424,11 +425,13 @@ fn config_get_masks_secrets_and_put_roundtrips() {
         guard.config.github = Some(lunacy::config::GithubCfg {
             mode: None,
             token: Some("ghp_realtoken".into()),
+            token_file: None,
             api_url: None,
             app: None,
         });
         guard.config.discord = Some(lunacy::config::DiscordCfg {
             webhook_url: Some("https://discord.com/api/webhooks/a/b".into()),
+            webhook_url_file: None,
             notify_on_start: false,
         });
     }
@@ -558,6 +561,7 @@ fn webhook_404s_without_a_secret_and_rejects_a_bad_signature() {
         guard.config.github = Some(lunacy::config::GithubCfg {
             mode: None,
             token: Some("x".into()),
+            token_file: None,
             api_url: None,
             app: Some(lunacy::config::AppCfg {
                 app_id: 1,
@@ -565,6 +569,7 @@ fn webhook_404s_without_a_secret_and_rejects_a_bad_signature() {
                 private_key: Some("k".into()),
                 installation_id: Some(1),
                 webhook_secret: Some("hooksecret".into()),
+                webhook_secret_file: None,
             }),
         });
     }

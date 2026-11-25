@@ -39,6 +39,16 @@ pub fn upstream_sha(repo: &Path, remote: &str, branch: &str) -> Result<String> {
     rev_parse(repo, &format!("refs/remotes/{remote}/{branch}"))
 }
 
+/// `(message, author name, author email)` of one commit; empty parts on failure.
+pub fn commit_details(repo: &Path, sha: &str) -> (String, String, String) {
+    let raw = git(repo, &["log", "-1", "--format=%B%x1f%an%x1f%ae", sha]).unwrap_or_default();
+    let mut parts = raw.split('\u{1f}');
+    let message = parts.next().unwrap_or_default().trim_end().to_string();
+    let name = parts.next().unwrap_or_default().trim().to_string();
+    let email = parts.next().unwrap_or_default().trim().to_string();
+    (message, name, email)
+}
+
 pub fn subject(repo: &Path, sha: &str) -> String {
     git(repo, &["log", "-1", "--format=%s", sha]).unwrap_or_default()
 }

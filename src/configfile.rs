@@ -238,6 +238,7 @@ timeout = 60
         cfg.server = Some(crate::config::ServerCfg {
             listen: "127.0.0.1:9999".into(),
             token: "t".into(),
+            token_file: None,
             web_root: None,
             public_url: None,
         });

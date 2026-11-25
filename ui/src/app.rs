@@ -46,8 +46,11 @@ fn init() -> State {
     State::new(crate::state::conn_from_env())
 }
 
+/// One named scene: `--scene` and `tools/shots.sh` pick by name.
+pub type Scene = (&'static str, fn(&mut State));
+
 /// Named states, for `--scene` snapshots and the screenshot script.
-pub const SCENES: &[(&str, fn(&mut State))] = &[
+pub const SCENES: &[Scene] = &[
     ("projects", |s| crate::demo::load(s, View::Projects)),
     ("projects-dark", |s| crate::demo::load(s, View::Projects)),
     ("project", |s| {
@@ -445,8 +448,10 @@ fn rail(s: &State, k: &Kit, hair: f32) -> El {
                 .gap(2.0)
                 .border_sides([hair, 0.0, 0.0, 0.0], k.c.border_muted)
                 .child(
+                    // Two lines rather than one truncated "daemon 0....": the
+                    // rail is 196px, so the address wraps under the version.
                     text(format!(
-                        "daemon {} · {}",
+                        "daemon {}\n{}",
                         if s.version.is_empty() {
                             "—".into()
                         } else {
@@ -456,8 +461,7 @@ fn rail(s: &State, k: &Kit, hair: f32) -> El {
                     ))
                     .font(k.ty.small)
                     .color(k.c.text_faint)
-                    .nowrap()
-                    .truncate(),
+                    .wrap(),
                 ),
         )
 }

@@ -567,6 +567,7 @@
       "command": [
         "act"
       ],
+      "lock_file": "~/.local/state/act-gate.lock",
       "platforms": {
         "ubuntu-latest": "catthehacker/ubuntu:act-latest",
         "windows-latest": "catthehacker/windows:latest"

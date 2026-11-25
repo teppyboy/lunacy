@@ -125,11 +125,26 @@ pub struct ServerCfg {
     pub listen: String,
     #[serde(default)]
     pub token: String,
+    /// File holding the token instead of the inline value; read trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_root: Option<PathBuf>,
     /// Used for GitHub check-run `details_url` links back into the UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
+}
+
+impl ServerCfg {
+    pub fn token_value(&self) -> String {
+        if !self.token.trim().is_empty() {
+            return self.token.trim().to_string();
+        }
+        self.token_file
+            .as_deref()
+            .and_then(read_trimmed)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +155,9 @@ pub struct GithubCfg {
     pub mode: Option<GithubMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// File holding the token instead of the inline value; read trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,7 +179,15 @@ impl GithubCfg {
 
     /// True when there is anything to report with.
     pub fn enabled(&self) -> bool {
-        non_empty(&self.token) || self.app.is_some()
+        non_empty(&self.token) || self.token_file.is_some() || self.app.is_some()
+    }
+
+    /// The inline token, else the trimmed contents of `token_file`.
+    pub fn token_value(&self) -> Option<String> {
+        match self.token.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => Some(t.to_string()),
+            _ => self.token_file.as_deref().and_then(read_trimmed),
+        }
     }
 }
 
@@ -177,20 +203,33 @@ pub struct AppCfg {
     pub installation_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_secret: Option<String>,
+    /// File holding the webhook secret instead of the inline value; read trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_file: Option<PathBuf>,
 }
 
 impl AppCfg {
     pub fn key_pem(&self) -> Result<String> {
         if let Some(path) = &self.private_key_path {
-            return std::fs::read_to_string(path)
+            let path = expand_tilde(path);
+            return std::fs::read_to_string(&path)
+                .map(|pem| pem.trim().to_string())
                 .with_context(|| format!("reading github app key {}", path.display()));
         }
         if let Some(k) = &self.private_key {
-            if !k.is_empty() {
-                return Ok(k.clone());
+            if !k.trim().is_empty() {
+                return Ok(k.trim().to_string());
             }
         }
         anyhow::bail!("github.app needs private_key_path or private_key")
+    }
+
+    /// The inline webhook secret, else the trimmed contents of `webhook_secret_file`.
+    pub fn webhook_secret_value(&self) -> Option<String> {
+        match self.webhook_secret.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => Some(s.to_string()),
+            _ => self.webhook_secret_file.as_deref().and_then(read_trimmed),
+        }
     }
 }
 
@@ -199,8 +238,21 @@ impl AppCfg {
 pub struct DiscordCfg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
+    /// File holding the webhook URL instead of the inline value; read trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url_file: Option<PathBuf>,
     #[serde(default)]
     pub notify_on_start: bool,
+}
+
+impl DiscordCfg {
+    /// The inline webhook URL, else the trimmed contents of `webhook_url_file`.
+    pub fn webhook_url_value(&self) -> Option<String> {
+        match self.webhook_url.as_deref().map(str::trim) {
+            Some(u) if !u.is_empty() => Some(u.to_string()),
+            _ => self.webhook_url_file.as_deref().and_then(read_trimmed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -216,6 +268,10 @@ pub struct ActCfg {
     pub platforms: BTreeMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Lock every act run takes; `flock(2)`, so the `flock` CLI can share it.
+    /// Defaults to `state_dir/act.lock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_file: Option<PathBuf>,
 }
 
 impl ActCfg {
@@ -418,8 +474,22 @@ impl Config {
             if server.listen.trim().is_empty() {
                 return Err(ConfigError::new("server.listen", "must not be empty"));
             }
+            conflict(
+                "server.token",
+                !server.token.trim().is_empty(),
+                "server.token_file",
+                server.token_file.is_some(),
+            )?;
+            check_secret_file("server.token_file", server.token_file.as_deref())?;
         }
         if let Some(github) = &self.github {
+            conflict(
+                "github.token",
+                non_empty(&github.token),
+                "github.token_file",
+                github.token_file.is_some(),
+            )?;
+            check_secret_file("github.token_file", github.token_file.as_deref())?;
             if let Some(mode) = github.mode {
                 if mode == GithubMode::Checks && github.app.is_none() {
                     return Err(ConfigError::new(
@@ -435,11 +505,48 @@ impl Config {
                         "needs private_key_path or private_key",
                     ));
                 }
+                conflict(
+                    "github.app.private_key",
+                    non_empty(&app.private_key),
+                    "github.app.private_key_path",
+                    app.private_key_path.is_some(),
+                )?;
+                conflict(
+                    "github.app.webhook_secret",
+                    non_empty(&app.webhook_secret),
+                    "github.app.webhook_secret_file",
+                    app.webhook_secret_file.is_some(),
+                )?;
+                check_secret_file(
+                    "github.app.private_key_path",
+                    app.private_key_path.as_deref(),
+                )?;
+                check_secret_file(
+                    "github.app.webhook_secret_file",
+                    app.webhook_secret_file.as_deref(),
+                )?;
             }
+        }
+        if let Some(discord) = &self.discord {
+            conflict(
+                "discord.webhook_url",
+                non_empty(&discord.webhook_url),
+                "discord.webhook_url_file",
+                discord.webhook_url_file.is_some(),
+            )?;
+            check_secret_file(
+                "discord.webhook_url_file",
+                discord.webhook_url_file.as_deref(),
+            )?;
         }
         if let Some(act) = &self.act {
             if act.command().is_empty() {
                 return Err(ConfigError::new("act.command", "must not be empty"));
+            }
+            if let Some(lock) = &act.lock_file {
+                if lock.as_os_str().is_empty() {
+                    return Err(ConfigError::new("act.lock_file", "must not be empty"));
+                }
             }
         }
 
@@ -546,8 +653,12 @@ impl Config {
         let url = project
             .discord_webhook_url
             .clone()
-            .or_else(|| self.discord.as_ref().and_then(|d| d.webhook_url.clone()))
-            .filter(|u| !u.is_empty())?;
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| self.discord.as_ref().and_then(|d| d.webhook_url_value()))?;
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return None;
+        }
         let start = project
             .notify_on_start
             .or_else(|| self.discord.as_ref().map(|d| d.notify_on_start))
@@ -557,6 +668,14 @@ impl Config {
 
     pub fn act(&self) -> ActCfg {
         self.act.clone().unwrap_or_default()
+    }
+
+    /// The act lock every act run takes: `[act] lock_file`, else `state_dir/act.lock`.
+    pub fn act_lock_file(&self) -> PathBuf {
+        match self.act.as_ref().and_then(|a| a.lock_file.clone()) {
+            Some(path) => expand_tilde(&path),
+            None => self.state_dir().join("act.lock"),
+        }
     }
 
     /// Copy with secrets replaced by [`MASK`]; empty values stay empty.
@@ -628,6 +747,34 @@ impl Config {
     }
 }
 
+/// `~/x` -> the home directory plus `x`; anything else is returned unchanged.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    let Some(rest) = path
+        .to_string_lossy()
+        .strip_prefix("~/")
+        .map(str::to_string)
+    else {
+        return path.to_path_buf();
+    };
+    match directories::BaseDirs::new() {
+        Some(base) => base.home_dir().join(rest),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Read a secret file and trim it; `None` when it cannot be read (the caller
+/// then behaves as if the secret were absent, and `check` reports the path).
+fn read_trimmed(path: &Path) -> Option<String> {
+    let path = expand_tilde(path);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn mask_str(v: &mut String) {
     if !v.is_empty() {
         *v = MASK.to_string();
@@ -648,6 +795,39 @@ fn unmask_opt(new: &mut Option<String>, old: &Option<String>) {
 
 fn non_empty(v: &Option<String>) -> bool {
     v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
+/// The inline value and its `*_file` alternative are mutually exclusive.
+fn conflict(
+    inline: &str,
+    has_inline: bool,
+    file: &str,
+    has_file: bool,
+) -> std::result::Result<(), ConfigError> {
+    if has_inline && has_file {
+        return Err(ConfigError::new(
+            file,
+            format!("set either {inline} or {file}, not both"),
+        ));
+    }
+    Ok(())
+}
+
+/// A secret file must exist and hold something; the value itself is read at load.
+fn check_secret_file(field: &str, path: Option<&Path>) -> std::result::Result<(), ConfigError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let expanded = expand_tilde(path);
+    let text = std::fs::read_to_string(&expanded)
+        .map_err(|e| ConfigError::new(field, format!("cannot read {}: {e}", expanded.display())))?;
+    if text.trim().is_empty() {
+        return Err(ConfigError::new(
+            field,
+            format!("{} is empty", expanded.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn is_owner_name(v: &str) -> bool {
@@ -807,6 +987,7 @@ chekout = "worktree"
         let plain = GithubCfg {
             mode: None,
             token: Some("t".into()),
+            token_file: None,
             api_url: None,
             app: None,
         };
@@ -818,6 +999,7 @@ chekout = "worktree"
             private_key: Some("k".into()),
             installation_id: None,
             webhook_secret: None,
+            webhook_secret_file: None,
         });
         assert_eq!(with_app.effective_mode(), GithubMode::Checks);
     }
@@ -828,6 +1010,7 @@ chekout = "worktree"
         cfg.github = Some(GithubCfg {
             mode: Some(GithubMode::Checks),
             token: Some("x".into()),
+            token_file: None,
             api_url: None,
             app: None,
         });
@@ -841,11 +1024,13 @@ chekout = "worktree"
         cfg.github = Some(GithubCfg {
             mode: None,
             token: Some("ghp_secret".into()),
+            token_file: None,
             api_url: None,
             app: None,
         });
         cfg.discord = Some(DiscordCfg {
             webhook_url: Some("https://discord.com/api/webhooks/x".into()),
+            webhook_url_file: None,
             notify_on_start: false,
         });
         if let Some(s) = cfg.server.as_mut() {
@@ -942,6 +1127,137 @@ chekout = "worktree"
             resolve_shell(&General::default(), None, None, Os::Macos),
             vec!["bash".to_string(), "-c".to_string()]
         );
+    }
+
+    #[test]
+    fn secret_files_are_read_and_conflict_with_inline_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token = dir.path().join("token");
+        std::fs::write(&token, "  ghp_from_file\n").expect("write");
+        let hook = dir.path().join("hook");
+        std::fs::write(&hook, "hooksecret").expect("write");
+        let url = dir.path().join("url");
+        std::fs::write(&url, "https://discord.com/api/webhooks/f/g").expect("write");
+
+        let mut cfg = example();
+        cfg.github = Some(GithubCfg {
+            mode: Some(GithubMode::Checks),
+            token: None,
+            token_file: Some(token.clone()),
+            api_url: None,
+            app: Some(AppCfg {
+                app_id: 1,
+                private_key_path: Some(dir.path().join("missing.pem")),
+                private_key: None,
+                installation_id: Some(1),
+                webhook_secret: None,
+                webhook_secret_file: Some(hook.clone()),
+            }),
+        });
+        cfg.discord = Some(DiscordCfg {
+            webhook_url: None,
+            webhook_url_file: Some(url.clone()),
+            notify_on_start: false,
+        });
+        cfg.server = Some(ServerCfg {
+            listen: "127.0.0.1:1".into(),
+            token: String::new(),
+            token_file: Some(token.clone()),
+            web_root: None,
+            public_url: None,
+        });
+
+        // Trimmed at load.
+        assert_eq!(
+            cfg.github.as_ref().unwrap().token_value().as_deref(),
+            Some("ghp_from_file")
+        );
+        assert_eq!(
+            cfg.github
+                .as_ref()
+                .unwrap()
+                .app
+                .as_ref()
+                .unwrap()
+                .webhook_secret_value()
+                .as_deref(),
+            Some("hooksecret")
+        );
+        assert_eq!(
+            cfg.discord_for(&cfg.projects[0].clone())
+                .map(|(u, _)| u)
+                .as_deref(),
+            Some("https://discord.com/api/webhooks/f/g")
+        );
+        assert_eq!(cfg.server.as_ref().unwrap().token_value(), "ghp_from_file");
+        // A missing key file is a validation error on that field, not a panic.
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("github.app.private_key_path"));
+        assert!(err.message.contains("cannot read"), "{}", err.message);
+
+        // Give it a real key file: now it validates, and the *_file paths are
+        // exposed as plain strings.
+        let pem = dir.path().join("key.pem");
+        std::fs::write(&pem, "-----BEGIN KEY-----\n").expect("write");
+        if let Some(app) = cfg.github.as_mut().and_then(|g| g.app.as_mut()) {
+            app.private_key_path = Some(pem);
+        }
+        cfg.validate().expect("valid");
+        let json = serde_json::to_string(&cfg.masked()).expect("json");
+        assert!(json.contains("token_file"), "{json}");
+        assert!(json.contains("webhook_url_file"), "{json}");
+        assert!(!json.contains("ghp_from_file"), "{json}");
+        assert!(!json.contains("hooksecret"), "{json}");
+        assert!(!json.contains("webhooks/f/g"), "{json}");
+
+        // Both spellings of one secret is a hard error naming the file field.
+        let mut bad = cfg.clone();
+        bad.github.as_mut().unwrap().token = Some("inline".into());
+        let err = bad.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("github.token_file"));
+        assert!(err.message.contains("not both"), "{}", err.message);
+
+        let mut bad = cfg.clone();
+        bad.discord.as_mut().unwrap().webhook_url = Some("inline".into());
+        assert_eq!(
+            bad.validate().unwrap_err().field.as_deref(),
+            Some("discord.webhook_url_file")
+        );
+        let mut bad = cfg.clone();
+        bad.server.as_mut().unwrap().token = "inline".into();
+        assert_eq!(
+            bad.validate().unwrap_err().field.as_deref(),
+            Some("server.token_file")
+        );
+
+        // An empty file is reported instead of silently meaning "no secret".
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "  \n").expect("write");
+        let mut bad = cfg.clone();
+        bad.github.as_mut().unwrap().token_file = Some(empty);
+        bad.github.as_mut().unwrap().token = None;
+        let err = bad.validate().unwrap_err();
+        assert!(err.message.contains("is empty"), "{}", err.message);
+    }
+
+    #[test]
+    fn tilde_and_lock_file() {
+        let home = directories::BaseDirs::new()
+            .expect("home")
+            .home_dir()
+            .to_path_buf();
+        assert_eq!(expand_tilde(Path::new("~/x")), home.join("x"));
+        assert_eq!(expand_tilde(Path::new("/abs/x")), PathBuf::from("/abs/x"));
+
+        // Default stays state_dir/act.lock.
+        let mut cfg = Config::default();
+        cfg.general.state_dir = Some(PathBuf::from("/state"));
+        assert_eq!(cfg.act_lock_file(), PathBuf::from("/state/act.lock"));
+        cfg.act = Some(ActCfg {
+            lock_file: Some(PathBuf::from("~/act-gate.lock")),
+            ..ActCfg::default()
+        });
+        assert_eq!(cfg.act_lock_file(), home.join("act-gate.lock"));
     }
 
     #[test]

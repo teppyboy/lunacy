@@ -9,6 +9,7 @@ JSON everywhere except logs. Times are unix seconds (u64). Unknown fields must b
 [server]
 listen = "127.0.0.1:7878"   # omit [server] to disable the API
 token = ""                  # optional; if set, every /api request needs `Authorization: Bearer <token>`
+token_file = "~/.config/lunacy/api-token"   # or read the token from a file
 web_root = "ui/dist"        # optional; static files (Rune web build) served at `/`
 ```
 
@@ -92,6 +93,17 @@ Step config: `{"name", "kind": "shell"|"act", "run"?, "timeout", "cwd"?, "shell"
 host OS is recorded with `status = "skipped"` (not a failure) and shows up as skipped
 in run history, the GitHub summary and Discord.
 Secret fields (masked): `github.token`, `github.app.private_key`, `github.app.webhook_secret`, `discord.webhook_url`, `server.token`, every project `discord_webhook_url`, every act `secrets` value.
+
+A secret may instead come from a file: `github.token_file`, `github.app.webhook_secret_file`,
+`discord.webhook_url_file`, `server.token_file`. The file is read (trimmed) at load; setting both
+the inline value and its `_file` is a validation error naming the `_file` field, and a missing or
+empty file is one too. The `*_file` paths are plain (non-secret) strings in this JSON — the file
+contents never are. `github.app.private_key_path` works the same way.
+
+`[act] lock_file` (default `<state_dir>/act.lock`, `~/` expanded) is the `flock` every act run
+takes; point it at the file a manual `make ci` locks to keep the two apart. Every step of a run
+whose first act step created a clone gets its path as `LUNACY_CI_DIR` in the environment (not in
+this JSON).
 Comments in config.toml are preserved where possible (toml_edit); new sections are appended.
 
 Run history is persisted under `state_dir/runs/<project>/<id>.json` so it survives restarts.

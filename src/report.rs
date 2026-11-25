@@ -46,7 +46,7 @@ impl Github {
         };
         Ok(Github {
             mode: cfg.effective_mode(),
-            token: cfg.token.clone().filter(|t| !t.is_empty() && t != MASK),
+            token: cfg.token_value().filter(|t| !t.is_empty() && t != MASK),
             app,
             api_url: cfg.api_url().trim_end_matches('/').to_string(),
             agent,

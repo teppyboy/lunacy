@@ -27,10 +27,21 @@ Two kinds of step:
 
 - `kind = "shell"` (default) — your own command, e.g. the repo's deploy script.
 - `kind = "act"` — a job from a GitHub Actions workflow, run by
-  [nektos/act](https://github.com/nektos/act). lunacy clones the commit into a
-  temporary directory, writes `event.json`, streams act's `--json` output into
-  per-step substeps (visible in the API, the GitHub summary and Discord), and
-  serialises act across projects with a machine-wide lock.
+  [nektos/act](https://github.com/nektos/act). lunacy clones the commit into
+  `state_dir/checkouts/<run id>/repo`, writes `event.json`, streams act's
+  `--json` output into per-step substeps (visible in the API, the GitHub summary
+  and Discord), and serialises act across projects with a machine-wide lock.
+
+Every step of the run sees that clone's path as `LUNACY_CI_DIR` (unset when no
+act step ran). act runs with `--bind`, so files a CI job writes into the clone
+are still there for a later deploy step — that is how a deploy publishes the
+`build/web` the CI job produced without running act twice. The clone is removed
+when the pipeline ends. act's container can leave root-owned files behind; the
+cleanup then only logs a warning, and you remove the directory with `sudo rm -rf`.
+
+`[act] lock_file` points the act lock at the file a manual `make ci` also uses.
+`fs2`'s `lock_exclusive` is `flock(2)`, the same lock the `flock` CLI takes, so
+lunacy and lunarum's `scripts/with-act-lock.sh` never run act at the same time.
 
 ## Install
 
@@ -55,7 +66,12 @@ lunacy run    -c config.toml                # the daemon
 Config is strict: unknown keys are a hard error, so a typo fails `lunacy check`
 instead of being silently ignored. Secrets may live in the file; the API masks
 them (`"********"`) and a `PUT /api/config` that echoes the mask keeps the
-stored value.
+stored value. A secret can also come from a file, which is read (and trimmed) at
+load and kept out of the config: `github.token_file`,
+`github.app.webhook_secret_file`, `discord.webhook_url_file` and
+`server.token_file`. Setting both the inline value and its `_file` is a
+validation error; `~/` is expanded in every path. Only the file *paths* appear in
+the API's Config JSON — the values never do.
 
 ## Windows host
 
@@ -148,12 +164,19 @@ failures are logged and never fail the pipeline.
 
 - **lunarum** — CI is the `web` job of `.github/workflows/local-deploy-ci.yml`
   under act; a second act step builds the `windows` job of `flutter-ci.yml`
-  with `only_on = ["windows"]`. Deploy runs `scripts/local-web-deploy.sh`,
-  which keeps its own fetch/act/health-check logic and health endpoint
-  `127.0.0.1:47831`.
+  with `only_on = ["windows"]`. That job runs with `--bind`, so it leaves
+  `build/web` in `LUNACY_CI_DIR` for the deploy step: publishing can rsync
+  `$LUNACY_CI_DIR/build/web/` into the live checkout and recreate the container
+  instead of running act again. Deploy runs `scripts/local-web-deploy.sh`,
+  which still keeps its own fetch/act/health-check logic and health endpoint
+  `127.0.0.1:47831`. Set `[act] lock_file = "~/.local/state/act-gate.lock"` so
+  lunacy and the script's `with-act-lock.sh` share one lock.
 - **frostedge** — CI is the `validate` job of `.github/workflows/rust.yml`
   under act, with the runner image pinned by digest exactly like
-  `scripts/ci-act.sh`. Deploy runs `scripts/deploy-local.sh`, which still does
+  `scripts/ci-act.sh`. Its commit-message check walks `before..after`, so
+  `event.json` carries the last processed sha as `before` when that is an
+  ancestor of the target, else the target's first parent, and only zeros for a
+  root commit — a zero `before` would make the check walk the whole history. Deploy runs `scripts/deploy-local.sh`, which still does
   its own dirty-worktree check, fast-forward and health check on
   `127.0.0.1:47830`.
 

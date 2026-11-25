@@ -265,7 +265,7 @@ fn once(path: PathBuf, project_name: String, sha: Option<String>, force: bool) -
             }
         }
     });
-    let act_lock = state_dir.join("act.lock");
+    let act_lock = cfg.act_lock_file();
     let on_update = |run: &model::Run| {
         println!(
             "[{}] {}: {} ({})",

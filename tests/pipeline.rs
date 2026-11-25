@@ -320,6 +320,7 @@ fn reporting_is_disabled_without_token_or_webhook() {
         github: Some(lunacy::config::GithubCfg {
             mode: None,
             token: None,
+            token_file: None,
             api_url: None,
             app: None,
         }),
@@ -383,5 +384,120 @@ fn worktree_checkout_is_cleaned_up_and_sees_the_commit() {
         listing.matches("worktree ").count(),
         1,
         "only the main worktree should remain: {listing}"
+    );
+}
+
+/// A fake `act`: ignores its arguments, writes `build/web/index.html` into the
+/// working directory (the run's clone, the way a real job with `--bind` would),
+/// and prints one act JSON line so the substep parser runs too.
+fn fake_act(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake-act");
+    std::fs::write(
+        &path,
+        "#!/usr/bin/env bash\nset -e\nmkdir -p build/web\nprintf 'built\\n' > build/web/index.html\n\
+         printf '%s\\n' '{\"job\":\"CI/web\",\"jobID\":\"web\",\"step\":\"Build\",\"stepID\":[\"0\"],\"msg\":\"\\u2b50 Run Main Build\"}'\n\
+         printf '%s\\n' '{\"step\":\"Build\",\"stepResult\":\"success\",\"executionTime\":1000}'\n",
+    )
+    .expect("write fake act");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    path
+}
+
+#[test]
+fn act_clone_is_reused_for_deploy_and_removed_afterwards() {
+    if cfg!(windows) {
+        return; // the fixture steps use bash
+    }
+    let fx = common::Fixture::new();
+    let state = tempfile::tempdir().expect("state");
+    let state_dir = state.path().to_path_buf();
+    let sha = fx.commit("a.txt", "eight\n", "feat: act clone");
+    let act = fake_act(state.path());
+
+    let mut cfg = config(&fx, &state_dir);
+    cfg.act = Some(lunacy::config::ActCfg {
+        command: Some(vec![act.to_string_lossy().to_string()]),
+        ..lunacy::config::ActCfg::default()
+    });
+
+    let mut p = project(&fx, &state_dir, "true");
+    p.ci = vec![StepCfg {
+        name: "Workflow".into(),
+        kind: StepKind::Act,
+        run: None,
+        workflow: Some(".github/workflows/ci.yml".into()),
+        job: Some("web".into()),
+        event: None,
+        platforms: Default::default(),
+        args: Vec::new(),
+        secrets: Default::default(),
+        vars: Default::default(),
+        only_on: Vec::new(),
+        timeout: Some(60),
+        cwd: None,
+        shell: None,
+        env: Default::default(),
+    }];
+    // The deploy step sees the artifact the CI job wrote into the clone, and
+    // records the directory so the test can check it is gone afterwards.
+    let seen = state_dir.join("ci-dir-seen");
+    p.deploy = vec![shell_step(
+        "Publish",
+        &format!(
+            "set -eu; test -n \"${{LUNACY_CI_DIR:-}}\"; \
+             test -f \"$LUNACY_CI_DIR/build/web/index.html\"; \
+             printf '%s' \"$LUNACY_CI_DIR\" > {}",
+            seen.display()
+        ),
+    )];
+
+    lunacy::git::fetch(&p.repo_path, "origin", "master").expect("fetch");
+    let run = run_pipeline(&cfg, &state_dir, &p, &sha);
+    assert_eq!(run.status, RunStatus::Success, "steps: {:?}", run.steps);
+    assert_eq!(run.steps[0].status, StepStatus::Success);
+    assert!(!run.steps[0].substeps.is_empty(), "act JSON parsed");
+
+    let ci_dir = std::fs::read_to_string(&seen).expect("deploy saw LUNACY_CI_DIR");
+    assert_eq!(
+        PathBuf::from(&ci_dir),
+        state_dir.join("checkouts").join(&run.id).join("repo"),
+        "the clone lives under the run's state dir"
+    );
+    assert!(
+        !state_dir.join("checkouts").join(&run.id).exists(),
+        "the act clone is removed when the pipeline finishes"
+    );
+}
+
+#[test]
+fn no_act_step_means_no_ci_dir_in_the_environment() {
+    if cfg!(windows) {
+        return;
+    }
+    let fx = common::Fixture::new();
+    let state = tempfile::tempdir().expect("state");
+    let state_dir = state.path().to_path_buf();
+    let sha = fx.commit("a.txt", "nine\n", "feat: shell only");
+    let cfg = config(&fx, &state_dir);
+    let marker = state_dir.join("ci-dir-absent");
+    let mut p = project(&fx, &state_dir, "true");
+    p.deploy = vec![shell_step(
+        "Publish",
+        &format!(
+            "test -z \"${{LUNACY_CI_DIR:-}}\" && touch {}",
+            marker.display()
+        ),
+    )];
+
+    lunacy::git::fetch(&p.repo_path, "origin", "master").expect("fetch");
+    let run = run_pipeline(&cfg, &state_dir, &p, &sha);
+    assert_eq!(run.status, RunStatus::Success, "steps: {:?}", run.steps);
+    assert!(
+        marker.is_file(),
+        "LUNACY_CI_DIR is unset without an act step"
     );
 }

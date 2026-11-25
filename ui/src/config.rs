@@ -129,6 +129,9 @@ pub struct Discord {
 pub struct Act {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
+    /// Lock every act run takes; defaults to `state_dir/act.lock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_file: Option<String>,
     #[serde(default)]
     pub platforms: BTreeMap<String, String>,
     #[serde(default)]

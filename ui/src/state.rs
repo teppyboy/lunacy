@@ -343,7 +343,7 @@ impl SettingsPage {
             }
             SettingsPage::Github => "How check runs are reported: a token, or a GitHub App.",
             SettingsPage::Discord => "Webhook notifications when a pipeline starts or finishes.",
-            SettingsPage::Act => "The act binary, its image mapping and default arguments.",
+            SettingsPage::Act => "The act binary, its image mapping, its arguments and the lock it holds.",
             SettingsPage::Projects => {
                 "Repositories to watch, and the CI and deploy steps for each."
             }

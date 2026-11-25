@@ -6,6 +6,7 @@ Notes below were checked against act 0.2.97 on Linux. The Windows and macOS note
 ## How lunacy drives act
 
 - Command: `act <event> --json -W <workflow> [-j <job>] -e <event.json> -P <platform>=<image> --secret-file <tmp> --var-file <tmp> [args...]`, run in a **fresh clone** of the target SHA (`git clone --no-checkout` + `git fetch <sha>` + `checkout --detach`). act copies the working tree, and a linked `git worktree` has no usable `.git` dir. frostedge's `scripts/ci-act.sh` already uses this pattern.
+- **One clone per run**, at `state_dir/checkouts/<run id>/repo`: the first act step creates it, later act steps reuse it, and it is removed when the pipeline ends. Every step of the run gets its path as `LUNACY_CI_DIR` (unset when no act step ran), so a deploy shell step can publish what a CI job built in it — act leaves files in place with `--bind`. Cleanup is best-effort: `--bind` can leave root-owned files, and then lunacy only warns (remove it with `sudo rm -rf`).
 - `--json` writes one JSON object per line on stdout/stderr. Example from act 0.2.97:
   - step start: `{"job":"T/Build it","jobID":"build","stage":"Main","step":"Hello","stepID":["0"],"msg":"⭐ Run Main Hello"}`
   - output: `{"step":"Hello","raw_output":true,"msg":"hi\n"}`
@@ -15,7 +16,8 @@ Notes below were checked against act 0.2.97 on Linux. The Windows and macOS note
   - The process exits non-zero when any job fails.
   lunacy turns these lines into per-step progress (`substeps` in the API and in GitHub check summaries). The human-readable log keeps the `msg` text.
 - One act run at a time per machine (global lock). act names containers after the workflow and job, so two parallel runs remove each other's containers (see frostedge `ci-act.sh`, lunarum `with-act-lock.sh`).
-- `event.json` is generated with `after`/`head_commit.id` = SHA, `ref` = `refs/heads/<branch>`, `repository.full_name`, the same way lunarum's `local-web-deploy.sh` does it.
+  The lock file is `[act] lock_file`, default `state_dir/act.lock`. lunacy locks it with `fs2`'s `lock_exclusive`, which is `flock(2)` — the same lock the `flock` CLI takes — so pointing it at lunarum's `~/.local/state/act-gate.lock` keeps a manual `make ci` and lunacy apart.
+- `event.json` is a push event: `after`/`head_commit.id` = SHA, `ref` = `refs/heads/<branch>`, `repository.full_name`, `head_commit.message` (the full commit message), `commits[0]`, and minimal `pusher`/`sender` objects. `before` is the last sha lunacy processed for the project when it is an ancestor of the target, else the target's first parent, else all zeros (a root commit). Workflows that read commit messages over `before..after` (frostedge's `rust.yml`) would otherwise treat a zero `before` as "walk from the repo root" and re-check the whole history.
 
 ## Linux
 
@@ -42,6 +44,7 @@ Install act with `brew install act` and run Docker Desktop, OrbStack or colima. 
 command = ["act"]           # e.g. ["wsl.exe", "-e", "act"] on Windows
 platforms = { "ubuntu-latest" = "catthehacker/ubuntu:act-latest" }
 args = []                   # extra args for every act run, e.g. ["--pull=false"]
+lock_file = "~/.local/state/act-gate.lock"   # default: <state_dir>/act.lock
 
 [[project.ci]]
 name = "Web"

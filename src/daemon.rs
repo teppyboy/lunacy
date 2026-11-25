@@ -409,7 +409,7 @@ fn execute(
     });
 
     let state_dir = shared.lock().expect("shared").state_dir.clone();
-    let act_lock = state_dir.join("act.lock");
+    let act_lock = cfg.act_lock_file();
 
     if let Ok(mut s) = shared.lock() {
         if let Some(p) = s.projects.iter_mut().find(|p| p.name == project.name) {

@@ -116,6 +116,8 @@ pub fn run_pipeline(ctx: &Ctx<'_>, project: &ProjectCfg, sha: &str, trigger: Tri
     };
     let workdir = checkout.workdir.clone();
     let throttle = Throttle::default();
+    // Created by the first act step, reused by every later step, removed at the end.
+    let mut ci_dir: Option<PathBuf> = None;
 
     let ci_check = start_report(ctx, project, &run, repo.as_deref(), Phase::Ci);
     let ci_ok = run_steps(
@@ -124,6 +126,7 @@ pub fn run_pipeline(ctx: &Ctx<'_>, project: &ProjectCfg, sha: &str, trigger: Tri
         &mut run,
         Phase::Ci,
         &workdir,
+        &mut ci_dir,
         &throttle,
         &ci_check,
         repo.as_deref(),
@@ -141,6 +144,7 @@ pub fn run_pipeline(ctx: &Ctx<'_>, project: &ProjectCfg, sha: &str, trigger: Tri
                 &mut run,
                 Phase::Deploy,
                 &workdir,
+                &mut ci_dir,
                 &throttle,
                 &deploy_check,
                 repo.as_deref(),
@@ -162,6 +166,7 @@ pub fn run_pipeline(ctx: &Ctx<'_>, project: &ProjectCfg, sha: &str, trigger: Tri
     }
 
     drop(checkout);
+    cleanup_ci_dir(ctx.state_dir, &run.id);
     finish(ctx, &mut run, repo.as_deref(), discord.as_ref());
     run
 }
@@ -197,6 +202,7 @@ fn run_steps(
     run: &mut Run,
     phase: Phase,
     workdir: &Path,
+    ci_dir: &mut Option<PathBuf>,
     throttle: &Throttle,
     check: &Option<CheckHandle>,
     repo: Option<&str>,
@@ -231,8 +237,18 @@ fn run_steps(
         let started = Instant::now();
 
         let outcome = match step_cfg.kind {
-            StepKind::Shell => run_shell_step(ctx, project, step_cfg, run, index, workdir),
-            StepKind::Act => run_act_step(ctx, project, step_cfg, run, index, workdir, repo),
+            StepKind::Shell => run_shell_step(
+                ctx,
+                project,
+                step_cfg,
+                run,
+                index,
+                workdir,
+                ci_dir.as_deref(),
+            ),
+            StepKind::Act => {
+                run_act_step(ctx, project, step_cfg, run, index, workdir, ci_dir, repo)
+            }
         };
 
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -406,7 +422,12 @@ fn finish_report(
     }
 }
 
-fn base_env(run: &Run, project: &ProjectCfg, workdir: &Path) -> BTreeMap<String, String> {
+fn base_env(
+    run: &Run,
+    project: &ProjectCfg,
+    workdir: &Path,
+    ci_dir: Option<&Path>,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("LUNACY_SHA".into(), run.sha.clone());
     env.insert("LUNACY_BRANCH".into(), project.branch.clone());
@@ -416,6 +437,10 @@ fn base_env(run: &Run, project: &ProjectCfg, workdir: &Path) -> BTreeMap<String,
         workdir.to_string_lossy().to_string(),
     );
     env.insert("LUNACY_RUN_ID".into(), run.id.clone());
+    // The act clone, so a deploy step can pick up what the CI job built in it.
+    if let Some(dir) = ci_dir {
+        env.insert("LUNACY_CI_DIR".into(), dir.to_string_lossy().to_string());
+    }
     env
 }
 
@@ -426,13 +451,14 @@ fn run_shell_step(
     run: &Run,
     index: usize,
     workdir: &Path,
+    ci_dir: Option<&Path>,
 ) -> Result<(Outcome, Vec<Substep>)> {
     let shell = crate::config::resolve_shell(&ctx.cfg.general, Some(project), Some(step), ctx.os);
     let (program, args) = shell.split_first().context("empty shell argv")?;
     let mut argv: Vec<String> = args.to_vec();
     argv.push(step.run.clone().unwrap_or_default());
 
-    let mut env = base_env(run, project, workdir);
+    let mut env = base_env(run, project, workdir, ci_dir);
     env.extend(project.env.clone());
     env.extend(step.env.clone());
 
@@ -461,6 +487,7 @@ fn run_act_step(
     run: &Run,
     index: usize,
     workdir: &Path,
+    ci_dir: &mut Option<PathBuf>,
     repo: Option<&str>,
 ) -> Result<(Outcome, Vec<Substep>)> {
     let act_cfg = ctx.cfg.act();
@@ -469,10 +496,22 @@ fn run_act_step(
     let workflow = step.workflow.clone().unwrap_or_default();
 
     // act copies the working tree and needs a usable `.git`, so no git worktree.
-    let clone_dir = TempDir::new().context("creating an act clone dir")?;
-    let clone_path = clone_dir.path().join("repo");
-    git::clone_at(workdir, &clone_path, "origin", &run.sha)
-        .with_context(|| format!("cloning {} for act", workdir.display()))?;
+    // One clone per run, kept under the state dir so the CI job's `build/`
+    // output survives for a later deploy step (`LUNACY_CI_DIR`).
+    let clone_path = match ci_dir.clone() {
+        Some(path) => path,
+        None => {
+            let path = ctx.state_dir.join("checkouts").join(&run.id).join("repo");
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            git::clone_at(workdir, &path, "origin", &run.sha)
+                .with_context(|| format!("cloning {} for act", workdir.display()))?;
+            *ci_dir = Some(path.clone());
+            path
+        }
+    };
 
     let workflow_text = fs::read_to_string(clone_path.join(&workflow)).ok();
     let runs_on = act::job_runs_on(workflow_text.as_deref(), step.job.as_deref());
@@ -484,11 +523,7 @@ fn run_act_step(
     let event_file = tmp.path().join("event.json");
     fs::write(
         &event_file,
-        act::event_json(
-            &run.sha,
-            &project.branch,
-            repo.or(project.github_repo.as_deref()),
-        ),
+        push_event(ctx, project, workdir, &run.sha, repo),
     )?;
 
     let secret_file = if step.secrets.is_empty() {
@@ -531,7 +566,7 @@ fn run_act_step(
         full_args = act::wsl_translate_args(&full_args);
     }
 
-    let mut env = base_env(run, project, workdir);
+    let mut env = base_env(run, project, workdir, Some(&clone_path));
     env.extend(project.env.clone());
     env.extend(step.env.clone());
 
@@ -583,6 +618,49 @@ fn run_act_step(
 
     let substeps = progress.lock().map(|p| p.substeps()).unwrap_or_default();
     Ok((result.outcome, substeps))
+}
+
+/// Remove the run's act clone. Files act created with `--bind` can be root-owned,
+/// so a failure only warns: the run already happened and must not be failed by it.
+fn cleanup_ci_dir(state_dir: &Path, run_id: &str) {
+    let dir = state_dir.join("checkouts").join(run_id);
+    if !dir.exists() {
+        return;
+    }
+    if let Err(e) = fs::remove_dir_all(&dir) {
+        log::warn!(
+            "could not remove the act clone {} ({e}); remove it with `sudo rm -rf {}`",
+            dir.display(),
+            dir.display()
+        );
+    }
+}
+
+/// The push event for `sha`: a realistic `before` so workflows that read
+/// `before..after` see only this commit, plus the message and pusher.
+fn push_event(
+    ctx: &Ctx<'_>,
+    project: &ProjectCfg,
+    repo_dir: &Path,
+    sha: &str,
+    repo: Option<&str>,
+) -> String {
+    let last = crate::model::read_last_sha(ctx.state_dir, &project.name);
+    let last_is_ancestor = last
+        .as_deref()
+        .map(|l| l != sha && git::is_ancestor(repo_dir, l, sha).unwrap_or(false))
+        .unwrap_or(false);
+    let first_parent = git::rev_parse(repo_dir, &format!("{sha}^")).ok();
+    let before = act::pick_before(last.as_deref(), last_is_ancestor, first_parent.as_deref());
+    let (message, name, email) = git::commit_details(repo_dir, sha);
+    act::event_json(
+        sha,
+        &before,
+        &project.branch,
+        repo.or(project.github_repo.as_deref()),
+        &message,
+        (&name, &email),
+    )
 }
 
 fn write_kv_file(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {

@@ -20,6 +20,7 @@ log_level = "info"       # trace | debug | info | warn | error
 # HTTP API + web UI. Remove the whole section to disable it.
 listen = "127.0.0.1:7878"
 # token = ""             # optional bearer token for every /api request
+# token_file = "~/.config/lunacy/api-token"   # or read it from a file
 # web_root = "ui/dist"   # serve the Rune web build at `/`
 # public_url = "http://127.0.0.1:7878"  # makes GitHub check runs link back here
 
@@ -31,6 +32,9 @@ listen = "127.0.0.1:7878"
 mode = "status"
 # Fine-grained PAT with `Commit statuses: write` (and `Checks: write` for checks).
 token = "ghp_REPLACE_ME"
+# Or read it from a file instead (mutually exclusive with `token`). Trailing
+# whitespace is trimmed; `~/` is expanded.
+# token_file = "~/.config/lunacy/github-token"
 # api_url = "https://api.github.com"   # GitHub Enterprise: https://ghe.example/api/v3
 
 # GitHub App, for mode = "checks" and for the "Re-run" button.
@@ -38,11 +42,15 @@ token = "ghp_REPLACE_ME"
 # app_id = 123456
 # private_key_path = "/home/tretrauit/.config/lunacy/github-app.pem"
 # # private_key = """-----BEGIN RSA PRIVATE KEY-----..."""   # inline alternative
-# # installation_id = 12345678   # looked up via /repos/{owner}/{repo}/installation when omitted
+# # # installation_id = 12345678   # looked up via /repos/{owner}/{repo}/installation when omitted
 # webhook_secret = "REPLACE_ME"   # enables POST /api/github/webhook (re-run button)
+# # ... or read it from a file instead of the inline value:
+# webhook_secret_file = "~/.config/lunacy/webhook-secret"
 
 [discord]
 # webhook_url = "https://discord.com/api/webhooks/REPLACE/REPLACE"
+# # ... or read it from a file instead of the inline value:
+# webhook_url_file = "~/.config/lunacy/discord-webhook"
 notify_on_start = false
 
 [act]
@@ -55,6 +63,11 @@ notify_on_start = false
 # native_command = ["act"]
 platforms = { "ubuntu-latest" = "catthehacker/ubuntu:act-latest" }
 # args = ["--pull=false"]
+# One act run at a time per machine: lunacy takes `flock(2)` on this file.
+# Point it at the same file a manual `make ci` uses (lunarum's
+# scripts/with-act-lock.sh locks ~/.local/state/act-gate.lock with `flock`), so
+# the two never run act concurrently. Default: <state_dir>/act.lock. `~/` expands.
+# lock_file = "~/.local/state/act-gate.lock"
 
 # ---------------------------------------------------------------------------
 # lunarum: Flutter web frontend. CI = the `web` job of local-deploy-ci.yml
@@ -68,7 +81,8 @@ branch = "master"
 github_repo = "teppyboy/lunarum"
 # The deploy script publishes into the live checkout and recreates the web
 # container from it, so it must run in repo_path itself. CI runs in act's own
-# clone, so nothing else needs a checkout.
+# clone, so nothing else needs a checkout. That clone survives the CI phase:
+# every later step gets its path as LUNACY_CI_DIR (see the deploy step below).
 checkout = "none"
 poll_interval = 300
 env = { }
@@ -99,8 +113,16 @@ only_on = ["windows"]
 
 [[project.deploy]]
 name = "Publish web"
-# scripts/local-web-deploy.sh does its own fetch, act CI, artifact sync and
-# health check on 127.0.0.1:47831. lunacy only triggers it.
+# CI above already ran the `web` job in act, so this step publishes what that
+# job built instead of running act a second time. The job runs with `--bind`,
+# so `build/web` is in lunacy's clone, whose path is `LUNACY_CI_DIR`:
+#
+#   test -s "$LUNACY_CI_DIR/build/web/index.html"
+#   rsync -a --delete "$LUNACY_CI_DIR/build/web/" build/web/
+#   docker compose -f docker-compose.yaml up -d --force-recreate web
+#
+# scripts/local-web-deploy.sh still does its own act CI run; use it until it
+# reads LUNACY_CI_DIR, and keep this step to the publish half after that.
 # NOTE: the script sends its own Discord embed through deploy-notification.py.
 # Set discord_webhook_url = "" below (or here) if you want only one message.
 run = "bash scripts/local-web-deploy.sh"

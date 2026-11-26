@@ -387,8 +387,17 @@ pub fn clone_at(repo: &Path, dest: &Path, remote: &str, sha: &str) -> Result<()>
         .output();
     git(dest, &["checkout", "--quiet", "--detach", sha])
         .with_context(|| format!("checking out {sha} in {}", dest.display()))?;
+    // A clone of a detached worktree packs every ref, leaving `.git/refs` with only empty
+    // folders. act copies the tree into its container with `docker cp`, which drops empty
+    // folders, and git without `.git/refs` is "not a git repository". One loose ref keeps
+    // the folder, and gives act a branch to name the commit by.
+    git(dest, &["update-ref", LUNACY_CI_REF, sha])
+        .with_context(|| format!("writing {LUNACY_CI_REF} in {}", dest.display()))?;
     Ok(())
 }
+
+/// The branch `clone_at` points at the commit under test.
+pub const LUNACY_CI_REF: &str = "refs/heads/lunacy-ci";
 
 #[cfg(test)]
 mod tests {
@@ -459,5 +468,51 @@ mod tests {
             commit_details(repo, "--format=%H"),
             (String::new(), String::new(), String::new())
         );
+    }
+
+    /// `checkout = "worktree"`: act's clone comes from a detached worktree. Its `.git/refs`
+    /// must hold a file, or `docker cp` drops the empty folder and git in the container says
+    /// "not a git repository".
+    #[test]
+    fn clone_of_a_detached_worktree_keeps_a_loose_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, wt, cl) = (
+            dir.path().join("r"),
+            dir.path().join("wt"),
+            dir.path().join("cl"),
+        );
+        let run = |cwd: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "git {args:?}");
+        };
+        std::fs::create_dir(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "master"]);
+        run(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "one",
+            ],
+        );
+        let sha = rev_parse(&repo, "HEAD").unwrap();
+        add_worktree(&repo, &wt, &sha).unwrap();
+
+        clone_at(&wt, &cl, "origin", &sha).unwrap();
+
+        let loose = cl.join(".git").join(LUNACY_CI_REF);
+        assert_eq!(std::fs::read_to_string(&loose).unwrap().trim(), sha);
+        assert_eq!(rev_parse(&cl, "HEAD").unwrap(), sha);
     }
 }

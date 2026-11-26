@@ -15,8 +15,9 @@ Notes below were checked against act 0.2.97 on Linux. The Windows and macOS note
   - Setup and teardown steps use `stepid` (lowercase) `["--setup-job"]` / `["--complete-job"]`.
   - The process exits non-zero when any job fails.
   Lunacy turns these lines into per-step progress (`substeps` in the API and in GitHub check summaries). The human-readable log keeps the `msg` text.
-- One act run at a time per machine (global lock). act names containers after the workflow and job, so two parallel runs remove each other's containers (see frostedge `ci-act.sh`, lunarum `with-act-lock.sh`).
-  The lock file is `[act] lock_file`, default `state_dir/act.lock`. Lunacy locks it with `fs2`'s `lock_exclusive`, which is `flock(2)` — the same lock the `flock` CLI takes — so pointing it at lunarum's `~/.local/state/act-gate.lock` keeps a manual `make ci` and Lunacy apart.
+- **Machine-wide `act` lock pool & parallel slot isolation:** By default Lunacy runs one `act` step at a time (`general.max_concurrent_runs = 1`, `[act] max_concurrent` inherits it). Set `general.max_concurrent_runs > 1` (and optionally `[act] max_concurrent`) to run multiple `act` steps in parallel.
+  - Lock pool: Lunacy takes `flock(2)` on `[act] lock_file` (default `state_dir/act.lock`) for slot `0` — staying compatible with external `flock` tools like `with-act-lock.sh` — and `<lock_file>.{i}` (e.g. `act.lock.1`, `act.lock.2`) for parallel slots `i > 0`.
+  - Resource isolation per slot: slot `0` uses `<cache_dir>/act-actions` and `<cache_dir>/act-cache-server`, while slot `i > 0` uses `<cache_dir>/act-actions-slot-{i}` and `<cache_dir>/act-cache-server-slot-{i}` so concurrent runs never contend on BoltDB locks or action git clones. When `act.max_concurrent > 1`, Lunacy allocates a free ephemeral loopback port and passes `--artifact-server-port <port>` (unless user args already set it) so runs never collide on `act`'s default port `34567`. When a single project runs concurrently (`project.max_concurrent_runs > 1`), run slots `> 0` use suffixed per-project Docker volumes (`lunacy-cache-<slug>-slot-<slot>-cargo-target`, `lunacy-cache-<slug>-slot-<slot>-build`) to avoid Cargo `.cargo-lock` contention.
 - `event.json` is a push event: `after`/`head_commit.id` = SHA, `ref` = `refs/heads/<branch>`, `repository.full_name`, `head_commit.message` (the full commit message), `commits[0]`, and minimal `pusher`/`sender` objects. `before` is the last sha Lunacy processed for the project when it is an ancestor of the target, else the target's first parent, else all zeros (a root commit). Workflows that read commit messages over `before..after` (frostedge's `rust.yml`) would otherwise treat a zero `before` as "walk from the repo root" and re-check the whole history.
 
 ## Linux
@@ -44,7 +45,8 @@ Install act with `brew install act` and run Docker Desktop, OrbStack or colima. 
 command = ["act"]           # e.g. ["wsl.exe", "-e", "act"] on Windows
 platforms = { "ubuntu-latest" = "catthehacker/ubuntu:act-latest" }
 args = []                   # extra args for every act run, e.g. ["--pull=false"]
-lock_file = "~/.local/state/act-gate.lock"   # default: <state_dir>/act.lock
+lock_file = "~/.local/state/act-gate.lock"   # default: <state_dir>/act.lock (slot 0; parallel slots use .1, .2, ...)
+max_concurrent = 1          # optional; defaults to general.max_concurrent_runs (hot-reloads)
 
 [[project.ci]]
 name = "Web"

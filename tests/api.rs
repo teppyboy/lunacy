@@ -181,6 +181,7 @@ fn project(root: &std::path::Path) -> ProjectCfg {
         deploy_refs: Vec::new(),
         watch_tags: false,
         cache: None,
+        max_concurrent_runs: None,
         ci: vec![shell_step("Test", "true")],
         deploy: Vec::new(),
     }
@@ -603,6 +604,8 @@ fn system_endpoint_reports_diagnostics() {
     assert!(v["os"].is_string());
     assert_eq!(v["version"], lunacy::VERSION);
     assert!(v["config_path"].is_string());
+    assert_eq!(v["max_concurrent_runs"], 1);
+    assert_eq!(v["act_max_concurrent"], 1);
     assert!(v["act"].is_object());
     assert!(v["docker"]["ok"].is_boolean());
     assert!(v["git"].is_object());
@@ -929,8 +932,12 @@ fn force_deploy_project_and_run_endpoints() {
             trigger,
             deploy_only,
             force_deploy,
+            reserved,
             ..
         } => {
+            if let Some((slot, _)) = reserved {
+                s.shared.lock().unwrap().projects[0].release_pending_slot(slot);
+            }
             assert_eq!(got_sha.as_deref(), Some(sha));
             assert!(force);
             assert_eq!(trigger, lunacy::model::Trigger::ForceDeploy);
@@ -956,8 +963,12 @@ fn force_deploy_project_and_run_endpoints() {
             sha: got_sha,
             deploy_only,
             force_deploy,
+            reserved,
             ..
         } => {
+            if let Some((slot, _)) = reserved {
+                s.shared.lock().unwrap().projects[0].release_pending_slot(slot);
+            }
             assert_eq!(got_sha.as_deref(), Some(sha2));
             assert!(!deploy_only);
             assert!(force_deploy);
@@ -1032,8 +1043,12 @@ fn force_deploy_project_and_run_endpoints() {
             git_ref,
             deploy_only,
             force_deploy,
+            reserved,
             ..
         } => {
+            if let Some((slot, _)) = reserved {
+                s.shared.lock().unwrap().projects[0].release_pending_slot(slot);
+            }
             assert_eq!(got_sha.as_deref(), Some(sha));
             assert_eq!(trigger, lunacy::model::Trigger::ForceDeploy);
             assert_eq!(git_ref.as_deref(), Some("tags/v1.0.0"));
@@ -1072,19 +1087,28 @@ fn cache_clear_endpoints_remove_disk_caches() {
     let s = start("tok");
     let cache_root = s.state_dir.join("cache");
     let act_actions = cache_root.join("act-actions");
+    let act_actions_slot1 = cache_root.join("act-actions-slot-1");
     let act_cache_server = cache_root.join("act-cache-server");
+    let act_cache_server_slot1 = cache_root.join("act-cache-server-slot-1");
     let demo_cache = cache_root.join("projects").join("demo");
+    let demo_slot1_cache = cache_root.join("projects").join("demo-slot-1");
     let other_cache = cache_root.join("projects").join("other");
     let unrelated_file = cache_root.join("keep.txt");
     let unrelated_dir = cache_root.join("unrelated-dir");
     std::fs::create_dir_all(&act_actions).unwrap();
+    std::fs::create_dir_all(&act_actions_slot1).unwrap();
     std::fs::create_dir_all(&act_cache_server).unwrap();
+    std::fs::create_dir_all(&act_cache_server_slot1).unwrap();
     std::fs::create_dir_all(&demo_cache).unwrap();
+    std::fs::create_dir_all(&demo_slot1_cache).unwrap();
     std::fs::create_dir_all(&other_cache).unwrap();
     std::fs::create_dir_all(&unrelated_dir).unwrap();
     std::fs::write(act_actions.join("a"), "1").unwrap();
+    std::fs::write(act_actions_slot1.join("a1"), "1").unwrap();
     std::fs::write(act_cache_server.join("s"), "4").unwrap();
+    std::fs::write(act_cache_server_slot1.join("s1"), "4").unwrap();
     std::fs::write(demo_cache.join("b"), "2").unwrap();
+    std::fs::write(demo_slot1_cache.join("b1"), "2").unwrap();
     std::fs::write(other_cache.join("c"), "3").unwrap();
     std::fs::write(&unrelated_file, "do-not-delete").unwrap();
     std::fs::write(unrelated_dir.join("note.txt"), "keep-me").unwrap();
@@ -1125,17 +1149,21 @@ fn cache_clear_endpoints_remove_disk_caches() {
     assert_eq!(v["cleared"], true);
     assert_eq!(v["project"], "demo");
     assert!(!demo_cache.exists());
+    assert!(!demo_slot1_cache.exists());
     assert!(other_cache.is_dir());
     assert!(act_actions.is_dir());
+    assert!(act_actions_slot1.is_dir());
 
-    // Clear all caches -> removes managed subdirs only, leaves unrelated sibling files/dirs untouched.
+    // Clear all caches -> removes managed subdirs (including -slot-*) only, leaves unrelated sibling files/dirs untouched.
     let r = request(s.port, "POST", "/api/cache/clear", Some("tok"), None);
     assert_eq!(r.status, 200, "{}", r.body);
     let v = json(&r.body);
     assert_eq!(v["cleared"], true);
     assert!(!other_cache.exists());
     assert!(!act_actions.exists());
+    assert!(!act_actions_slot1.exists());
     assert!(!act_cache_server.exists());
+    assert!(!act_cache_server_slot1.exists());
     assert!(unrelated_file.is_file(), "unrelated file must remain");
     assert!(
         unrelated_dir.join("note.txt").is_file(),
@@ -2826,7 +2854,12 @@ fn retry_run_endpoint_requeues_regular_and_pr_runs_and_enforces_guards() {
             pr,
             deploy_only,
             force_deploy,
+            trigger_reason,
+            reserved,
         } => {
+            if let Some((slot, _)) = reserved {
+                s.shared.lock().unwrap().projects[0].release_pending_slot(slot);
+            }
             assert_eq!(
                 sha.as_deref(),
                 Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -2837,6 +2870,10 @@ fn retry_run_endpoint_requeues_regular_and_pr_runs_and_enforces_guards() {
             assert!(pr.is_none());
             assert!(!deploy_only);
             assert!(!force_deploy);
+            assert_eq!(
+                trigger_reason.as_deref(),
+                Some("Retry of demo-1001-aaaaaaa")
+            );
         }
         other => panic!("unexpected command: {other:?}"),
     }
@@ -2881,7 +2918,12 @@ fn retry_run_endpoint_requeues_regular_and_pr_runs_and_enforces_guards() {
             pr,
             deploy_only,
             force_deploy,
+            trigger_reason,
+            reserved,
         } => {
+            if let Some((slot, _)) = reserved {
+                s.shared.lock().unwrap().projects[0].release_pending_slot(slot);
+            }
             assert_eq!(
                 sha.as_deref(),
                 Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -2897,6 +2939,10 @@ fn retry_run_endpoint_requeues_regular_and_pr_runs_and_enforces_guards() {
             assert!(pr.base_sha.is_empty());
             assert!(!deploy_only);
             assert!(!force_deploy);
+            assert_eq!(
+                trigger_reason.as_deref(),
+                Some("Retry of demo-1002-bbbbbbb")
+            );
         }
         other => panic!("unexpected command: {other:?}"),
     }
@@ -3024,6 +3070,8 @@ fn check_run_requested_action_webhook_handles_retry_ci_retry_deploy_and_pr_safet
             pr,
             deploy_only,
             force_deploy,
+            trigger_reason,
+            reserved: _,
         } => {
             assert_eq!(
                 sha.as_deref(),
@@ -3038,6 +3086,7 @@ fn check_run_requested_action_webhook_handles_retry_ci_retry_deploy_and_pr_safet
             assert_eq!(pr.base_ref, "master");
             assert!(!deploy_only);
             assert!(!force_deploy);
+            assert_eq!(trigger_reason.as_deref(), Some("GitHub action: Retry CI"));
         }
         other => panic!("unexpected command: {other:?}"),
     }
@@ -3066,6 +3115,8 @@ fn check_run_requested_action_webhook_handles_retry_ci_retry_deploy_and_pr_safet
             pr,
             deploy_only,
             force_deploy,
+            trigger_reason,
+            reserved: _,
         } => {
             assert_eq!(
                 sha.as_deref(),
@@ -3077,6 +3128,10 @@ fn check_run_requested_action_webhook_handles_retry_ci_retry_deploy_and_pr_safet
             assert!(pr.is_none());
             assert!(deploy_only);
             assert!(force_deploy);
+            assert_eq!(
+                trigger_reason.as_deref(),
+                Some("GitHub action: Retry Deploy")
+            );
         }
         other => panic!("unexpected command: {other:?}"),
     }
@@ -3126,4 +3181,710 @@ fn check_run_requested_action_webhook_handles_retry_ci_retry_deploy_and_pr_safet
     assert_eq!(json(&r.body)["queued"], false);
     assert_eq!(json(&r.body)["reason"], "project is paused");
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn api_trigger_deploy_and_retry_populate_default_and_custom_trigger_reasons() {
+    let s = start("tok");
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.commands.lock().unwrap().insert("demo".into(), tx);
+    let sha = "1111111111111111111111111111111111111111";
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.projects[0].deploy = vec![shell_step("Publish", "true")];
+        guard.projects[0].upstream_sha = Some(sha.into());
+    }
+
+    let recv_reason = || match rx.recv_timeout(Duration::from_secs(5)).expect("cmd") {
+        Command::Trigger {
+            trigger_reason,
+            reserved,
+            ..
+        } => {
+            if let Some((slot, _)) = reserved {
+                s.shared.lock().unwrap().projects[0].release_pending_slot(slot);
+            }
+            trigger_reason
+        }
+        other => panic!("unexpected command: {other:?}"),
+    };
+
+    // 1. POST /api/projects/{name}/trigger defaults + explicit reason.
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/trigger",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Manual API trigger"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/trigger",
+        Some("tok"),
+        Some(r#"{"force": true}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Manual API trigger (force)"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/trigger",
+        Some("tok"),
+        Some(r#"{"pr_number": 42}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Manual PR #42 trigger"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/trigger",
+        Some("tok"),
+        Some(r#"{"deploy_only": true}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Manual force deploy"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/trigger",
+        Some("tok"),
+        Some(r#"{"force": true, "reason": "  Hotfix\n  deploy\tcheck  "}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Hotfix deploy check"));
+
+    // 2. POST /api/projects/{name}/deploy: empty body, {}, and explicit reason.
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/deploy",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Force deploy"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/deploy",
+        Some("tok"),
+        Some("{}"),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Force deploy"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/deploy",
+        Some("tok"),
+        Some(r#"{"reason": "Promote verified build"}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Promote verified build"));
+
+    // 3. Persist two runs (one with trigger_reason, one without) and verify GET /api/runs/{id}.
+    let mut run_with_reason = lunacy::model::Run::new(
+        "demo",
+        sha,
+        "feat: release".into(),
+        lunacy::model::Trigger::Webhook,
+        Vec::new(),
+    );
+    run_with_reason.id = "demo-5001-1111111".into();
+    run_with_reason.status = lunacy::model::RunStatus::Failure;
+    run_with_reason.git_ref = Some("master".into());
+    run_with_reason.trigger_reason = Some("GitHub push webhook (master by alice)".into());
+    lunacy::model::persist_run(&s.state_dir, &run_with_reason).unwrap();
+
+    let mut run_without_reason = lunacy::model::Run::new(
+        "demo",
+        sha,
+        "chore: legacy".into(),
+        lunacy::model::Trigger::Poll,
+        Vec::new(),
+    );
+    run_without_reason.id = "demo-5000-1111111".into();
+    run_without_reason.status = lunacy::model::RunStatus::Success;
+    lunacy::model::persist_run(&s.state_dir, &run_without_reason).unwrap();
+
+    let r = request(
+        s.port,
+        "GET",
+        "/api/runs/demo-5001-1111111",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        json(&r.body)["trigger_reason"],
+        "GitHub push webhook (master by alice)"
+    );
+
+    let r = request(
+        s.port,
+        "GET",
+        "/api/runs/demo-5000-1111111",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(json(&r.body).get("trigger_reason").is_none());
+
+    // 4. POST /api/runs/{id}/deploy: empty body default + explicit reason.
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-5001-1111111/deploy",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(
+        recv_reason().as_deref(),
+        Some("Force deploy of demo-5001-1111111")
+    );
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-5001-1111111/deploy",
+        Some("tok"),
+        Some(r#"{"reason": "Rollback to known good"}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Rollback to known good"));
+
+    // 5. POST /api/runs/{id}/retry: empty body, {}, explicit reason, and invalid JSON -> 400.
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-5001-1111111/retry",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Retry of demo-5001-1111111"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-5001-1111111/retry",
+        Some("tok"),
+        Some("{}"),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Retry of demo-5001-1111111"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-5001-1111111/retry",
+        Some("tok"),
+        Some(r#"{"reason": "Transient network flake"}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(recv_reason().as_deref(), Some("Transient network flake"));
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-5001-1111111/retry",
+        Some("tok"),
+        Some("{not-valid-json"),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn webhooks_include_actor_in_trigger_reason_for_push_tag_pr_and_check_events() {
+    let s = start("tok");
+    let secret = "wh-reason-secret";
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.commands.lock().unwrap().insert("demo".into(), tx);
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.github = Some(lunacy::config::GithubCfg {
+            mode: None,
+            token: None,
+            token_file: None,
+            api_url: None,
+            webhook_secret: Some(secret.into()),
+            webhook_secret_file: None,
+            app: None,
+        });
+        guard.config.projects[0].watch_prs = true;
+        guard.config.projects[0].watch_tags = true;
+    }
+
+    let send = |event: &str, payload: serde_json::Value| {
+        let body = payload.to_string();
+        let sig = api::signature_header(secret, body.as_bytes());
+        let r = request_with_headers(
+            s.port,
+            "POST",
+            "/api/github/webhook",
+            None,
+            &[("X-GitHub-Event", event), ("X-Hub-Signature-256", &sig)],
+            Some(&body),
+        );
+        assert_eq!(r.status, 202, "{event}: {}", r.body);
+        assert_eq!(json(&r.body)["queued"], true, "{event}: {}", r.body);
+        match rx.recv_timeout(Duration::from_secs(5)).expect("cmd") {
+            Command::Trigger { trigger_reason, .. } => trigger_reason,
+            other => panic!("unexpected command: {other:?}"),
+        }
+    };
+
+    // push (branch) with sender.login
+    let reason = send(
+        "push",
+        serde_json::json!({
+            "ref": "refs/heads/master",
+            "after": "1111111111111111111111111111111111111111",
+            "repository": { "full_name": "teppyboy/demo" },
+            "sender": { "login": "alice" },
+            "pusher": { "name": "alice-git" }
+        }),
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("GitHub push webhook (master by alice)")
+    );
+
+    // push (branch) falling back to pusher.name
+    let reason = send(
+        "push",
+        serde_json::json!({
+            "ref": "refs/heads/master",
+            "after": "2222222222222222222222222222222222222222",
+            "repository": { "full_name": "teppyboy/demo" },
+            "pusher": { "name": "bob" }
+        }),
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("GitHub push webhook (master by bob)")
+    );
+
+    // push (branch) without actor
+    let reason = send(
+        "push",
+        serde_json::json!({
+            "ref": "refs/heads/master",
+            "after": "3333333333333333333333333333333333333333",
+            "repository": { "full_name": "teppyboy/demo" }
+        }),
+    );
+    assert_eq!(reason.as_deref(), Some("GitHub push webhook (master)"));
+
+    // push (tag) with sender.login and without actor
+    let reason = send(
+        "push",
+        serde_json::json!({
+            "ref": "refs/tags/v2.3.4",
+            "after": "4444444444444444444444444444444444444444",
+            "repository": { "full_name": "teppyboy/demo" },
+            "sender": { "login": "release-bot" }
+        }),
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("GitHub tag webhook (v2.3.4 by release-bot)")
+    );
+
+    let reason = send(
+        "push",
+        serde_json::json!({
+            "ref": "refs/tags/v2.3.5",
+            "after": "5555555555555555555555555555555555555555",
+            "repository": { "full_name": "teppyboy/demo" }
+        }),
+    );
+    assert_eq!(reason.as_deref(), Some("GitHub tag webhook (v2.3.5)"));
+
+    // pull_request with sender.login and without actor
+    let reason = send(
+        "pull_request",
+        serde_json::json!({
+            "action": "synchronize",
+            "repository": { "full_name": "teppyboy/demo" },
+            "sender": { "login": "octocat" },
+            "pull_request": {
+                "number": 88,
+                "title": "feat: sync",
+                "head": {
+                    "sha": "6666666666666666666666666666666666666666",
+                    "ref": "feat/sync",
+                    "repo": { "full_name": "teppyboy/demo", "fork": false }
+                },
+                "base": {
+                    "sha": "1111111111111111111111111111111111111111",
+                    "ref": "master",
+                    "repo": { "full_name": "teppyboy/demo", "fork": false }
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("GitHub PR #88 synchronize by octocat")
+    );
+
+    let reason = send(
+        "pull_request",
+        serde_json::json!({
+            "action": "opened",
+            "repository": { "full_name": "teppyboy/demo" },
+            "pull_request": {
+                "number": 89,
+                "title": "feat: open",
+                "head": {
+                    "sha": "7777777777777777777777777777777777777777",
+                    "ref": "feat/open",
+                    "repo": { "full_name": "teppyboy/demo", "fork": false }
+                },
+                "base": {
+                    "sha": "1111111111111111111111111111111111111111",
+                    "ref": "master",
+                    "repo": { "full_name": "teppyboy/demo", "fork": false }
+                }
+            }
+        }),
+    );
+    assert_eq!(reason.as_deref(), Some("GitHub PR #89 opened"));
+
+    // check_run rerequested + requested_action (retry_ci / retry_deploy) with sender.login
+    let reason = send(
+        "check_run",
+        serde_json::json!({
+            "action": "rerequested",
+            "repository": { "full_name": "teppyboy/demo" },
+            "sender": { "login": "alice" },
+            "check_run": { "head_sha": "1111111111111111111111111111111111111111" }
+        }),
+    );
+    assert_eq!(reason.as_deref(), Some("GitHub check re-run by alice"));
+
+    let reason = send(
+        "check_suite",
+        serde_json::json!({
+            "action": "rerequested",
+            "repository": { "full_name": "teppyboy/demo" },
+            "check_suite": { "head_sha": "1111111111111111111111111111111111111111" }
+        }),
+    );
+    assert_eq!(reason.as_deref(), Some("GitHub check re-run"));
+
+    let reason = send(
+        "check_run",
+        serde_json::json!({
+            "action": "requested_action",
+            "requested_action": { "identifier": "retry_ci" },
+            "repository": { "full_name": "teppyboy/demo" },
+            "sender": { "login": "bob" },
+            "check_run": { "head_sha": "1111111111111111111111111111111111111111" }
+        }),
+    );
+    assert_eq!(reason.as_deref(), Some("GitHub action: Retry CI by bob"));
+
+    let reason = send(
+        "check_run",
+        serde_json::json!({
+            "action": "requested_action",
+            "requested_action": { "identifier": "retry_deploy" },
+            "repository": { "full_name": "teppyboy/demo" },
+            "sender": { "login": "carol" },
+            "check_run": { "head_sha": "1111111111111111111111111111111111111111" }
+        }),
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("GitHub action: Retry Deploy by carol")
+    );
+}
+
+#[test]
+fn concurrent_project_endpoints_expose_active_runs_and_enforce_capacity() {
+    use lunacy::daemon::ActiveRun;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let s = start("");
+    let (tx, rx) = std::sync::mpsc::channel::<Command>();
+    s.commands.lock().unwrap().insert("demo".into(), tx);
+
+    let sha = "1111111111111111111111111111111111111111";
+    let mut finished_run = lunacy::model::Run::new(
+        "demo",
+        sha,
+        "done".into(),
+        lunacy::model::Trigger::Manual,
+        vec![],
+    );
+    finished_run.status = lunacy::model::RunStatus::Success;
+    finished_run.finished_at = Some(finished_run.started_at + 5);
+    lunacy::model::persist_run(&s.state_dir, &finished_run).unwrap();
+
+    let active1 = lunacy::model::Run::new(
+        "demo",
+        sha,
+        "active 1".into(),
+        lunacy::model::Trigger::Manual,
+        vec![],
+    );
+    let active2 = lunacy::model::Run::new(
+        "demo",
+        sha,
+        "active 2".into(),
+        lunacy::model::Trigger::Manual,
+        vec![],
+    );
+    let cancel1 = Arc::new(AtomicBool::new(false));
+    let cancel2 = Arc::new(AtomicBool::new(false));
+
+    // Configure project with deploy step + max_concurrent_runs = 2 + 1 active run.
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.projects[0].checkout = Checkout::Worktree;
+        guard.config.projects[0].max_concurrent_runs = Some(2);
+        guard.config.projects[0].deploy = vec![shell_step("Deploy", "true")];
+        guard.projects[0].upstream_sha = Some(sha.into());
+        guard.projects[0].running = true;
+        guard.projects[0].current_run = Some(active1.clone());
+        guard.projects[0].cancel = Some(cancel1.clone());
+        guard.projects[0].active_runs.push(ActiveRun {
+            run: active1.clone(),
+            cancel: cancel1.clone(),
+            slot: 0,
+        });
+    }
+
+    // GET /api/projects/demo exposes active_runs and max_concurrent_runs while preserving running & current_run.
+    let r = request(s.port, "GET", "/api/projects/demo", None, None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = json(&r.body);
+    assert_eq!(v["running"], true);
+    assert_eq!(v["current_run"]["id"], active1.id);
+    assert_eq!(v["max_concurrent_runs"], 2);
+    assert_eq!(v["active_runs"].as_array().unwrap().len(), 1);
+    assert_eq!(v["active_runs"][0]["id"], active1.id);
+
+    // Below capacity (1 < 2): trigger, project deploy, run retry, and run deploy all succeed with 202!
+    let consume_reserved = || match rx.try_recv().expect("cmd") {
+        Command::Trigger { reserved, .. } => {
+            let (slot, _) = reserved.expect("API trigger must reserve a pending slot");
+            s.shared.lock().unwrap().projects[0].release_pending_slot(slot);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    };
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/trigger",
+        None,
+        Some(r#"{"force":true}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    consume_reserved();
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/deploy",
+        None,
+        Some("{}"),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    consume_reserved();
+
+    let r = request(
+        s.port,
+        "POST",
+        &format!("/api/runs/{}/retry", finished_run.id),
+        None,
+        Some("{}"),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    consume_reserved();
+
+    let r = request(
+        s.port,
+        "POST",
+        &format!("/api/runs/{}/deploy", finished_run.id),
+        None,
+        Some("{}"),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    consume_reserved();
+
+    // Now fill capacity to 2/2 active runs.
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.projects[0].current_run = Some(active2.clone());
+        guard.projects[0].cancel = Some(cancel2.clone());
+        guard.projects[0].active_runs.push(ActiveRun {
+            run: active2.clone(),
+            cancel: cancel2.clone(),
+            slot: 1,
+        });
+    }
+
+    let r = request(s.port, "GET", "/api/projects/demo", None, None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(json(&r.body)["active_runs"].as_array().unwrap().len(), 2);
+
+    // At capacity (2 >= 2): all four endpoints return 409 "project is already running".
+    for (path, body) in [
+        (
+            "/api/projects/demo/trigger".to_string(),
+            r#"{"force":true}"#,
+        ),
+        ("/api/projects/demo/deploy".to_string(), "{}"),
+        (format!("/api/runs/{}/retry", finished_run.id), "{}"),
+        (format!("/api/runs/{}/deploy", finished_run.id), "{}"),
+    ] {
+        let r = request(s.port, "POST", &path, None, Some(body));
+        assert_eq!(r.status, 409, "{path}: {}", r.body);
+        assert_eq!(json(&r.body)["error"], "project is already running");
+    }
+
+    // Cancelling active1 by run id cancels ONLY active1, leaving active2 untouched.
+    let r = request(
+        s.port,
+        "POST",
+        &format!("/api/runs/{}/cancel", active1.id),
+        None,
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert!(cancel1.load(Ordering::SeqCst));
+    assert!(
+        !cancel2.load(Ordering::SeqCst),
+        "sibling run must not be cancelled"
+    );
+
+    // PUT /api/config hot-reloads general.max_concurrent_runs onto the live ConcurrencyGate.
+    let mut cfg = s.shared.lock().unwrap().config.clone();
+    cfg.general.max_concurrent_runs = 4;
+    let body = serde_json::to_string(&cfg).unwrap();
+    let r = request(s.port, "PUT", "/api/config", None, Some(&body));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(s.shared.lock().unwrap().concurrency_gate.limit(), 4);
+}
+
+#[test]
+fn api_trigger_atomically_enforces_capacity_cancels_pending_and_releases_on_send_failure() {
+    use std::sync::atomic::Ordering;
+
+    let s = start("tok");
+    let (tx, rx) = std::sync::mpsc::channel::<Command>();
+    s.commands.lock().unwrap().insert("demo".into(), tx);
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.projects[0].checkout = Checkout::Worktree;
+        guard.config.projects[0].max_concurrent_runs = Some(2);
+    }
+
+    // Fire 4 concurrent triggers before any worker wakes up to read `rx`:
+    // atomic PendingSlot reservation MUST allow exactly 2 (202) and reject 2 (409).
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let b = barrier.clone();
+        let port = s.port;
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            request(
+                port,
+                "POST",
+                "/api/projects/demo/trigger",
+                Some("tok"),
+                Some(r#"{"force":true}"#),
+            )
+        }));
+    }
+    let responses: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let summary: Vec<(u16, String)> = responses
+        .iter()
+        .map(|r| (r.status, r.body.clone()))
+        .collect();
+    let ok_count = responses.iter().filter(|r| r.status == 202).count();
+    let conflict_count = responses.iter().filter(|r| r.status == 409).count();
+    assert_eq!(
+        ok_count, 2,
+        "expected exactly 2 accepted triggers: {summary:?}"
+    );
+    assert_eq!(
+        conflict_count, 2,
+        "expected exactly 2 409 conflicts: {summary:?}"
+    );
+    assert_eq!(s.shared.lock().unwrap().projects[0].active_run_count(), 2);
+
+    // Collect the 2 reserved slots + cancel flags from rx (distinct slots 0 and 1).
+    let mut reserved_tokens = Vec::new();
+    for _ in 0..2 {
+        match rx.try_recv().expect("trigger cmd") {
+            Command::Trigger { reserved, .. } => {
+                reserved_tokens.push(reserved.expect("reserved slot"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+    assert!(rx.try_recv().is_err(), "only 2 triggers should be queued");
+    let mut slots: Vec<usize> = reserved_tokens.iter().map(|(s, _)| *s).collect();
+    slots.sort();
+    assert_eq!(slots, vec![0, 1]);
+
+    // POST /api/projects/demo/cancel sets cancel on all reserved slots and emits Command::CancelQueued.
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/cancel",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    for (_, cancel) in &reserved_tokens {
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "reserved pending slot must be marked cancelled"
+        );
+    }
+    assert!(
+        matches!(rx.try_recv(), Ok(Command::CancelQueued)),
+        "cancel_project must emit Command::CancelQueued"
+    );
+
+    // Release the 2 slots and drop rx (disconnected worker channel):
+    // trigger must return 503 AND release the reserved pending slot cleanly.
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.projects[0].release_pending_slot(0);
+        guard.projects[0].release_pending_slot(1);
+    }
+    drop(rx);
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/trigger",
+        Some("tok"),
+        Some(r#"{"force":true}"#),
+    );
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert_eq!(
+        s.shared.lock().unwrap().projects[0].active_run_count(),
+        0,
+        "failed tx.send must release reserved pending slot"
+    );
 }

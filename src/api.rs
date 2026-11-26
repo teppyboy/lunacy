@@ -1,7 +1,7 @@
 //! HTTP API & WebSocket server for the Rune UI (see `docs/api.md`) plus GitHub webhooks.
 
 use crate::config::{self, Config, TriggerMode, MASK};
-use crate::daemon::{Command, Shared};
+use crate::daemon::{upsert_open_pr, Command, Shared};
 use crate::git;
 use crate::model::{self, Run, Trigger};
 use crate::pipeline::PrContext;
@@ -416,7 +416,7 @@ fn handle_sync(
             }
         }
         (Method::POST, ["api", "runs", id, "deploy"]) => handle_deploy_run(state, &body_str, id),
-        (Method::POST, ["api", "runs", id, "retry"]) => handle_retry_run(state, id),
+        (Method::POST, ["api", "runs", id, "retry"]) => handle_retry_run(state, &body_str, id),
         (Method::POST, ["api", "runs", id, "cancel"]) => handle_cancel_run(state, id),
         (Method::GET, ["api", "runs", id, "steps", index, "log"]) => {
             handle_step_log(state, id, index, &params)
@@ -488,6 +488,19 @@ pub fn projects_json(state: &Arc<ApiState>) -> Value {
                 .map(|c| c.effective_trigger_mode(&shared.config.general))
                 .unwrap_or_else(|| shared.config.general.effective_trigger_mode())
                 .as_str();
+            let max_concurrent_runs = cfg_p
+                .map(|c| c.effective_max_concurrent_runs())
+                .unwrap_or(1);
+            let active_runs: Vec<Value> = if !p.active_runs.is_empty() {
+                p.active_runs.iter().map(|a| run_json(&a.run)).collect()
+            } else if p.running {
+                p.current_run
+                    .as_ref()
+                    .map(|r| vec![run_json(r)])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let mut value = json!({
                 "name": p.name,
                 "enabled": cfg_p.map(|c| c.is_enabled()).unwrap_or(true),
@@ -497,6 +510,8 @@ pub fn projects_json(state: &Arc<ApiState>) -> Value {
                 "last_sha": p.last_sha,
                 "running": p.running,
                 "current_run": p.current_run.as_ref().map(run_json),
+                "active_runs": active_runs,
+                "max_concurrent_runs": max_concurrent_runs,
                 "last_run": p
                     .last_run
                     .as_ref()
@@ -550,6 +565,9 @@ pub fn run_json(run: &Run) -> Value {
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     });
+    if let Some(reason) = &run.trigger_reason {
+        v["trigger_reason"] = json!(reason);
+    }
     if let Some(git_ref) = &run.git_ref {
         v["git_ref"] = json!(git_ref);
     }
@@ -617,6 +635,19 @@ struct TriggerBody {
     git_ref: Option<String>,
     #[serde(default)]
     pr_number: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn release_reserved_slot(state: &Arc<ApiState>, project_name: &str, slot: usize) {
+    let ws = {
+        let mut shared = state.shared.lock().expect("shared");
+        if let Some(p) = shared.projects.iter_mut().find(|p| p.name == project_name) {
+            p.release_pending_slot(slot);
+        }
+        shared.ws.clone()
+    };
+    ws.emit_projects_updated();
 }
 
 fn handle_trigger(state: &Arc<ApiState>, body: &str, name: &str) -> Response {
@@ -642,53 +673,74 @@ fn handle_trigger(state: &Arc<ApiState>, body: &str, name: &str) -> Response {
         }
     }
 
-    let (running, known, branch, pr_summary) = {
-        let shared = state.shared.lock().expect("shared");
-        match shared.projects.iter().find(|p| p.name == name) {
-            Some(p) => (
-                p.running,
-                true,
-                p.branch.clone(),
-                parsed
-                    .pr_number
-                    .and_then(|num| p.open_prs.iter().find(|pr| pr.number == num).cloned()),
-            ),
-            None => (false, false, String::new(), None),
+    let tx_opt = state.commands.lock().expect("commands").get(name).cloned();
+    let (tx, resolved_sha, git_ref, pr_ctx, reserved, ws) = {
+        let mut shared = state.shared.lock().expect("shared");
+        let max_concurrent = shared
+            .config
+            .project(name)
+            .map(|c| c.effective_max_concurrent_runs())
+            .unwrap_or(1);
+        let ws = shared.ws.clone();
+        let Some(p) = shared.projects.iter_mut().find(|p| p.name == name) else {
+            return error_response(404, "unknown project");
+        };
+        let Some(tx) = tx_opt else {
+            return error_response(503, "project worker is not running");
+        };
+        if p.active_run_count() >= max_concurrent {
+            return error_response(409, "project is already running");
         }
-    };
-    if !known {
-        return error_response(404, "unknown project");
-    }
-    let tx = state.commands.lock().expect("commands").get(name).cloned();
-    let Some(tx) = tx else {
-        return error_response(503, "project worker is not running");
-    };
-    if running {
-        return error_response(409, "project is already running");
-    }
-
-    let pr_ctx = parsed.pr_number.map(|num| match &pr_summary {
-        Some(pr) => PrContext {
-            number: pr.number,
-            title: pr.title.clone(),
-            head_ref: pr.head_ref.clone(),
-            base_ref: pr.base_ref.clone(),
-            base_sha: String::new(),
-        },
-        None => PrContext {
-            number: num,
-            title: String::new(),
-            head_ref: req_git_ref.clone().unwrap_or_else(|| format!("pull/{num}")),
-            base_ref: branch.clone(),
-            base_sha: String::new(),
-        },
-    });
-    let resolved_sha = req_sha.or_else(|| pr_summary.as_ref().map(|pr| pr.head_sha.clone()));
-    if let Some(ref s) = resolved_sha {
-        if !git::is_valid_sha(s) {
-            return error_response(400, "invalid commit sha");
+        let branch = p.branch.clone();
+        let pr_summary = parsed
+            .pr_number
+            .and_then(|num| p.open_prs.iter().find(|pr| pr.number == num).cloned());
+        let pr_ctx = parsed.pr_number.map(|num| match &pr_summary {
+            Some(pr) => PrContext {
+                number: pr.number,
+                title: pr.title.clone(),
+                head_ref: pr.head_ref.clone(),
+                base_ref: pr.base_ref.clone(),
+                base_sha: String::new(),
+            },
+            None => PrContext {
+                number: num,
+                title: String::new(),
+                head_ref: req_git_ref.clone().unwrap_or_else(|| format!("pull/{num}")),
+                base_ref: branch.clone(),
+                base_sha: String::new(),
+            },
+        });
+        let resolved_sha = req_sha.or_else(|| pr_summary.as_ref().map(|pr| pr.head_sha.clone()));
+        if let Some(ref s) = resolved_sha {
+            if !git::is_valid_sha(s) {
+                return error_response(400, "invalid commit sha");
+            }
         }
-    }
+        let git_ref = req_git_ref.or_else(|| {
+            pr_ctx.as_ref().map(|p| {
+                if p.head_ref.is_empty() {
+                    format!("pull/{}", p.number)
+                } else {
+                    p.head_ref.clone()
+                }
+            })
+        });
+        if let Some(ref r) = git_ref {
+            if !git::is_valid_git_ref(r) {
+                return error_response(400, "invalid git ref");
+            }
+        }
+        let Some(reserved) = p.try_reserve_pending_slot(
+            max_concurrent,
+            resolved_sha.clone(),
+            git_ref.clone(),
+            parsed.pr_number,
+        ) else {
+            return error_response(409, "project is already running");
+        };
+        (tx, resolved_sha, git_ref, pr_ctx, reserved, ws)
+    };
 
     let trigger = if parsed.pr_number.is_some() {
         Trigger::PullRequest
@@ -697,30 +749,38 @@ fn handle_trigger(state: &Arc<ApiState>, body: &str, name: &str) -> Response {
     } else {
         Trigger::Manual
     };
-    let git_ref = req_git_ref.or_else(|| {
-        pr_ctx.as_ref().map(|p| {
-            if p.head_ref.is_empty() {
-                format!("pull/{}", p.number)
-            } else {
-                p.head_ref.clone()
-            }
+
+    let trigger_reason = model::sanitize_trigger_reason(parsed.reason.as_deref()).or_else(|| {
+        Some(if let Some(n) = parsed.pr_number {
+            format!("Manual PR #{n} trigger")
+        } else if parsed.deploy_only || parsed.force_deploy {
+            "Manual force deploy".to_string()
+        } else if parsed.force {
+            "Manual API trigger (force)".to_string()
+        } else {
+            "Manual API trigger".to_string()
         })
     });
-    if let Some(ref r) = git_ref {
-        if !git::is_valid_git_ref(r) {
-            return error_response(400, "invalid git ref");
-        }
-    }
 
-    let _ = tx.send(Command::Trigger {
-        sha: resolved_sha,
-        force: parsed.force || parsed.deploy_only || parsed.force_deploy,
-        trigger,
-        git_ref,
-        pr: pr_ctx,
-        deploy_only: parsed.deploy_only,
-        force_deploy: parsed.force_deploy,
-    });
+    let slot = reserved.0;
+    if tx
+        .send(Command::Trigger {
+            sha: resolved_sha,
+            force: parsed.force || parsed.deploy_only || parsed.force_deploy,
+            trigger,
+            git_ref,
+            pr: pr_ctx,
+            deploy_only: parsed.deploy_only,
+            force_deploy: parsed.force_deploy,
+            trigger_reason,
+            reserved: Some(reserved),
+        })
+        .is_err()
+    {
+        release_reserved_slot(state, name, slot);
+        return error_response(503, "project worker is not running");
+    }
+    ws.emit_projects_updated();
     json_response(202, &json!({"queued": true}))
 }
 
@@ -730,6 +790,8 @@ struct DeployBody {
     sha: Option<String>,
     #[serde(default)]
     skip_ci: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn handle_deploy_project(state: &Arc<ApiState>, body: &str, name: &str) -> Response {
@@ -749,12 +811,17 @@ fn handle_deploy_project(state: &Arc<ApiState>, body: &str, name: &str) -> Respo
         }
     }
 
-    let (project_cfg, running, upstream, last_sha) = {
+    let (project_cfg, at_capacity, upstream, last_sha) = {
         let shared = state.shared.lock().expect("shared");
         let cfg_p = shared.config.project(name).cloned();
         let state_p = shared.projects.iter().find(|p| p.name == name);
         match (cfg_p, state_p) {
-            (Some(c), Some(s)) => (c, s.running, s.upstream_sha.clone(), s.last_sha.clone()),
+            (Some(c), Some(s)) => (
+                c.clone(),
+                s.active_run_count() >= c.effective_max_concurrent_runs(),
+                s.upstream_sha.clone(),
+                s.last_sha.clone(),
+            ),
             (Some(c), None) => (c, false, None, None),
             (None, _) => return error_response(404, "unknown project"),
         }
@@ -763,7 +830,7 @@ fn handle_deploy_project(state: &Arc<ApiState>, body: &str, name: &str) -> Respo
     if project_cfg.deploy.is_empty() {
         return error_response(400, "project has no deploy steps");
     }
-    if running {
+    if at_capacity {
         return error_response(409, "project is already running");
     }
     let tx = state.commands.lock().expect("commands").get(name).cloned();
@@ -785,16 +852,50 @@ fn handle_deploy_project(state: &Arc<ApiState>, body: &str, name: &str) -> Respo
         return error_response(400, "invalid commit sha");
     }
 
+    let (reserved, ws) = {
+        let mut shared = state.shared.lock().expect("shared");
+        let max_concurrent = shared
+            .config
+            .project(name)
+            .map(|c| c.effective_max_concurrent_runs())
+            .unwrap_or(1);
+        let ws = shared.ws.clone();
+        let Some(p) = shared.projects.iter_mut().find(|p| p.name == name) else {
+            return error_response(404, "unknown project");
+        };
+        let Some(reserved) = p.try_reserve_pending_slot(
+            max_concurrent,
+            Some(target_sha.clone()),
+            Some(project_cfg.branch.clone()),
+            None,
+        ) else {
+            return error_response(409, "project is already running");
+        };
+        (reserved, ws)
+    };
+
     let deploy_only = parsed.skip_ci.unwrap_or(true);
-    let _ = tx.send(Command::Trigger {
-        sha: Some(target_sha.clone()),
-        force: true,
-        trigger: Trigger::ForceDeploy,
-        git_ref: Some(project_cfg.branch.clone()),
-        pr: None,
-        deploy_only,
-        force_deploy: true,
-    });
+    let trigger_reason = model::sanitize_trigger_reason(parsed.reason.as_deref())
+        .or_else(|| Some("Force deploy".to_string()));
+    let slot = reserved.0;
+    if tx
+        .send(Command::Trigger {
+            sha: Some(target_sha.clone()),
+            force: true,
+            trigger: Trigger::ForceDeploy,
+            git_ref: Some(project_cfg.branch.clone()),
+            pr: None,
+            deploy_only,
+            force_deploy: true,
+            trigger_reason,
+            reserved: Some(reserved),
+        })
+        .is_err()
+    {
+        release_reserved_slot(state, name, slot);
+        return error_response(503, "project worker is not running");
+    }
+    ws.emit_projects_updated();
     json_response(
         202,
         &json!({
@@ -811,6 +912,8 @@ struct RunDeployBody {
     skip_ci: Option<bool>,
     #[serde(default)]
     allow_pr: bool,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn handle_deploy_run(state: &Arc<ApiState>, body: &str, id: &str) -> Response {
@@ -832,61 +935,75 @@ fn handle_deploy_run(state: &Arc<ApiState>, body: &str, id: &str) -> Response {
         return error_response(400, "cannot deploy a pull request build");
     }
 
-    let (project_cfg, running) = {
-        let shared = state.shared.lock().expect("shared");
-        let cfg_p = shared.config.project(&run.project).cloned();
-        let is_running = shared
-            .projects
-            .iter()
-            .find(|p| p.name == run.project)
-            .is_some_and(|p| p.running);
-        match cfg_p {
-            Some(c) => (c, is_running),
-            None => return error_response(404, "unknown project"),
-        }
-    };
-
-    if project_cfg.deploy.is_empty() {
-        return error_response(400, "project has no deploy steps");
-    }
-    if running {
-        return error_response(409, "project is already running");
-    }
-    let tx = state
+    let tx_opt = state
         .commands
         .lock()
         .expect("commands")
         .get(&run.project)
         .cloned();
-    let Some(tx) = tx else {
-        return error_response(503, "project worker is not running");
+    let (tx, git_ref, pr, reserved, ws) = {
+        let mut shared = state.shared.lock().expect("shared");
+        let Some(cfg_p) = shared.config.project(&run.project).cloned() else {
+            return error_response(404, "unknown project");
+        };
+        if cfg_p.deploy.is_empty() {
+            return error_response(400, "project has no deploy steps");
+        }
+        let max_c = cfg_p.effective_max_concurrent_runs();
+        let ws = shared.ws.clone();
+        let Some(p) = shared.projects.iter_mut().find(|p| p.name == run.project) else {
+            return error_response(404, "unknown project");
+        };
+        if p.active_run_count() >= max_c {
+            return error_response(409, "project is already running");
+        }
+        let Some(tx) = tx_opt else {
+            return error_response(503, "project worker is not running");
+        };
+        let git_ref = run.git_ref.clone().unwrap_or_else(|| cfg_p.branch.clone());
+        let pr = run.pr_number.map(|number| PrContext {
+            number,
+            title: run.pr_title.clone().unwrap_or_default(),
+            head_ref: run.pr_head_ref.clone().unwrap_or_default(),
+            base_ref: run
+                .pr_base_ref
+                .clone()
+                .unwrap_or_else(|| cfg_p.branch.clone()),
+            base_sha: String::new(),
+        });
+        let Some(reserved) = p.try_reserve_pending_slot(
+            max_c,
+            Some(run.sha.clone()),
+            Some(git_ref.clone()),
+            pr.as_ref().map(|p| p.number),
+        ) else {
+            return error_response(409, "project is already running");
+        };
+        (tx, git_ref, pr, reserved, ws)
     };
 
     let deploy_only = parsed.skip_ci.unwrap_or(true);
-    let git_ref = run
-        .git_ref
-        .clone()
-        .unwrap_or_else(|| project_cfg.branch.clone());
-    let pr = run.pr_number.map(|number| PrContext {
-        number,
-        title: run.pr_title.clone().unwrap_or_default(),
-        head_ref: run.pr_head_ref.clone().unwrap_or_default(),
-        base_ref: run
-            .pr_base_ref
-            .clone()
-            .unwrap_or_else(|| project_cfg.branch.clone()),
-        base_sha: String::new(),
-    });
-
-    let _ = tx.send(Command::Trigger {
-        sha: Some(run.sha.clone()),
-        force: true,
-        trigger: Trigger::ForceDeploy,
-        git_ref: Some(git_ref),
-        pr,
-        deploy_only,
-        force_deploy: true,
-    });
+    let trigger_reason = model::sanitize_trigger_reason(parsed.reason.as_deref())
+        .or_else(|| Some(format!("Force deploy of {id}")));
+    let slot = reserved.0;
+    if tx
+        .send(Command::Trigger {
+            sha: Some(run.sha.clone()),
+            force: true,
+            trigger: Trigger::ForceDeploy,
+            git_ref: Some(git_ref),
+            pr,
+            deploy_only,
+            force_deploy: true,
+            trigger_reason,
+            reserved: Some(reserved),
+        })
+        .is_err()
+    {
+        release_reserved_slot(state, &run.project, slot);
+        return error_response(503, "project worker is not running");
+    }
+    ws.emit_projects_updated();
     json_response(
         202,
         &json!({
@@ -915,10 +1032,27 @@ fn run_retry_context(run: &Run) -> (Option<String>, Option<PrContext>) {
     (git_ref, pr)
 }
 
-fn handle_retry_run(state: &Arc<ApiState>, id: &str) -> Response {
+#[derive(Debug, Deserialize, Default)]
+struct ReasonBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn handle_retry_run(state: &Arc<ApiState>, body: &str, id: &str) -> Response {
+    let parsed: ReasonBody = if body.trim().is_empty() {
+        ReasonBody::default()
+    } else {
+        match serde_json::from_str(body) {
+            Ok(b) => b,
+            Err(e) => return error_response(400, &format!("invalid JSON: {e}")),
+        }
+    };
     let (state_dir, live_run) = {
         let shared = state.shared.lock().expect("shared");
         let live = shared.projects.iter().find_map(|p| {
+            if let Some(active) = p.active_runs.iter().find(|a| a.run.id == id) {
+                return Some((active.run.clone(), true));
+            }
             p.current_run
                 .as_ref()
                 .filter(|r| r.id == id)
@@ -933,45 +1067,64 @@ fn handle_retry_run(state: &Arc<ApiState>, id: &str) -> Response {
         return error_response(404, "run not found");
     };
 
-    let (project_exists, running) = {
-        let shared = state.shared.lock().expect("shared");
-        let exists = shared.config.project(&run.project).is_some();
-        let is_running = shared
-            .projects
-            .iter()
-            .find(|p| p.name == run.project)
-            .is_some_and(|p| p.running);
-        (exists, is_running)
-    };
-    if !project_exists {
-        return error_response(404, "project not found");
-    }
-    if running {
-        return error_response(409, "project is already running");
-    }
-    if !git::is_valid_sha(&run.sha) {
-        return error_response(400, "invalid commit sha");
-    }
-    let tx = state
+    let tx_opt = state
         .commands
         .lock()
         .expect("commands")
         .get(&run.project)
         .cloned();
-    let Some(tx) = tx else {
-        return error_response(503, "project worker is not running");
+    let (git_ref, pr) = run_retry_context(&run);
+    let (tx, reserved, ws) = {
+        let mut shared = state.shared.lock().expect("shared");
+        let Some(cfg_p) = shared.config.project(&run.project) else {
+            return error_response(404, "project not found");
+        };
+        let max_c = cfg_p.effective_max_concurrent_runs();
+        let ws = shared.ws.clone();
+        let Some(p) = shared.projects.iter_mut().find(|p| p.name == run.project) else {
+            return error_response(404, "project not found");
+        };
+        if p.active_run_count() >= max_c {
+            return error_response(409, "project is already running");
+        }
+        if !git::is_valid_sha(&run.sha) {
+            return error_response(400, "invalid commit sha");
+        }
+        let Some(tx) = tx_opt else {
+            return error_response(503, "project worker is not running");
+        };
+        let Some(reserved) = p.try_reserve_pending_slot(
+            max_c,
+            Some(run.sha.clone()),
+            git_ref.clone(),
+            pr.as_ref().map(|p| p.number),
+        ) else {
+            return error_response(409, "project is already running");
+        };
+        (tx, reserved, ws)
     };
 
-    let (git_ref, pr) = run_retry_context(&run);
-    let _ = tx.send(Command::Trigger {
-        sha: Some(run.sha.clone()),
-        force: true,
-        trigger: Trigger::Manual,
-        git_ref,
-        pr,
-        deploy_only: false,
-        force_deploy: false,
-    });
+    let trigger_reason = model::sanitize_trigger_reason(parsed.reason.as_deref())
+        .or_else(|| Some(format!("Retry of {id}")));
+    let slot = reserved.0;
+    if tx
+        .send(Command::Trigger {
+            sha: Some(run.sha.clone()),
+            force: true,
+            trigger: Trigger::Manual,
+            git_ref,
+            pr,
+            deploy_only: false,
+            force_deploy: false,
+            trigger_reason,
+            reserved: Some(reserved),
+        })
+        .is_err()
+    {
+        release_reserved_slot(state, &run.project, slot);
+        return error_response(503, "project worker is not running");
+    }
+    ws.emit_projects_updated();
     json_response(
         202,
         &json!({
@@ -1029,8 +1182,19 @@ fn remove_docker_volumes_with_prefix(prefix: &str, wsl: bool) -> Vec<String> {
     removed
 }
 
+fn remove_path_entry(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let res = if meta.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    res.is_ok()
+}
+
 fn handle_clear_cache(state: &Arc<ApiState>) -> Response {
-    const MANAGED_CACHE_SUBDIRS: &[&str] = &["act-actions", "act-cache-server", "projects"];
     let (cache_dir, wsl) = {
         let shared = state.shared.lock().expect("shared");
         let act = shared.config.act();
@@ -1038,15 +1202,23 @@ fn handle_clear_cache(state: &Arc<ApiState>) -> Response {
     };
     let mut removed = Vec::new();
     if cache_dir.is_dir() {
-        for sub in MANAGED_CACHE_SUBDIRS {
-            let path = cache_dir.join(sub);
-            if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                let res = if meta.file_type().is_dir() {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
-                if res.is_ok() {
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            let mut paths: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+                        name == "act-actions"
+                            || name.starts_with("act-actions-slot-")
+                            || name == "act-cache-server"
+                            || name.starts_with("act-cache-server-slot-")
+                            || name == "projects"
+                    })
+                })
+                .collect();
+            paths.sort();
+            for path in paths {
+                if remove_path_entry(&path) {
                     removed.push(path.to_string_lossy().to_string());
                 }
             }
@@ -1072,9 +1244,26 @@ fn handle_clear_project_cache(state: &Arc<ApiState>, name: &str) -> Response {
     }
     let slug = config::project_cache_slug(name);
     let mut removed = Vec::new();
-    let project_cache = cache_dir.join("projects").join(&slug);
-    if project_cache.exists() && std::fs::remove_dir_all(&project_cache).is_ok() {
-        removed.push(project_cache.to_string_lossy().to_string());
+    let projects_dir = cache_dir.join("projects");
+    if projects_dir.is_dir() {
+        let slot_prefix = format!("{slug}-slot-");
+        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+            let mut paths: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n == slug || n.starts_with(&slot_prefix))
+                })
+                .collect();
+            paths.sort();
+            for path in paths {
+                if remove_path_entry(&path) {
+                    removed.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
     }
     removed.extend(remove_docker_volumes_with_prefix(
         &format!("lunacy-cache-{slug}-"),
@@ -1226,16 +1415,21 @@ fn handle_cancel_project(state: &Arc<ApiState>, name: &str) -> Response {
         )
     };
     match outcome {
-        crate::daemon::CancelProjectOutcome::Cancelling(run_id) => json_response(
-            202,
-            &json!({
-                "cancelling": true,
-                "cancelled": false,
-                "orphaned": false,
-                "run_id": run_id,
-                "project": name,
-            }),
-        ),
+        crate::daemon::CancelProjectOutcome::Cancelling(run_id) => {
+            if let Some(tx) = state.commands.lock().expect("commands").get(name).cloned() {
+                let _ = tx.send(Command::CancelQueued);
+            }
+            json_response(
+                202,
+                &json!({
+                    "cancelling": true,
+                    "cancelled": false,
+                    "orphaned": false,
+                    "run_id": run_id,
+                    "project": name,
+                }),
+            )
+        }
         crate::daemon::CancelProjectOutcome::NotFound => error_response(404, "project not found"),
         crate::daemon::CancelProjectOutcome::NotRunning => {
             let mut candidates: Vec<Run> = model::list_runs(&state_dir, name, usize::MAX)
@@ -1260,7 +1454,15 @@ fn handle_cancel_project(state: &Arc<ApiState>, name: &str) -> Response {
                         .iter()
                         .find(|p| p.name == name)
                         .and_then(|p| {
-                            if p.running && p.current_run.as_ref().is_some_and(|r| r.id == run.id) {
+                            if let Some(active) = p.active_runs.iter().find(|a| a.run.id == run.id)
+                            {
+                                active
+                                    .cancel
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                Some(run.id.clone())
+                            } else if p.running
+                                && p.current_run.as_ref().is_some_and(|r| r.id == run.id)
+                            {
                                 if let Some(flag) = &p.cancel {
                                     flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                 }
@@ -1499,6 +1701,9 @@ fn handle_put_config(state: &Arc<ApiState>, body: &str) -> Response {
     // keeps the config it started with.
     let (restarted, ws) = {
         let mut shared = state.shared.lock().expect("shared");
+        shared
+            .concurrency_gate
+            .set_limit(incoming.general.max_concurrent_runs);
         shared.config = incoming.clone();
         // Refresh the read models for added/removed/reordered projects.
         let state_dir = shared.state_dir.clone();
@@ -1574,6 +1779,35 @@ struct WebhookPayload {
     after: Option<String>,
     #[serde(default)]
     deleted: Option<bool>,
+    #[serde(default)]
+    sender: Option<WebhookUser>,
+    #[serde(default)]
+    pusher: Option<WebhookPusher>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookUser {
+    #[serde(default)]
+    login: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookPusher {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+fn webhook_actor(payload: &WebhookPayload) -> Option<String> {
+    payload
+        .sender
+        .as_ref()
+        .and_then(|u| model::sanitize_trigger_reason(u.login.as_deref()))
+        .or_else(|| {
+            payload
+                .pusher
+                .as_ref()
+                .and_then(|p| model::sanitize_trigger_reason(p.name.as_deref()))
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1741,6 +1975,7 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
         _ => "check_run",
     };
 
+    let actor = webhook_actor(&payload);
     let full_name = payload.repository.and_then(|r| r.full_name);
     let commands = state.commands.lock().expect("commands").clone();
 
@@ -1873,10 +2108,12 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
 
             let mut filtered_by_paused = false;
             let mut filtered_by_poll = false;
+            let mut prs_changed = None;
             let targets: Vec<(String, Sender<Command>)> = {
-                let shared = state.shared.lock().expect("shared");
+                let mut guard = state.shared.lock().expect("shared");
+                let shared = &mut *guard;
                 let mut out = Vec::new();
-                for p in &shared.projects {
+                for p in shared.projects.iter_mut() {
                     let have = project_github_repo(p, &shared.config);
                     let repo_match = match (&full_name, &have) {
                         (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
@@ -1899,12 +2136,28 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                         filtered_by_poll = true;
                         continue;
                     }
+                    // Track the PR's new head now, not at the next poll: a finished run
+                    // records its sha only when it matches the tracked head, else the next
+                    // poll would build this commit a second time.
+                    if upsert_open_pr(
+                        &mut p.open_prs,
+                        number,
+                        &title,
+                        &head_ref,
+                        &base_ref,
+                        &head_sha,
+                    ) {
+                        prs_changed = Some(shared.ws.clone());
+                    }
                     if let Some(tx) = commands.get(&p.name) {
                         out.push((p.name.clone(), tx.clone()));
                     }
                 }
                 out
             };
+            if let Some(ws) = prs_changed {
+                ws.emit_projects_updated();
+            }
             if targets.is_empty() {
                 let reason = if filtered_by_paused {
                     "project is paused"
@@ -1923,6 +2176,10 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                 base_ref,
                 base_sha,
             };
+            let trigger_reason = model::sanitize_trigger_reason(Some(&match actor.as_deref() {
+                Some(who) => format!("GitHub PR #{number} {action} by {who}"),
+                None => format!("GitHub PR #{number} {action}"),
+            }));
             let mut queued = Vec::new();
             for (name, tx) in targets {
                 let _ = tx.send(Command::Trigger {
@@ -1933,6 +2190,8 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                     pr: Some(pr_ctx.clone()),
                     deploy_only: false,
                     force_deploy: false,
+                    trigger_reason: trigger_reason.clone(),
+                    reserved: None,
                 });
                 queued.push(name);
             }
@@ -2044,6 +2303,18 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                 record_webhook(state, event_kind, full_name, delivery_id, reason, false);
                 return json_response(202, &json!({"queued": false, "reason": reason}));
             }
+            let trigger_reason = model::sanitize_trigger_reason(Some(&if is_tag {
+                let tag = norm_ref.strip_prefix("tags/").unwrap_or(&norm_ref);
+                match actor.as_deref() {
+                    Some(who) => format!("GitHub tag webhook ({tag} by {who})"),
+                    None => format!("GitHub tag webhook ({tag})"),
+                }
+            } else {
+                match actor.as_deref() {
+                    Some(who) => format!("GitHub push webhook ({norm_ref} by {who})"),
+                    None => format!("GitHub push webhook ({norm_ref})"),
+                }
+            }));
             let mut queued = Vec::new();
             for (name, tx) in targets {
                 let _ = tx.send(Command::Trigger {
@@ -2054,6 +2325,8 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                     pr: None,
                     deploy_only: false,
                     force_deploy: false,
+                    trigger_reason: trigger_reason.clone(),
+                    reserved: None,
                 });
                 queued.push(name);
             }
@@ -2065,47 +2338,52 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
             )
         }
         "check_run" | "check_suite" => {
-            let (deploy_only, force_deploy, action_label) = match payload.action.as_deref() {
-                Some("rerequested") => (false, false, "rerun"),
-                Some("requested_action") => {
-                    match payload
-                        .requested_action
-                        .as_ref()
-                        .and_then(|a| a.identifier.as_deref())
-                    {
-                        Some("retry_ci" | "retry") => (false, false, "retry_ci"),
-                        Some("retry_deploy") => (true, true, "retry_deploy"),
-                        _ => {
-                            record_webhook(
-                                state,
-                                event_kind,
-                                full_name,
-                                delivery_id,
-                                "ignored requested_action",
-                                false,
-                            );
-                            return json_response(
-                                202,
-                                &json!({"queued": false, "reason": "ignored requested_action"}),
-                            );
+            let (deploy_only, force_deploy, action_label, reason_base) =
+                match payload.action.as_deref() {
+                    Some("rerequested") => (false, false, "rerun", "GitHub check re-run"),
+                    Some("requested_action") => {
+                        match payload
+                            .requested_action
+                            .as_ref()
+                            .and_then(|a| a.identifier.as_deref())
+                        {
+                            Some("retry_ci" | "retry") => {
+                                (false, false, "retry_ci", "GitHub action: Retry CI")
+                            }
+                            Some("retry_deploy") => {
+                                (true, true, "retry_deploy", "GitHub action: Retry Deploy")
+                            }
+                            _ => {
+                                record_webhook(
+                                    state,
+                                    event_kind,
+                                    full_name,
+                                    delivery_id,
+                                    "ignored requested_action",
+                                    false,
+                                );
+                                return json_response(
+                                    202,
+                                    &json!({"queued": false, "reason": "ignored requested_action"}),
+                                );
+                            }
                         }
                     }
-                }
-                _ => {
-                    record_webhook(
-                        state,
-                        event_kind,
-                        full_name,
-                        delivery_id,
-                        "ignored action",
-                        false,
-                    );
-                    return json_response(
-                        202,
-                        &json!({"queued": false, "reason": "ignored action"}),
-                    );
-                }
-            };
+                    _ => {
+                        record_webhook(
+                            state,
+                            event_kind,
+                            full_name,
+                            delivery_id,
+                            "ignored action",
+                            false,
+                        );
+                        return json_response(
+                            202,
+                            &json!({"queued": false, "reason": "ignored action"}),
+                        );
+                    }
+                };
             let external_id = payload
                 .check_run
                 .as_ref()
@@ -2167,6 +2445,10 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                 .as_deref()
                 .filter(|id| is_valid_segment(id))
                 .and_then(|id| lookup_run(&state_dir, id));
+            let trigger_reason = model::sanitize_trigger_reason(Some(&match actor.as_deref() {
+                Some(who) => format!("{reason_base} by {who}"),
+                None => reason_base.to_string(),
+            }));
             let mut queued = Vec::new();
             let mut blocked_pr_deploy = false;
             for (name, tx) in targets {
@@ -2186,6 +2468,8 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                     pr,
                     deploy_only,
                     force_deploy,
+                    trigger_reason: trigger_reason.clone(),
+                    reserved: None,
                 });
                 queued.push(name);
             }
@@ -2223,8 +2507,64 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
 
 // -------------------------------------------------------------- system
 
+fn probe_docker_daemon() -> (bool, Option<String>) {
+    let mut child = match std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (false, Some(e.to_string())),
+    };
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut err = String::new();
+        if let Some(mut s) = stderr {
+            let _ = std::io::Read::read_to_string(&mut s, &mut err);
+        }
+        err
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let err = reader.join().unwrap_or_default();
+                if status.success() {
+                    return (true, None);
+                }
+                return (false, Some(err.trim().to_string()));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return (false, Some("docker info timed out".to_string()));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return (false, Some(e.to_string()));
+            }
+        }
+    }
+}
+
 fn system_json(state: &Arc<ApiState>) -> Value {
-    let (config_path, state_dir, webhook_configured, webhook_endpoint, webhook_stats) = {
+    let (
+        config_path,
+        state_dir,
+        webhook_configured,
+        webhook_endpoint,
+        webhook_stats,
+        max_concurrent_runs,
+        act_max_concurrent,
+    ) = {
         let shared = state.shared.lock().expect("shared");
         let configured = shared
             .config
@@ -2250,6 +2590,8 @@ fn system_json(state: &Arc<ApiState>) -> Value {
             configured,
             endpoint,
             shared.webhook_stats.clone(),
+            shared.config.general.max_concurrent_runs,
+            shared.config.effective_act_max_concurrent(),
         )
     };
     let act_path = crate::exec::which("act");
@@ -2257,23 +2599,15 @@ fn system_json(state: &Arc<ApiState>) -> Value {
         .as_ref()
         .and_then(|_| crate::exec::first_line_of_stdout("act", &["--version"]))
         .map(|v| v.trim_start_matches("act version ").to_string());
-    let (docker_ok, docker_error) = match std::process::Command::new("docker")
-        .args(["info", "--format", "{{.ServerVersion}}"])
-        .output()
-    {
-        Ok(out) if out.status.success() => (true, None),
-        Ok(out) => (
-            false,
-            Some(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        ),
-        Err(e) => (false, Some(e.to_string())),
-    };
+    let (docker_ok, docker_error) = probe_docker_daemon();
     let git_version = crate::exec::first_line_of_stdout("git", &["--version"]);
     json!({
         "os": crate::config::Os::current().as_str(),
         "version": VERSION,
         "config_path": config_path.to_string_lossy(),
         "state_dir": state_dir.to_string_lossy(),
+        "max_concurrent_runs": max_concurrent_runs,
+        "act_max_concurrent": act_max_concurrent,
         "act": {
             "path": act_path.map(|p| p.to_string_lossy().to_string()),
             "version": act_version,
@@ -2541,5 +2875,29 @@ mod tests {
 
         shared.lock().unwrap().shutdown = true;
         thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn webhook_actor_falls_back_to_pusher_when_sender_login_is_control_chars_only() {
+        let payload: WebhookPayload = serde_json::from_value(json!({
+            "sender": { "login": "\u{0000}\u{0007}\u{001b}\t\n" },
+            "pusher": { "name": "  alice\tdev  " }
+        }))
+        .unwrap();
+        assert_eq!(webhook_actor(&payload).as_deref(), Some("alice dev"));
+
+        let both_bad: WebhookPayload = serde_json::from_value(json!({
+            "sender": { "login": "\u{0001}\u{0002}" },
+            "pusher": { "name": "\r\n\u{0000}" }
+        }))
+        .unwrap();
+        assert_eq!(webhook_actor(&both_bad), None);
+
+        let valid_sender: WebhookPayload = serde_json::from_value(json!({
+            "sender": { "login": "octocat" },
+            "pusher": { "name": "alice" }
+        }))
+        .unwrap();
+        assert_eq!(webhook_actor(&valid_sender).as_deref(), Some("octocat"));
     }
 }

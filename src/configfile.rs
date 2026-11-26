@@ -282,4 +282,19 @@ timeout = 60
         assert_eq!(back.general.poll_interval, 120);
         assert_eq!(back.projects.len(), cfg.projects.len());
     }
+
+    #[test]
+    fn roundtrip_preserves_concurrency_fields() {
+        let existing = std::fs::read_to_string("config.example.toml").unwrap();
+        let mut cfg = Config::load(Path::new("config.example.toml")).unwrap();
+        cfg.general.max_concurrent_runs = 4;
+        cfg.act.as_mut().unwrap().max_concurrent = Some(2);
+        cfg.projects[0].max_concurrent_runs = Some(2);
+
+        let back = render_and_parse(&existing, &cfg).unwrap();
+        assert_eq!(back.general.max_concurrent_runs, 4);
+        assert_eq!(back.act.as_ref().and_then(|a| a.max_concurrent), Some(2));
+        assert_eq!(back.projects[0].max_concurrent_runs, Some(2));
+        assert_eq!(back.projects[1].max_concurrent_runs, None);
+    }
 }

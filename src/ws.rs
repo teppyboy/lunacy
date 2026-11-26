@@ -220,6 +220,9 @@ fn lookup_run_live_or_disk(state: &ApiState, id: &str) -> Option<Run> {
     let state_dir = {
         let shared = state.shared.lock().expect("shared");
         for p in &shared.projects {
+            if let Some(active) = p.active_runs.iter().find(|a| a.run.id == id) {
+                return Some(active.run.clone());
+            }
             if let Some(ref r) = p.current_run {
                 if r.id == id {
                     return Some(r.clone());

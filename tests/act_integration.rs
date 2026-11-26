@@ -58,6 +58,7 @@ fn act_step_runs_the_workflow_and_records_substeps() {
         lock_file: None,
         cache: true,
         cache_dir: None,
+        max_concurrent: None,
     });
 
     let project = ProjectCfg {
@@ -89,6 +90,7 @@ fn act_step_runs_the_workflow_and_records_substeps() {
         deploy_refs: Vec::new(),
         watch_tags: false,
         cache: None,
+        max_concurrent_runs: None,
         ci: vec![StepCfg {
             name: "Workflow".into(),
             kind: StepKind::Act,
@@ -120,6 +122,9 @@ fn act_step_runs_the_workflow_and_records_substeps() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
     let run = pipeline::run_pipeline(&ctx, &project, &sha, Trigger::Manual);
 

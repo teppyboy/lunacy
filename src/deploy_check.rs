@@ -1059,6 +1059,7 @@ mod tests {
             deploy_refs: Vec::new(),
             watch_tags: false,
             cache: None,
+            max_concurrent_runs: None,
             ci: vec![shell_step("Test", "true")],
             deploy: Vec::new(),
         }

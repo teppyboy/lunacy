@@ -167,6 +167,8 @@ pub struct Run {
     #[serde(default)]
     pub trigger: Trigger,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
@@ -190,9 +192,27 @@ impl Run {
         trigger: Trigger,
         steps: Vec<Step>,
     ) -> Run {
+        use std::sync::{Mutex, OnceLock};
+        static LAST_ID_SEQ: OnceLock<Mutex<(u64, u64)>> = OnceLock::new();
         let started_at = now_secs();
+        let seq = {
+            let lock = LAST_ID_SEQ.get_or_init(|| Mutex::new((0, 0)));
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.0 == started_at {
+                guard.1 = guard.1.saturating_add(1);
+            } else {
+                guard.0 = started_at;
+                guard.1 = 0;
+            }
+            guard.1
+        };
+        let id = if seq == 0 {
+            format!("{project}-{started_at}-{}", short_sha(sha))
+        } else {
+            format!("{project}-{started_at}-{}-{seq}", short_sha(sha))
+        };
         Run {
-            id: format!("{project}-{started_at}-{}", short_sha(sha)),
+            id,
             project: project.to_string(),
             sha: sha.to_string(),
             subject,
@@ -203,6 +223,7 @@ impl Run {
             github_url: None,
             steps,
             trigger,
+            trigger_reason: None,
             git_ref: None,
             pr_number: None,
             pr_title: None,
@@ -240,6 +261,36 @@ impl Run {
 pub fn short_sha(sha: &str) -> &str {
     let n = sha.len().min(7);
     &sha[..n]
+}
+
+/// Maximum character length for persisted `Run::trigger_reason` values.
+pub const MAX_TRIGGER_REASON_CHARS: usize = 160;
+
+/// Normalize a human-readable trigger reason for storage, logs, and notifications:
+/// trims surrounding whitespace, replaces control characters/newlines with spaces,
+/// collapses runs of whitespace into single spaces, truncates on a UTF-8 char boundary
+/// to at most [`MAX_TRIGGER_REASON_CHARS`] characters (appending `"…"` if truncated),
+/// and returns `None` when empty.
+pub fn sanitize_trigger_reason(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= MAX_TRIGGER_REASON_CHARS {
+        Some(collapsed)
+    } else {
+        let mut out: String = collapsed
+            .chars()
+            .take(MAX_TRIGGER_REASON_CHARS.saturating_sub(1))
+            .collect();
+        out.push('…');
+        Some(out)
+    }
 }
 
 /// `state_dir/runs/<project>`
@@ -717,6 +768,64 @@ mod tests {
         assert_eq!(
             read_run(dir.path(), &finished.id).unwrap().status,
             RunStatus::Success
+        );
+    }
+
+    #[test]
+    fn sanitize_trigger_reason_normalizes_and_truncates_utf8() {
+        assert_eq!(sanitize_trigger_reason(None), None);
+        assert_eq!(sanitize_trigger_reason(Some("")), None);
+        assert_eq!(sanitize_trigger_reason(Some("   \n\t\r\x00\x1b  ")), None);
+        assert_eq!(
+            sanitize_trigger_reason(Some("  GitHub\npush\t\twebhook\x07(master)  ")),
+            Some("GitHub push webhook (master)".to_string())
+        );
+
+        let exact = "a".repeat(MAX_TRIGGER_REASON_CHARS);
+        assert_eq!(sanitize_trigger_reason(Some(&exact)), Some(exact.clone()));
+
+        let long_ascii = "x".repeat(MAX_TRIGGER_REASON_CHARS + 25);
+        let truncated = sanitize_trigger_reason(Some(&long_ascii)).unwrap();
+        assert_eq!(truncated.chars().count(), MAX_TRIGGER_REASON_CHARS);
+        assert!(truncated.ends_with('…'));
+
+        let long_utf8 = "🚀é".repeat(MAX_TRIGGER_REASON_CHARS);
+        let truncated_utf8 = sanitize_trigger_reason(Some(&long_utf8)).unwrap();
+        assert_eq!(truncated_utf8.chars().count(), MAX_TRIGGER_REASON_CHARS);
+        assert!(truncated_utf8.ends_with('…'));
+        assert!(truncated_utf8.starts_with("🚀é"));
+    }
+
+    #[test]
+    fn run_serde_roundtrip_with_and_without_trigger_reason() {
+        // Without trigger_reason: field is omitted from JSON and deserializes as None.
+        let run_without = Run::new(
+            "demo",
+            "0123456789abcdef0123456789abcdef01234567",
+            "chore: legacy".into(),
+            Trigger::Poll,
+            vec![],
+        );
+        let json_without = serde_json::to_string(&run_without).unwrap();
+        assert!(
+            !json_without.contains("trigger_reason"),
+            "None trigger_reason must be omitted: {json_without}"
+        );
+        let back_without: Run = serde_json::from_str(&json_without).unwrap();
+        assert_eq!(back_without.trigger_reason, None);
+
+        // With trigger_reason: persisted and deserialized cleanly.
+        let mut run_with = run_without;
+        run_with.trigger_reason = Some("GitHub push webhook (master by alice)".into());
+        let json_with = serde_json::to_string(&run_with).unwrap();
+        assert!(
+            json_with.contains("\"trigger_reason\":\"GitHub push webhook (master by alice)\""),
+            "{json_with}"
+        );
+        let back_with: Run = serde_json::from_str(&json_with).unwrap();
+        assert_eq!(
+            back_with.trigger_reason.as_deref(),
+            Some("GitHub push webhook (master by alice)")
         );
     }
 }

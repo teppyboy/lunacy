@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub const MASK: &str = "********";
 pub const DEFAULT_STEP_TIMEOUT: u64 = 3600;
 pub const DEFAULT_POLL_INTERVAL: u64 = 300;
+pub const DEFAULT_MAX_CONCURRENT_RUNS: usize = 1;
 pub const DEFAULT_API_URL: &str = "https://api.github.com";
 
 /// Host operating system, as used by `only_on` and the platform defaults.
@@ -122,6 +123,9 @@ pub struct General {
     /// Default per-step timeout in seconds (fallback when project/step don't set one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_timeout: Option<u64>,
+    /// Maximum number of pipelines running concurrently across the daemon (default 1).
+    #[serde(default = "default_max_concurrent_runs")]
+    pub max_concurrent_runs: usize,
 }
 
 impl Default for General {
@@ -133,6 +137,7 @@ impl Default for General {
             log_level: default_log_level(),
             shell: None,
             step_timeout: None,
+            max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
         }
     }
 }
@@ -145,6 +150,10 @@ impl General {
 
 fn default_poll_interval() -> u64 {
     DEFAULT_POLL_INTERVAL
+}
+
+fn default_max_concurrent_runs() -> usize {
+    DEFAULT_MAX_CONCURRENT_RUNS
 }
 
 fn default_log_level() -> String {
@@ -364,6 +373,10 @@ pub struct ActCfg {
     /// Defaults to `state_dir/cache`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
+    /// Maximum number of concurrent `act` runs across the machine.
+    /// Defaults to `general.max_concurrent_runs` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
 }
 
 impl Default for ActCfg {
@@ -376,6 +389,7 @@ impl Default for ActCfg {
             lock_file: None,
             cache: true,
             cache_dir: None,
+            max_concurrent: None,
         }
     }
 }
@@ -485,6 +499,10 @@ pub struct ProjectCfg {
     /// Override global `[act] cache` for this project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
+    /// Maximum number of concurrent runs for this project (default 1).
+    /// Values > 1 require `checkout = "worktree"` or `"none"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_runs: Option<usize>,
     #[serde(default)]
     pub ci: Vec<StepCfg>,
     #[serde(default)]
@@ -529,6 +547,10 @@ impl ProjectCfg {
             .or(general.step_timeout)
             .unwrap_or(DEFAULT_STEP_TIMEOUT)
             .max(1)
+    }
+
+    pub fn effective_max_concurrent_runs(&self) -> usize {
+        self.max_concurrent_runs.unwrap_or(1).max(1)
     }
 
     pub fn watches_tags(&self) -> bool {
@@ -765,6 +787,12 @@ impl Config {
                 "must be at least 1",
             ));
         }
+        if self.general.max_concurrent_runs == 0 {
+            return Err(ConfigError::new(
+                "general.max_concurrent_runs",
+                "must be at least 1",
+            ));
+        }
         if let Some(shell) = &self.general.shell {
             validate_shell("general.shell", shell)?;
         }
@@ -872,6 +900,9 @@ impl Config {
         if let Some(act) = &self.act {
             if act.command().is_empty() {
                 return Err(ConfigError::new("act.command", "must not be empty"));
+            }
+            if act.max_concurrent == Some(0) {
+                return Err(ConfigError::new("act.max_concurrent", "must be at least 1"));
             }
             if let Some(lock) = &act.lock_file {
                 if lock.as_os_str().is_empty() {
@@ -982,6 +1013,20 @@ impl Config {
                     format!("{base}.timeout"),
                     "must be at least 1",
                 ));
+            }
+            if let Some(max) = p.max_concurrent_runs {
+                if max == 0 {
+                    return Err(ConfigError::new(
+                        format!("{base}.max_concurrent_runs"),
+                        "must be at least 1",
+                    ));
+                }
+                if max > 1 && p.checkout == Checkout::InPlace {
+                    return Err(ConfigError::new(
+                        format!("{base}.max_concurrent_runs"),
+                        "concurrent runs on one project require checkout = \"worktree\" or \"none\" (not \"in-place\")",
+                    ));
+                }
             }
             if p.deploy_refs.iter().any(|r| r.trim().is_empty()) {
                 return Err(ConfigError::new(
@@ -1159,6 +1204,15 @@ impl Config {
 
     pub fn act(&self) -> ActCfg {
         self.act.clone().unwrap_or_default()
+    }
+
+    /// Effective concurrency limit for `act` runs: `[act].max_concurrent`, else `general.max_concurrent_runs`.
+    pub fn effective_act_max_concurrent(&self) -> usize {
+        self.act
+            .as_ref()
+            .and_then(|a| a.max_concurrent)
+            .unwrap_or(self.general.max_concurrent_runs)
+            .max(1)
     }
 
     /// The act lock every act run takes: `[act] lock_file`, else `state_dir/act.lock`.
@@ -2469,5 +2523,61 @@ chekout = "worktree"
             cfg.validate().unwrap_err().field.as_deref(),
             Some("project[0].ci[0].shell")
         );
+    }
+
+    #[test]
+    fn concurrency_config_defaults_and_validation() {
+        let cfg = example();
+        assert_eq!(cfg.general.max_concurrent_runs, 1);
+        assert_eq!(cfg.effective_act_max_concurrent(), 1);
+        assert_eq!(cfg.projects[0].effective_max_concurrent_runs(), 1);
+
+        // general.max_concurrent_runs = 0 rejected.
+        let mut bad = example();
+        bad.general.max_concurrent_runs = 0;
+        let err = bad.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("general.max_concurrent_runs"));
+
+        // act.max_concurrent = 0 rejected; inherits general.max_concurrent_runs when None.
+        let mut cfg = example();
+        cfg.general.max_concurrent_runs = 3;
+        assert_eq!(cfg.effective_act_max_concurrent(), 3);
+        cfg.act.as_mut().unwrap().max_concurrent = Some(2);
+        assert_eq!(cfg.effective_act_max_concurrent(), 2);
+        cfg.validate().expect("valid concurrency limits");
+
+        cfg.act.as_mut().unwrap().max_concurrent = Some(0);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("act.max_concurrent"));
+
+        // project.max_concurrent_runs = 0 rejected.
+        let mut cfg = example();
+        cfg.projects[0].max_concurrent_runs = Some(0);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("project[0].max_concurrent_runs"));
+
+        // project.max_concurrent_runs > 1 with checkout = "in-place" rejected.
+        let mut cfg = example();
+        cfg.projects[0].checkout = Checkout::InPlace;
+        cfg.projects[0].max_concurrent_runs = Some(2);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("project[0].max_concurrent_runs"));
+        assert!(
+            err.message.contains("checkout = \"worktree\" or \"none\""),
+            "{}",
+            err.message
+        );
+
+        // project.max_concurrent_runs = 1 with checkout = "in-place" allowed.
+        cfg.projects[0].max_concurrent_runs = Some(1);
+        cfg.validate().expect("in-place with limit 1 is valid");
+
+        // project.max_concurrent_runs > 1 with worktree or none allowed.
+        cfg.projects[0].checkout = Checkout::Worktree;
+        cfg.projects[0].max_concurrent_runs = Some(2);
+        cfg.validate().expect("worktree with limit 2 is valid");
+        cfg.projects[0].checkout = Checkout::None;
+        cfg.validate().expect("none with limit 2 is valid");
+        assert_eq!(cfg.projects[0].effective_max_concurrent_runs(), 2);
     }
 }

@@ -134,16 +134,20 @@ pub(crate) fn start_payload(
     repo: Option<&str>,
     username: Option<&str>,
 ) -> serde_json::Value {
+    let mut description = format!(
+        "{} `{}` — {}",
+        repo.map(|r| format!("{r} ")).unwrap_or_default(),
+        &run.sha[..run.sha.len().min(7)],
+        truncate(&run.subject, 200)
+    );
+    if let Some(reason) = crate::model::sanitize_trigger_reason(run.trigger_reason.as_deref()) {
+        description.push_str(&format!("\nTrigger: {reason}"));
+    }
     let mut payload = json!({
         "embeds": [{
             "title": format!("{} started", run.project),
             "color": 0x3498DB,
-            "description": format!(
-                "{} `{}` — {}",
-                repo.map(|r| format!("{r} ")).unwrap_or_default(),
-                &run.sha[..run.sha.len().min(7)],
-                truncate(&run.subject, 200)
-            ),
+            "description": description,
         }],
         "allowed_mentions": { "parse": [] },
     });
@@ -200,6 +204,13 @@ pub(crate) fn finish_payload_with_options(
         json!({ "name": "Result", "value": status_text, "inline": true }),
         json!({ "name": "Duration", "value": format!("{}s", run.duration_secs()), "inline": true }),
     ];
+    if let Some(reason) = crate::model::sanitize_trigger_reason(run.trigger_reason.as_deref()) {
+        fields.push(json!({
+            "name": "Trigger",
+            "value": truncate(&reason, MAX_FIELD),
+            "inline": false,
+        }));
+    }
     let highlight = run
         .failed()
         .or_else(|| run.steps.iter().find(|s| s.status == StepStatus::Cancelled));
@@ -751,5 +762,50 @@ mod tests {
         let content = payload["content"].as_str().expect("content");
         assert_eq!(content.chars().count(), MAX_CONTENT);
         assert!(content.ends_with('…'));
+    }
+
+    #[test]
+    fn start_and_finish_embeds_include_trigger_reason_only_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut run = failed_run();
+
+        let start_without = start_payload(&run, Some("owner/demo"), None);
+        assert!(
+            !start_without["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Trigger:"),
+            "{start_without}"
+        );
+        let finish_without = finish_payload(&run, Some("owner/demo"), dir.path());
+        assert!(
+            !finish_without["embeds"][0]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["name"] == "Trigger"),
+            "{finish_without}"
+        );
+
+        run.trigger_reason = Some("GitHub PR #42 opened by octocat".into());
+        let start_with = start_payload(&run, Some("owner/demo"), None);
+        assert!(
+            start_with["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("\nTrigger: GitHub PR #42 opened by octocat"),
+            "{start_with}"
+        );
+        let finish_with = finish_payload(&run, Some("owner/demo"), dir.path());
+        assert!(
+            finish_with["embeds"][0]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["name"] == "Trigger"
+                    && f["value"] == "GitHub PR #42 opened by octocat"
+                    && f["inline"] == false),
+            "{finish_with}"
+        );
     }
 }

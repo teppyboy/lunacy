@@ -1,230 +1,410 @@
+<div align="center">
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
-  <img alt="Lunacy" src="assets/logo-light.svg" width="64">
+  <img alt="Lunacy" src="assets/logo.svg" width="88">
 </picture>
 
-# Lunacy
+<h1>Lunacy</h1>
 
-A small local CI/deploy daemon. It polls a git remote, runs a pipeline for each
-new commit, and reports the result to GitHub and Discord. It replaces per-repo
-shell scripts, timers and webhook workers with one binary and one config file.
+<p><strong>Self-hosted local CI/CD daemon and real-time desktop/web UI built in Rust.</strong></p>
 
-Runs on Linux, macOS and Windows. No OpenSSL: TLS is pure Rust (`rustls`).
+<p>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2021-orange?logo=rust&logoColor=white" alt="Rust"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/License-MIT-blue" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/Platforms-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows%20%C2%B7%20Web-4c566a" alt="Platforms: Linux, macOS, Windows, Web">
+  <a href="https://github.com/teppyboy/lunacy/releases/tag/prerelease"><img src="https://img.shields.io/github/v/release/teppyboy/lunacy?include_prereleases&label=Pre-release&color=2ea043" alt="Pre-release downloads"></a>
+</p>
 
-## What it does
+<p>
+  <a href="#features">Features</a> &middot;
+  <a href="#architecture">Architecture</a> &middot;
+  <a href="#quick-start">Quick Start</a> &middot;
+  <a href="#configuration">Configuration</a> &middot;
+  <a href="#platform--service-guides">Platform Guides</a> &middot;
+  <a href="#desktop--web-ui">Desktop &amp; Web UI</a> &middot;
+  <a href="#documentation">Documentation</a>
+</p>
 
-For every `[[project]]`:
+</div>
 
-1. `git fetch <remote> <branch>` on an interval (default 300 s).
-2. If the upstream sha differs from the last processed sha, run the pipeline.
-3. Run `ci` steps in order. If one fails, the rest of CI and all of `deploy` are
-   recorded `skipped`.
-4. Run `deploy` steps only when CI passed.
-5. Report each phase to GitHub (commit status or check run) and Discord.
-6. Persist the run and per-step logs under `state_dir`, and advance the
-   last processed sha **whether the pipeline passed or failed**, so a broken
-   commit is not retried every poll. Use `lunacy once --force` to re-run it.
+---
 
-Projects are independent: one thread each, never two pipelines for the same
-project at once, and one project's failure never stops the daemon.
+Lunacy watches your Git repositories via GitHub webhooks and/or polling, runs CI pipelines using [nektos/act](https://github.com/nektos/act) and shell commands, deploys on matching branches or tags, and reports live status back to GitHub and Discord. One daemon binary (`lunacy`), one strict TOML config file, pure-Rust TLS (`rustls`, no OpenSSL), and an optional native + WebGPU UI (`lunacy-ui`) that streams logs over WebSockets.
 
-Two kinds of step:
+## Features
 
-- `kind = "shell"` (default) — your own command, e.g. the repo's deploy script.
-- `kind = "act"` — a job from a GitHub Actions workflow, run by
-  [nektos/act](https://github.com/nektos/act). Lunacy clones the commit into
-  `state_dir/checkouts/<run id>/repo`, writes `event.json`, streams act's
-  `--json` output into per-step substeps (visible in the API, the GitHub summary
-  and Discord), and serialises act across projects with a machine-wide lock.
+### Instant Triggers & Safe PR Builds
+- **Webhooks + polling (`trigger_mode`):** Choose `"both"` (default), `"webhook"` (event-driven, `poll_interval = 0` allowed), or `"poll"` globally or per project. Incoming `POST /api/github/webhook` requests are HMAC-SHA256 verified (`X-Hub-Signature-256`) with delivery counters and last-delivery details exposed in the API and UI.
+- **Fork-safe PR CI (`watch_prs`):** Automatically discovers and tests open pull requests on `opened`, `synchronize`, and `reopened` events or periodic polls. PRs always execute in isolated git worktrees and skip all deploy steps.
+- **Branch & tag deploy gating (`deploy_refs`, `watch_tags`):** Restrict deploys to specific branch or tag globs such as `["master", "release/*", "tags/v*"]`, or leave empty to deploy only the project's default branch.
 
-Every step of the run sees that clone's path as `LUNACY_CI_DIR` (unset when no
-act step ran). act runs with `--bind`, so files a CI job writes into the clone
-are still there for a later deploy step — that is how a deploy publishes the
-`build/web` the CI job produced without running act twice. The clone is removed
-when the pipeline ends. act's container can leave root-owned files behind; the
-cleanup then only logs a warning, and you remove the directory with `sudo rm -rf`.
+### Execution, Retries & Control
+- **`act` + shell pipelines & configurable concurrency:** Mix GitHub Actions jobs (`kind = "act"`) and shell commands (`kind = "shell"`) across `ci` and `deploy` phases. Control parallelism with `general.max_concurrent_runs` (daemon-wide, default `1`, hot-reloads), `act.max_concurrent` (multi-slot `flock(2)` pool with per-slot action/BoltDB cache dirs and ephemeral `--artifact-server-port`), and `project.max_concurrent_runs` (`> 1` requires `checkout = "worktree"` or `"none"`, with per-project deploy serialization and suffixed project cache volumes).
+- **Shared build handoff (`LUNACY_CI_DIR`):** The first `act` step clones the commit into a run-scoped checkout with `--bind`; every later step receives `LUNACY_CI_DIR` along with `LUNACY_SHA`, `LUNACY_BRANCH`, `LUNACY_REF`, `LUNACY_PROJECT`, `LUNACY_WORKDIR`, `LUNACY_RUN_ID`, and `LUNACY_PR_NUMBER`, so deploy steps can publish CI build outputs without re-running `act`.
+- **Host OS filtering (`only_on`):** Restrict steps to `["linux"]`, `["windows"]`, or `["macos"]`. Steps excluded on the current host are recorded as `skipped` instead of failing CI, letting one config file serve multiple machines.
+- **Timeouts, cancellation & recovery:** Configure step timeouts (`general.step_timeout`, `project.step_timeout`, `step.timeout`) and total pipeline deadlines (`project.timeout`). Active runs support full process-tree cancellation, and any run left in `running` state after a daemon crash is automatically reconciled to `cancelled` on startup.
+- **Force deploy & one-click retries:** Trigger **Force deploy** for a project or a specific historical run (skipping CI unless an active deploy step references `LUNACY_CI_DIR`), re-run failed or finished pipelines from the UI (**Retry** / **Re-run**), or trigger **Retry CI**, **Retry Deploy**, and **Retry All** directly from native GitHub Check Run action buttons.
 
-`[act] lock_file` points the act lock at the file a manual `make ci` also uses.
-`fs2`'s `lock_exclusive` is `flock(2)`, the same lock the `flock` CLI takes, so
-Lunacy and lunarum's `scripts/with-act-lock.sh` never run act at the same time.
+### Aggressive Build Caching
+- **Enabled by default (`[act] cache = true`):** Persists `act`'s new action cache (`--use-new-action-cache`, `--action-cache-path`, `--action-offline-mode`) and local cache server (`--cache-server-path`) under `act.cache_dir` (default `<state_dir>/cache`).
+- **Docker build volumes & BuildKit:** Mounts shared toolchain cache volumes (`cargo`, `rustup`, `pub`, `dart-server`, `npm`, `pnpm`, `go`, `pip`, `uv`, `ccache`) plus per-project volumes (`lunacy-cache-<slug>-cargo-target`, `lunacy-cache-<slug>-build`), sets `DOCKER_BUILDKIT=1` and `LUNACY_CACHE_DIR`, and appends `--pull=false` when mapped images already exist locally.
+- **One-click cache cleanup:** Clear all caches (`POST /api/cache/clear`) or a single project's disk and Docker volume caches (`POST /api/projects/{name}/cache/clear`) from the API or Settings UI.
 
-## Install
+### GitHub & Per-Repo Discord Reporting
+- **GitHub Check Runs & Commit Statuses:** Post rich GitHub App Check Runs (`mode = "checks"`, default contexts `lunacy/ci` and `lunacy/deploy`) with live substep tables, failure log tails, `details_url` deep links (`#/runs/{id}`), and retry action buttons — or classic commit statuses (`mode = "status"`) with a PAT.
+- **Global & per-repo Discord webhooks:** Configure embeds globally under `[discord]` or override per project with `discord_enabled`, `discord_webhook_url` / `discord_webhook_url_file`, `notify_on_start`, `discord_notify_on` (`"all"` | `"failures"`), `discord_username`, and `discord_mention_on_failure` (mentions users/roles only, never `@everyone`). Includes an SSRF-safe test button (`POST /api/discord/test`) that only targets saved config URLs and never follows redirects.
+- **Per-repo overrides & pausing:** Pause automatic polling and webhooks with `enabled = false` (manual triggers still work), toggle `github_enabled`, and override `contexts`, `shell`, `platforms`, `cache`, and `act_args` per project.
+
+### Real-Time Desktop & Web UI (`lunacy-ui`)
+- **Single Rune codebase, four targets:** Runs natively on Linux, macOS, and Windows (GUI subsystem with platform app icons) and compiles to a static WebGPU WASM bundle served directly by `lunacy` at `[server] web_root`.
+- **WebSocket streaming with HTTP fallback:** Streams live project states, run updates, step logs, config reloads, and incoming webhook events over `GET /api/ws` (Axum + Tokio) and falls back cleanly to HTTP polling if needed.
+- **Inspectable `act` logs & themes:** View `act` runs as expandable per-substep accordions (`Steps` | `Raw` toggle) with line-wrap (`Alt+Z`), switch between System, Light, Dark, and pure-black OLED themes, step discrete UI zoom (`90%`–`150%`), run offline pre-flight **Deploy Checks**, and edit `config.toml` live with comment preservation (`toml_edit`), masked secrets, and `*_file` secret support.
+- **Persistent settings & desktop auto-updater:** Persists local UI settings across restarts on both desktop (`prefs.json`) and web (`localStorage`), and checks rolling GitHub `prerelease` archives with `SHA256SUMS.txt` verification and atomic binary swap on Linux and Windows.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  GH["GitHub (Webhooks & REST API)"]
+  DC["Discord Webhooks"]
+  UI["lunacy-ui (Desktop & WebGPU WASM)"]
+
+  subgraph Daemon["lunacy daemon"]
+    API["Axum HTTP + WS API (/api/*, /api/ws)"]
+    Router["Webhook & Poll Router"]
+    Workers["Per-Project Workers"]
+    Runner["Pipeline Runner (act + shell)"]
+    Cache["act Lock, Disk Cache & Docker Volumes"]
+    Store["State Store (runs, logs, config.toml)"]
+  end
+
+  GH -- "POST /api/github/webhook (HMAC-SHA256)" --> API
+  API --> Router
+  Router --> Workers
+  Workers -- "git fetch / PR & tag checks" --> GH
+  Workers --> Runner
+  Runner --> Cache
+  Runner --> Store
+  Runner -- "Check Runs / Commit Statuses" --> GH
+  Runner -- "Embeds (start / outcome)" --> DC
+  API <--> Store
+  UI <== "WebSocket (/api/ws) + REST" ==> API
+```
+
+## Quick Start
+
+### Option 1: Download Pre-release Binaries
+
+Rolling builds for **Linux (`x86_64`)**, **Windows (`x86_64`)**, and the **Web WASM bundle** are published to the [`prerelease`](https://github.com/teppyboy/lunacy/releases/tag/prerelease) release with `SHA256SUMS.txt`:
+
+| Target | Archive | Contents |
+| --- | --- | --- |
+| Linux `x86_64` | `lunacy-linux-x86_64.tar.gz` | `lunacy`, `lunacy-ui`, `web/`, `config.example.toml`, `README.md`, `contrib/lunacy.service`, `contrib/lunacy.desktop`, `icons/` |
+| Windows `x86_64` | `lunacy-windows-x86_64.zip` | `lunacy.exe`, `lunacy-ui.exe`, `web/`, `config.example.toml`, `README.md` |
+| Web (`wasm32`) | `lunacy-web.tar.gz` | Static WebGPU UI files (`ui/dist/`) for `[server] web_root` |
+
+> macOS pre-built archives are not published yet; build from source below.
+
+### Option 2: Build from Source
 
 ```bash
-cargo build --release      # target/release/lunacy
-cargo test
+# 1. Build the daemon binary -> target/release/lunacy
+cargo build --release --locked
+cargo test --locked
+
+# 2. (Optional) Build the native desktop UI -> ui/target/release/lunacy-ui
+cargo build --manifest-path ui/Cargo.toml --release --locked --bin lunacy-ui
+
+# 3. (Optional) Build the static WebGPU WASM UI -> ui/dist/
+./ui/build-web.sh
 ```
 
-Copy `config.example.toml` to `config.toml` (git-ignored) and edit it.
+See [`ui/README.md`](ui/README.md) for Rune and `wasm-bindgen-cli` prerequisites.
+
+### Configure & Run
+
+Copy [`config.example.toml`](config.example.toml) to `config.toml` (git-ignored) and edit it for your repositories:
 
 ```bash
-lunacy check -c config.toml                 # validate, list projects
-lunacy once   -c config.toml lunarum        # run one pipeline now
-lunacy once   -c config.toml lunarum --force  # even if the sha was processed
-lunacy run    -c config.toml                # the daemon
+cp config.example.toml config.toml
+
+# Validate syntax, strict keys, secret files, and print resolved project pipelines
+lunacy check -c config.toml
+
+# Run a single project pipeline once (uses latest upstream commit by default)
+lunacy once -c config.toml my-app
+lunacy once -c config.toml my-app --force
+lunacy once -c config.toml my-app --sha <commit-sha> --force --reason "re-test release"
+
+# Start the daemon (and HTTP/WebSocket API + Web UI when [server] is configured)
+lunacy run -c config.toml
 ```
 
-`lunacy run` serves the HTTP API when `[server]` is present (see
-[`docs/api.md`](docs/api.md)); the optional Rune UI in `ui/` is served from
-`web_root` or built natively as `lunacy-ui`.
+Pass `--log-level <trace|debug|info|warn|error|off>` to any subcommand to override `general.log_level`.
 
-For desktop app launchers and bundles:
+`lunacy` advances each project's last-processed SHA after a run finishes (pass or fail) so broken commits are not retried in an infinite poll loop; re-run manually with `lunacy once --force`, the UI **Retry** / **Run now** buttons, or GitHub's **Re-run** / **Retry CI** check actions.
 
-- Linux: install [`contrib/lunacy.desktop`](contrib/lunacy.desktop) into
-  `~/.local/share/applications/` and copy `icons/hicolor/` from a release archive
-  into `~/.local/share/icons/hicolor/` (or from source, install
-  `assets/icons/lunacy.svg` to `~/.local/share/icons/hicolor/scalable/apps/lunacy.svg`
-  and `assets/icons/lunacy-<size>.png` to
-  `~/.local/share/icons/hicolor/<size>x<size>/apps/lunacy.png`).
-- macOS: assemble `Lunacy.app` with [`contrib/macos/Info.plist`](contrib/macos/Info.plist),
-  `lunacy-ui`, and [`assets/icons/lunacy.icns`](assets/icons/lunacy.icns).
+## Configuration
 
-Config is strict: unknown keys are a hard error, so a typo fails `lunacy check`
-instead of being silently ignored. Secrets may live in the file; the API masks
-them (`"********"`) and a `PUT /api/config` that echoes the mask keeps the
-stored value. A secret can also come from a file, which is read (and trimmed) at
-load and kept out of the config: `github.token_file`,
-`github.app.webhook_secret_file`, `discord.webhook_url_file` and
-`server.token_file`. Setting both the inline value and its `_file` is a
-validation error; `~/` is expanded in every path. Only the file *paths* appear in
-the API's Config JSON — the values never do.
+Config validation is strict (`deny_unknown_fields`), so typos fail `lunacy check` and `PUT /api/config` instead of being silently ignored. Every secret can be placed inline or loaded from a separate file (`*_file`, trimmed on load, `~/` expanded, mutually exclusive with the inline key):
 
-## Windows host
+- `server.token` / `server.token_file`
+- `github.token` / `github.token_file`
+- `github.webhook_secret` / `github.webhook_secret_file`
+- `github.app.private_key` / `github.app.private_key_path`
+- `github.app.webhook_secret` / `github.app.webhook_secret_file`
+- `discord.webhook_url` / `discord.webhook_url_file`
+- `project.discord_webhook_url` / `project.discord_webhook_url_file`
 
-act is a Linux-first tool, so a Windows host needs a little care. Lunacy handles
-the common cases:
+The API masks inline secrets as `"********"` (echoing the mask on `PUT /api/config` preserves the stored secret) and never exposes secret file contents. Live edits preserve comments via `toml_edit`, write atomically with a `config.toml.bak` backup, and hot-reload idle project workers.
 
-- **Self-hosted jobs run natively.** On Windows, `windows-latest`,
-  `windows-2022` and `windows-2025` default to act's `-self-hosted` platform,
-  so those jobs run on the host instead of inside a Linux container. Override
-  this with `[act] platforms`, a project's `platforms`, or a step's `platforms`
-  (later wins). On macOS the same happens for `macos-latest`, `macos-14` and
-  `macos-15`. On Linux there is no default for `windows-*`/`macos-*`, because
-  those jobs cannot run there.
-- **`[act] native_command` for self-hosted jobs.** If `[act] command` is the WSL
-  form (`["wsl.exe", "-e", "act"]`), self-hosted jobs still use
-  `native_command` (default `["act"]`), because WSL is Linux and cannot be
-  self-hosted. Lunacy decides per step by reading the workflow YAML and the
-  job's `runs-on`.
-- **WSL path translation.** In WSL mode, Lunacy rewrites `C:\...` to
-  `/mnt/c/...` for `-W`, `-e`, `--secret-file`, `--var-file`,
-  `--artifact-server-path`, `-C` and `--flag=<path>` forms.
-- **`only_on`** marks a step as host-specific:
+```toml
+[general]
+poll_interval = 300
+trigger_mode = "both"          # both | webhook | poll
+step_timeout = 3600            # default per-step timeout (seconds)
+max_concurrent_runs = 1        # daemon-wide concurrent pipelines (hot-reloads)
+log_level = "info"
 
-  ```toml
-  [[project.ci]]
-  name = "Windows build"
-  kind = "act"
-  workflow = ".github/workflows/flutter-ci.yml"
-  job = "windows"
-  only_on = ["windows"]
-  ```
+[server]
+listen = "127.0.0.1:7878"
+token_file = "~/.config/lunacy/api-token"
+web_root = "ui/dist"
+public_url = "https://ci.example.com"
 
-  On any other host the step is recorded `skipped`, not `failed`: CI still
-  passes, and the skip shows up in the API, the GitHub summary and Discord.
-  Values are `"linux"`, `"windows"`, `"macos"`.
-- **Artifacts work.** Every act step gets
-  `--artifact-server-path <state_dir>/artifacts/<run id>`, so
-  `actions/upload-artifact@v4` succeeds. Retrieve the files from that directory.
-- **Shell default** is `["cmd", "/C"]` on Windows, `["bash", "-c"]` elsewhere.
-  Override globally with `[general] shell`, per project, or per step — e.g.
-  `shell = ["pwsh", "-NoProfile", "-Command"]`.
+[github]
+mode = "checks"                # checks (GitHub App) | status (PAT)
+webhook_secret_file = "~/.config/lunacy/webhook-secret"
 
-Prerequisites for a Windows host running the sample `windows` job: Git,
-Node.js, Flutter 3.47.8, and Visual Studio 2022 Build Tools with the
-"Desktop development with C++" workload. A `shell` step that runs a repository's
-deploy script still needs whatever that script needs.
+[github.app]
+app_id = 123456
+private_key_path = "~/.config/lunacy/github-app.pem"
 
-## Running it as a service
+[discord]
+webhook_url_file = "~/.config/lunacy/discord-webhook"
+notify_on_start = false
+notify_on = "failures"         # all | failures
+username = "lunacy"
+mention_on_failure = "<@&1234567890>"
 
-- Linux (systemd): [`contrib/lunacy.service`](contrib/lunacy.service)
-- macOS (launchd): [`contrib/dev.lunacy.plist`](contrib/dev.lunacy.plist)
-- Windows: `sc.exe create lunacy binPath= "C:\path\lunacy.exe run -c C:\path\config.toml" start= auto`
-  (or run it from Task Scheduler at logon).
+[act]
+platforms = { "ubuntu-latest" = "catthehacker/ubuntu:act-latest" }
+lock_file = "~/.local/state/act-gate.lock"
+max_concurrent = 1             # defaults to general.max_concurrent_runs (hot-reloads)
+cache = true                   # persists action cache, cache server & Docker volumes
 
-## GitHub reporting
+[[project]]
+name = "web-app"
+repo_path = "/srv/repos/web-app"
+remote = "origin"
+branch = "main"
+github_repo = "org/web-app"
+checkout = "none"              # none | worktree | in-place
+trigger_mode = "both"
+watch_prs = true               # CI-only PR builds in isolated worktrees
+deploy_refs = ["main", "tags/v*"]
+watch_tags = true
+timeout = 7200                 # total pipeline timeout (seconds)
+max_concurrent_runs = 1        # > 1 requires checkout = "worktree" or "none" (deploys serialize)
+discord_notify_on = "all"
 
-`[github] mode = "status"` posts classic commit statuses (a PAT is enough).
-`mode = "checks"` posts check runs named `lunacy/ci` and `lunacy/deploy`, with a
-live-updating step table and the tail of the failing log; the Checks API only
-accepts a GitHub App installation token, so it needs `[github.app]`.
+[[project.ci]]
+name = "Build & Test"
+kind = "act"
+workflow = ".github/workflows/ci.yml"
+job = "build"
+event = "push"
+timeout = 3600
 
-Setting up the App once:
+[[project.ci]]
+name = "Windows Build"
+kind = "act"
+workflow = ".github/workflows/ci.yml"
+job = "windows"
+only_on = ["windows"]          # skipped on Linux/macOS without failing CI
 
-1. GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App**.
-2. Permissions: **Checks: read & write**, **Commit statuses: read & write**,
-   **Contents: read**, **Metadata: read**. Subscribe to the **Check run** and
-   **Check suite** events.
-3. Webhook URL: `http://<host>:<port>/api/github/webhook` (the `[server] listen`
-   address). Set a webhook secret and put the same string in
-   `[github.app] webhook_secret`.
-4. Generate a private key, save it, and point `private_key_path` at it.
-5. Install the App on the repositories, then put `app_id` in the config.
-   `installation_id` is looked up automatically when omitted.
-
-The webhook is what makes GitHub's **Re-run** button work: Lunacy verifies
-`X-Hub-Signature-256`, then queues the run for every project whose
-`github_repo` matches. `public_url` is used for the check run's `details_url`,
-which can link back into the UI (`#/runs/{id}`).
-
-## Discord
-
-Set `[discord] webhook_url` for a global default, or
-`discord_webhook_url` per project. Messages are embeds: start (optional), then
-the outcome with a per-step table and the tail of the failing log. Reporting
-failures are logged and never fail the pipeline.
-
-## Mapping to the two repos it replaces
-
-`config.example.toml` is wired for both:
-
-- **lunarum** — CI is the `web` job of `.github/workflows/local-deploy-ci.yml`
-  under act; a second act step builds the `windows` job of `flutter-ci.yml`
-  with `only_on = ["windows"]`. That job runs with `--bind`, so it leaves
-  `build/web` in `LUNACY_CI_DIR` for the deploy step: publishing can rsync
-  `$LUNACY_CI_DIR/build/web/` into the live checkout and recreate the container
-  instead of running act again. Deploy runs `scripts/local-web-deploy.sh`,
-  which still keeps its own fetch/act/health-check logic and health endpoint
-  `127.0.0.1:47831`. Set `[act] lock_file = "~/.local/state/act-gate.lock"` so
-  Lunacy and the script's `with-act-lock.sh` share one lock.
-- **frostedge** — CI is the `validate` job of `.github/workflows/rust.yml`
-  under act, with the runner image pinned by digest exactly like
-  `scripts/ci-act.sh`. Its commit-message check walks `before..after`, so
-  `event.json` carries the last processed sha as `before` when that is an
-  ancestor of the target, else the target's first parent, and only zeros for a
-  root commit — a zero `before` would make the check walk the whole history. Deploy runs `scripts/deploy-local.sh`, which still does
-  its own dirty-worktree check, fast-forward and health check on
-  `127.0.0.1:47830`.
-
-Both use `checkout = "none"`: the deploy scripts operate on the live checkout
-themselves, and act steps clone the commit into a temporary directory, so
-Lunacy must not move `HEAD` under them. Use `checkout = "worktree"` for a
-throwaway checkout at the commit, or `"in-place"` to check the commit out in
-`repo_path` (it refuses to touch a dirty worktree).
-
-Notes on what Lunacy does *not* take over from the old scripts:
-`scripts/ci-act.sh` additionally picks free loopback ports per run, sweeps
-leftover `act-Rust-CI-*` containers, injects `RUST_TEST_NOCAPTURE`, and tees a
-kept log; Lunacy uses the fixed `vars` in the example plus its own `timeout`.
-Both repos' deploy scripts send their own Discord notification, so set
-`discord_webhook_url = ""` if you want only Lunacy's message.
-
-## Layout
-
+[[project.deploy]]
+name = "Publish"
+kind = "shell"
+run = """
+rsync -a --delete "$LUNACY_CI_DIR/dist/" ./dist/
+docker compose up -d --force-recreate web
+"""
+timeout = 900
 ```
-src/config.rs      config types, validation, secret masking, OS/shell defaults
-src/configfile.rs  comment-preserving TOML writes (toml_edit + atomic rename)
-src/exec.rs        child processes, line streaming, timeout kill per platform
-src/git.rs         fetch/rev-parse/worktree/clone helpers
-src/act.rs         act platform maps, self-hosted detection, WSL, --json parsing
-src/pipeline.rs    checkout, step loop, act steps, reporting hooks
-src/report.rs      GitHub statuses + check runs (App JWT, token cache)
-src/github_app.rs  RS256 JWT and installation-token cache
-src/discord.rs     Discord embeds
-src/daemon.rs      per-project workers, polling, config reload
-src/api.rs         tiny_http JSON API + static UI
-src/model.rs       Run/Step model, state files, log tailing
-docs/api.md        HTTP API contract
-docs/act.md        the act --json lines Lunacy parses
+
+See [`config.example.toml`](config.example.toml) for a complete, heavily annotated reference including self-CI and rolling pre-release configuration.
+
+## Platform & Service Guides
+
+<details>
+<summary><strong>Linux (systemd service, desktop launcher &amp; icons)</strong></summary>
+
+#### Run `lunacy` as a `systemd` user service
+
+Copy [`contrib/lunacy.service`](contrib/lunacy.service) to `~/.config/systemd/user/lunacy.service`, adjust paths if needed, and enable it:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/lunacy.service ~/.config/systemd/user/lunacy.service
+systemctl --user daemon-reload
+systemctl --user enable --now lunacy
+journalctl --user -u lunacy -f
+
+# Keep the user daemon running after logout
+loginctl enable-linger "$USER"
 ```
+
+If you use `act`, ensure your user is in the `docker` group so it can access the Docker socket.
+
+#### Desktop entry & icons for `lunacy-ui`
+
+Install [`contrib/lunacy.desktop`](contrib/lunacy.desktop) and the hicolor icon set:
+
+```bash
+install -Dm644 contrib/lunacy.desktop ~/.local/share/applications/lunacy.desktop
+
+# From a release archive:
+cp -r icons/hicolor/* ~/.local/share/icons/hicolor/
+
+# Or directly from source:
+install -Dm644 assets/icons/lunacy.svg ~/.local/share/icons/hicolor/scalable/apps/lunacy.svg
+for sz in 16 32 48 64 128 256 512; do
+  install -Dm644 "assets/icons/lunacy-${sz}.png" \
+    "$HOME/.local/share/icons/hicolor/${sz}x${sz}/apps/lunacy.png"
+done
+```
+
+</details>
+
+<details>
+<summary><strong>macOS (launchd agent &amp; Lunacy.app bundle)</strong></summary>
+
+#### Run `lunacy` via `launchd`
+
+Copy [`contrib/dev.lunacy.plist`](contrib/dev.lunacy.plist) to `~/Library/LaunchAgents/`, replace `/Users/REPLACE` with your home directory, and load it:
+
+```bash
+cp contrib/dev.lunacy.plist ~/Library/LaunchAgents/dev.lunacy.plist
+# Edit paths in ~/Library/LaunchAgents/dev.lunacy.plist
+launchctl load -w ~/Library/LaunchAgents/dev.lunacy.plist
+tail -f ~/Library/Logs/lunacy.log
+```
+
+On macOS, `macos-latest`, `macos-14`, and `macos-15` default to `act`'s `-self-hosted` platform so macOS jobs run directly on the host. On Apple Silicon, pass `--container-architecture linux/amd64` in `[act] args` when an image or action requires amd64.
+
+#### Assemble `Lunacy.app`
+
+```bash
+mkdir -p Lunacy.app/Contents/MacOS Lunacy.app/Contents/Resources
+cp ui/target/release/lunacy-ui Lunacy.app/Contents/MacOS/lunacy-ui
+cp assets/icons/lunacy.icns Lunacy.app/Contents/Resources/lunacy.icns
+cp contrib/macos/Info.plist Lunacy.app/Contents/Info.plist
+```
+
+</details>
+
+<details>
+<summary><strong>Windows (native host, WSL path translation, services &amp; UI)</strong></summary>
+
+- **Self-hosted Windows jobs:** On Windows, `windows-latest`, `windows-2022`, and `windows-2025` automatically map to `-self-hosted` so jobs run natively on the host rather than inside a Linux container. Override per `[act]`, project, or step with `platforms`.
+- **WSL mode & path translation:** If an `ubuntu-*` workflow hits `act` Windows path issues (`nektos/act#2645`), set `[act] command = ["wsl.exe", "-e", "act"]`. Lunacy rewrites `C:\...` paths to `/mnt/c/...` automatically, while self-hosted Windows jobs still invoke `[act] native_command` (default `["act"]`).
+- **Host-specific steps & shells:** Use `only_on = ["windows"]` for Windows-only steps. Shell steps default to `["cmd", "/C"]` on Windows; override globally, per project, or per step with `shell = ["pwsh", "-NoProfile", "-Command"]` or Git Bash.
+- **Artifacts:** Every `act` step receives `--artifact-server-path <state_dir>/artifacts/<run_id>` so `actions/upload-artifact@v4` works out of the box.
+- **Desktop app & background service:** `lunacy-ui.exe` builds with `windows_subsystem = "windows"` and embedded multi-resolution icons (`assets/icons/lunacy.ico`). To run the daemon on boot, register it with Task Scheduler or Windows Services:
+
+```powershell
+sc.exe create lunacy binPath= "C:\path\to\lunacy.exe run -c C:\path\to\config.toml" start= auto
+```
+
+</details>
+
+<details>
+<summary><strong>GitHub App &amp; Webhook Setup</strong></summary>
+
+Lunacy exposes `POST /api/github/webhook` whenever `[github] webhook_secret` (or `webhook_secret_file`) or `[github.app] webhook_secret` (or `webhook_secret_file`) is configured. No bearer token is required on this route; every payload is verified against `X-Hub-Signature-256`.
+
+#### Standalone Repo Webhook (Commit Statuses or Trigger-Only)
+1. In your repository, go to **Settings → Webhooks → Add webhook**.
+2. Set **Payload URL** to `https://<your-host>/api/github/webhook` and **Content type** to `application/json`.
+3. Generate a secret and save it to `[github] webhook_secret` or `webhook_secret_file`.
+4. Subscribe to **Pushes** and **Pull requests** (for `watch_prs = true`).
+
+#### GitHub App (Rich Check Runs + Retry Action Buttons)
+1. Go to **GitHub → Settings → Developer settings → GitHub Apps → New GitHub App**.
+2. Grant permissions:
+   - **Checks:** Read & write
+   - **Commit statuses:** Read & write
+   - **Contents:** Read
+   - **Metadata:** Read
+   - **Pull requests:** Read (for `watch_prs` / PR triggers)
+3. Subscribe to events: **`push`**, **`pull_request`**, **`check_run`**, and **`check_suite`**.
+4. Set **Webhook URL** to `https://<your-host>/api/github/webhook` and put the same secret in `[github.app] webhook_secret` (or `webhook_secret_file`).
+5. Generate a private key, save the `.pem` file, and set `app_id` and `private_key_path` under `[github.app]`. Install the App on your repositories (`installation_id` is auto-discovered if omitted).
+6. Set `[server] public_url` so Check Run **Details** links open directly to `#/runs/{id}` in the web UI.
+
+When a CI or deploy phase fails, times out, or is cancelled, Lunacy attaches native GitHub Check Run action buttons (**Retry CI** on CI checks; **Retry Deploy** and **Retry All** on deploy checks) that dispatch back to `POST /api/github/webhook`.
+
+</details>
+
+## Desktop & Web UI
+
+`lunacy-ui` is a Rune client that compiles from a single view tree to native desktop binaries (Linux, macOS, Windows) and a static WebGPU WASM web app (`ui/dist/`).
+
+- **Screens:** **Projects** overview (live status, PR indicators, paused badges, Run now / Cancel), **Project** detail (current run steps, trigger source & reason badges, Force deploy, open PRs, run history with Retry), **Run** detail (trigger source & reason header, expandable `Steps | Raw` `act` substep accordion, live streaming logs, Cancel / Retry / Force deploy, GitHub links), and **Settings** (live `config.toml` editor across General / Server / GitHub / Discord / act / Projects, offline pre-flight **Deploy Checks**, **Diagnostics**, **Connection**, and **Appearance**).
+- **Themes & Zoom:** Neutral **System**, **Light**, **Dark**, and pure-black **OLED** themes plus discrete UI zoom stops (`90%`, `100%`, `110%`, `125%`, `150%`, or responsive auto).
+- **Keyboard Shortcuts:**
+  - `Cmd/Ctrl + S` — Save daemon config on config pages, or save & reconnect on **Settings → Connection** (`Enter` in Server URL / Token fields also saves & reconnects)
+  - `Cmd/Ctrl + R` — Refresh and reconnect using the active connection
+  - `Cmd/Ctrl + ,` — Open Settings
+  - `Cmd/Ctrl + =` / `-` / `0` — Zoom in / out / reset
+  - `Alt + Z` — Toggle log line wrap on the Run screen
+  - `Esc` — Close open drawer/dialog, or navigate back
+- **Local Settings Persistence:** Server URL, Bearer token, Theme, UI zoom, Log line wrap, `Steps | Raw` log mode, and desktop auto-update check preference are persisted across restarts in `prefs.json` on desktop (`~/.config/lunacy/prefs.json` with `0o600` permissions inside a `0o700` app directory on Linux/Unix, `~/Library/Application Support/lunacy/prefs.json` on macOS, `%APPDATA%\lunacy\prefs.json` on Windows; respects `RUNE_DIRS_ROOT` and `RUNE_PREFS_DIR`) and `localStorage` on web.
+  - **Connection precedence:** `LUNACY_SERVER` / `LUNACY_TOKEN` env vars &gt; `--server` / `--token` CLI flags &gt; saved local settings &gt; defaults (`http://127.0.0.1:7878` on desktop, page origin on web).
+- **Desktop Auto-Updater:** On Linux (`x86_64`) and Windows (`x86_64`), checks the rolling GitHub `prerelease` tag on startup (configurable in **Settings → Appearance**), verifies downloads against `SHA256SUMS.txt`, atomically swaps the binary, and prompts to relaunch.
+
+See [`ui/README.md`](ui/README.md) for full UI build, mock server, screenshot, and E2E testing instructions.
+
+## Project Layout
+
+```text
+.
+├── src/
+│   ├── bin/lunacy.rs     CLI entrypoint (`check`, `once`, `run`)
+│   ├── api.rs            Axum HTTP API, GitHub webhooks, Discord test & static UI
+│   ├── ws.rs             Real-time WebSocket broadcaster & client session handler
+│   ├── daemon.rs         Per-project worker threads, polling, PR/tag watchers, reload
+│   ├── pipeline.rs       Checkout/worktree isolation, step execution, env & hooks
+│   ├── act.rs            act invocation, platform maps, WSL translation, caching, --json parser
+│   ├── exec.rs           Cross-platform process-tree spawning, streaming & timeouts
+│   ├── git.rs            git fetch, rev-parse, worktree & clone helpers
+│   ├── config.rs         Strict TOML schema, validation, secret masking & defaults
+│   ├── configfile.rs     Comment-preserving TOML writes (`toml_edit` + atomic rename)
+│   ├── deploy_check.rs   Offline pre-flight deploy readiness diagnostics
+│   ├── report.rs         GitHub Check Runs (with retry actions) & commit statuses
+│   ├── github_app.rs     RS256 JWT signing & installation-token cache
+│   ├── discord.rs        Discord embed formatting & webhook delivery
+│   └── model.rs          Run/Step/Substep models, state persistence & log tailing
+├── ui/                   Rune native & WebGPU WASM client (`lunacy-ui`)
+├── assets/               Brand SVGs (`logo*.svg`, `favicon.svg`) & platform icons
+├── contrib/              systemd unit, launchd plist, Linux `.desktop`, macOS `Info.plist`
+├── docs/                 API contract & `act` integration notes
+├── scripts/              Daemon/UI CI scripts, icon generator & pre-release packager
+└── tests/                Daemon pipeline, API & `act` integration tests
+```
+
+## Documentation
+
+| Document | Description |
+| --- | --- |
+| [`docs/api.md`](docs/api.md) | Complete HTTP API v1 and WebSocket (`/api/ws`) protocol reference |
+| [`docs/act.md`](docs/act.md) | How Lunacy drives `nektos/act`, `--json` parsing, locking, and OS notes |
+| [`config.example.toml`](config.example.toml) | Annotated configuration reference with all global and per-project options |
+| [`ui/README.md`](ui/README.md) | Building, developing, screenshotting, and testing `lunacy-ui` (desktop & web) |
+
+## License
+
+Licensed under the **MIT License** (see package metadata in [`Cargo.toml`](Cargo.toml) and [`ui/Cargo.toml`](ui/Cargo.toml)).

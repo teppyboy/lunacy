@@ -413,18 +413,54 @@ pub const DEFAULT_CACHE_ENVS: &[(&str, &str)] = &[
     ("PUB_CACHE", "/root/.pub-cache"),
 ];
 
-/// Project-scoped Docker cache volumes for a sanitized project slug.
+/// Project-scoped Docker cache volumes for a sanitized project slug (slot 0 = base names).
 pub fn project_cache_volumes(slug: &str) -> Vec<(String, String)> {
+    project_cache_volumes_for_slot(slug, 0)
+}
+
+/// Project-scoped Docker cache volumes for a sanitized project slug and concurrent run slot.
+///
+/// Slot 0 keeps the base volume names (`lunacy-cache-{slug}-*`); slots `> 0` append
+/// `-slot-{slot}` so concurrent runs of the same project never contend on `.cargo-lock`.
+pub fn project_cache_volumes_for_slot(slug: &str, slot: usize) -> Vec<(String, String)> {
+    let prefix = if slot == 0 {
+        format!("lunacy-cache-{slug}")
+    } else {
+        format!("lunacy-cache-{slug}-slot-{slot}")
+    };
     vec![
         (
-            format!("lunacy-cache-{slug}-cargo-target"),
+            format!("{prefix}-cargo-target"),
             "/cache/cargo-target".to_string(),
         ),
-        (
-            format!("lunacy-cache-{slug}-build"),
-            "/cache/build".to_string(),
-        ),
+        (format!("{prefix}-build"), "/cache/build".to_string()),
     ]
+}
+
+/// Slot-isolated action cache path under `cache_root` (`act-actions` for slot 0, `act-actions-slot-{i}` for `i > 0`).
+pub fn act_action_cache_dir(cache_root: &Path, slot: usize) -> PathBuf {
+    if slot == 0 {
+        cache_root.join("act-actions")
+    } else {
+        cache_root.join(format!("act-actions-slot-{slot}"))
+    }
+}
+
+/// Slot-isolated BoltDB cache server path under `cache_root` (`act-cache-server` for slot 0, `act-cache-server-slot-{i}` for `i > 0`).
+pub fn act_cache_server_dir(cache_root: &Path, slot: usize) -> PathBuf {
+    if slot == 0 {
+        cache_root.join("act-cache-server")
+    } else {
+        cache_root.join(format!("act-cache-server-slot-{slot}"))
+    }
+}
+
+/// Allocate an available ephemeral loopback TCP port for parallel `act` artifact servers.
+pub fn allocate_ephemeral_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|addr| addr.port())
 }
 
 /// Aggressive caching settings resolved for a single `act` invocation.
@@ -433,9 +469,28 @@ pub struct ActCachePlan {
     pub action_cache_path: PathBuf,
     pub cache_server_path: PathBuf,
     pub project_slug: String,
+    pub project_run_slot: usize,
     pub pull_false: bool,
     pub include_container_volumes: bool,
     pub project_env: BTreeMap<String, String>,
+}
+
+/// Docker container label key tagging `act` job/service containers with their Lunacy run id.
+pub const CONTAINER_RUN_ID_LABEL: &str = "lunacy.run_id";
+
+/// The run id as a label value: act splits `--container-options` on whitespace, and a project
+/// name may hold spaces or quotes, so anything outside `[A-Za-z0-9_.-]` becomes `_`.
+pub fn run_id_label_value(run_id: &str) -> String {
+    run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Everything a step needs, resolved from config plus the repo checkout.
@@ -445,11 +500,16 @@ pub struct ActPlan {
     pub secret_file: Option<PathBuf>,
     pub var_file: Option<PathBuf>,
     pub artifact_dir: PathBuf,
+    /// Ephemeral port for `--artifact-server-port` when running parallel `act` slots.
+    pub artifact_server_port: Option<u16>,
     pub workflow: String,
     pub job: Option<String>,
     pub event: String,
     pub project_args: Vec<String>,
     pub cache: Option<ActCachePlan>,
+    /// Optional Lunacy run id injected as `--label lunacy.run_id=<id>` into `--container-options`
+    /// for container-based jobs (omitted for self-hosted jobs).
+    pub run_id: Option<String>,
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
@@ -654,60 +714,86 @@ pub fn build_args(
         args.push("--var-file".into());
         args.push(vars.to_string_lossy().to_string());
     }
-    args.push("--artifact-server-path".into());
-    args.push(plan.artifact_dir.to_string_lossy().to_string());
-
     let mut user_args: Vec<String> =
         Vec::with_capacity(act.args.len() + plan.project_args.len() + step.args.len());
     user_args.extend(act.args.iter().cloned());
     user_args.extend(plan.project_args.iter().cloned());
     user_args.extend(step.args.iter().cloned());
 
-    if let Some(cache) = &plan.cache {
-        if !has_flag(&user_args, "--use-new-action-cache") {
-            args.push("--use-new-action-cache".into());
+    args.push("--artifact-server-path".into());
+    args.push(plan.artifact_dir.to_string_lossy().to_string());
+    if let Some(port) = plan.artifact_server_port {
+        if !has_flag(&user_args, "--artifact-server-port") {
+            args.push("--artifact-server-port".into());
+            args.push(port.to_string());
         }
-        if !has_flag(&user_args, "--action-cache-path") {
-            args.push("--action-cache-path".into());
-            args.push(cache.action_cache_path.to_string_lossy().to_string());
-        }
-        if !has_flag(&user_args, "--action-offline-mode") {
-            args.push("--action-offline-mode".into());
-        }
-        if !has_flag(&user_args, "--cache-server-path")
-            && !has_flag(&user_args, "--no-cache-server")
-        {
-            args.push("--cache-server-path".into());
-            args.push(cache.cache_server_path.to_string_lossy().to_string());
-        }
-        if cache.pull_false && !has_pull_flag(&user_args) {
-            args.push("--pull=false".into());
+    }
+
+    if plan.cache.is_some() || plan.run_id.as_deref().is_some_and(|s| !s.is_empty()) {
+        if let Some(cache) = &plan.cache {
+            if !has_flag(&user_args, "--use-new-action-cache") {
+                args.push("--use-new-action-cache".into());
+            }
+            if !has_flag(&user_args, "--action-cache-path") {
+                args.push("--action-cache-path".into());
+                args.push(cache.action_cache_path.to_string_lossy().to_string());
+            }
+            if !has_flag(&user_args, "--action-offline-mode") {
+                args.push("--action-offline-mode".into());
+            }
+            if !has_flag(&user_args, "--cache-server-path")
+                && !has_flag(&user_args, "--no-cache-server")
+            {
+                args.push("--cache-server-path".into());
+                args.push(cache.cache_server_path.to_string_lossy().to_string());
+            }
+            if cache.pull_false && !has_pull_flag(&user_args) {
+                args.push("--pull=false".into());
+            }
         }
 
         let (remaining_user_args, existing_container_opts) = extract_container_options(&user_args);
-        if cache.include_container_volumes {
-            let mut volumes: Vec<(String, String)> = SHARED_CACHE_VOLUMES
-                .iter()
-                .map(|(v, m)| ((*v).to_string(), (*m).to_string()))
-                .collect();
-            volumes.extend(project_cache_volumes(&cache.project_slug));
-            let merged = merge_container_options(&existing_container_opts, &volumes);
-            if !merged.is_empty() {
-                args.push("--container-options".into());
-                args.push(merged);
+        let volumes = match &plan.cache {
+            Some(cache) if cache.include_container_volumes => {
+                let mut v: Vec<(String, String)> = SHARED_CACHE_VOLUMES
+                    .iter()
+                    .map(|(vol, mount)| ((*vol).to_string(), (*mount).to_string()))
+                    .collect();
+                v.extend(project_cache_volumes_for_slot(
+                    &cache.project_slug,
+                    cache.project_run_slot,
+                ));
+                v
             }
-            for (k, v) in DEFAULT_CACHE_ENVS {
-                if !args_has_env_key(&remaining_user_args, k)
-                    && !step.env.contains_key(*k)
-                    && !cache.project_env.contains_key(*k)
-                {
-                    args.push("--env".into());
-                    args.push(format!("{k}={v}"));
+            _ => Vec::new(),
+        };
+        let mut merged = merge_container_options(&existing_container_opts, &volumes);
+        if let Some(run_id) = plan.run_id.as_deref().filter(|s| !s.is_empty()) {
+            let label_kv = format!("{CONTAINER_RUN_ID_LABEL}={}", run_id_label_value(run_id));
+            if !merged.contains(&label_kv) {
+                if !merged.is_empty() {
+                    merged.push(' ');
+                }
+                merged.push_str(&format!("--label {label_kv}"));
+            }
+        }
+        if !merged.is_empty() {
+            args.push("--container-options".into());
+            args.push(merged);
+        }
+
+        if let Some(cache) = &plan.cache {
+            if cache.include_container_volumes {
+                for (k, v) in DEFAULT_CACHE_ENVS {
+                    if !args_has_env_key(&remaining_user_args, k)
+                        && !step.env.contains_key(*k)
+                        && !cache.project_env.contains_key(*k)
+                    {
+                        args.push("--env".into());
+                        args.push(format!("{k}={v}"));
+                    }
                 }
             }
-        } else if !existing_container_opts.is_empty() {
-            args.push("--container-options".into());
-            args.push(existing_container_opts.join(" "));
         }
 
         args.extend(remaining_user_args);
@@ -1140,11 +1226,13 @@ jobs:
             secret_file: Some(PathBuf::from("/tmp/secrets")),
             var_file: None,
             artifact_dir: PathBuf::from("/tmp/art"),
+            artifact_server_port: None,
             workflow: ".github/workflows/ci.yml".into(),
             job: Some("web".into()),
             event: "push".into(),
             project_args: Vec::new(),
             cache: None,
+            run_id: None,
         };
         let step = StepCfg {
             name: "s".into(),
@@ -1182,6 +1270,7 @@ jobs:
             secret_file: None,
             var_file: None,
             artifact_dir: PathBuf::from("/tmp/art"),
+            artifact_server_port: None,
             workflow: ".github/workflows/ci.yml".into(),
             job: Some("validate".into()),
             event: "push".into(),
@@ -1190,10 +1279,12 @@ jobs:
                 action_cache_path: PathBuf::from("/state/cache/act-actions"),
                 cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
                 project_slug: "frostedge".into(),
+                project_run_slot: 0,
                 pull_false: true,
                 include_container_volumes: true,
                 project_env: BTreeMap::from([("CARGO_INCREMENTAL".to_string(), "1".to_string())]),
             }),
+            run_id: None,
         };
         let step = StepCfg {
             name: "Validate".into(),
@@ -1302,6 +1393,7 @@ jobs:
             secret_file: None,
             var_file: None,
             artifact_dir: PathBuf::from("/tmp/art"),
+            artifact_server_port: None,
             workflow: ".github/workflows/ci.yml".into(),
             job: None,
             event: "push".into(),
@@ -1310,10 +1402,12 @@ jobs:
                 action_cache_path: PathBuf::from("/state/cache/act-actions"),
                 cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
                 project_slug: "demo".into(),
+                project_run_slot: 0,
                 pull_false: true,
                 include_container_volumes: false,
                 project_env: BTreeMap::new(),
             }),
+            run_id: None,
         };
         let step = StepCfg {
             name: "S".into(),
@@ -1371,6 +1465,7 @@ jobs:
             secret_file: None,
             var_file: None,
             artifact_dir: PathBuf::from("/tmp/art"),
+            artifact_server_port: None,
             workflow: ".github/workflows/ci.yml".into(),
             job: Some("windows".into()),
             event: "push".into(),
@@ -1379,10 +1474,12 @@ jobs:
                 action_cache_path: PathBuf::from("/state/cache/act-actions"),
                 cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
                 project_slug: "demo".into(),
+                project_run_slot: 0,
                 pull_false: false,
                 include_container_volumes: false,
                 project_env: BTreeMap::new(),
             }),
+            run_id: None,
         };
         let step = StepCfg {
             name: "WinBuild".into(),
@@ -1457,11 +1554,13 @@ jobs:
             secret_file: None,
             var_file: None,
             artifact_dir: PathBuf::from("/tmp/art"),
+            artifact_server_port: None,
             workflow: ".github/workflows/ci.yml".into(),
             job: Some("build".into()),
             event: "push".into(),
             project_args: vec!["--project-flag".into(), "p1".into()],
             cache: None,
+            run_id: None,
         };
         let act = ActCfg {
             args: vec!["--global-flag".into(), "g1".into()],
@@ -1489,5 +1588,172 @@ jobs:
         let p = args.iter().position(|a| a == "--project-flag").unwrap();
         let s = args.iter().position(|a| a == "--step-flag").unwrap();
         assert!(g < p && p < s, "expected global < project < step: {args:?}");
+    }
+
+    #[test]
+    fn parallel_slot_isolates_cache_paths_port_and_project_volumes() {
+        let cache_root = Path::new("/state/cache");
+        assert_eq!(
+            act_action_cache_dir(cache_root, 0),
+            PathBuf::from("/state/cache/act-actions")
+        );
+        assert_eq!(
+            act_action_cache_dir(cache_root, 1),
+            PathBuf::from("/state/cache/act-actions-slot-1")
+        );
+        assert_eq!(
+            act_cache_server_dir(cache_root, 0),
+            PathBuf::from("/state/cache/act-cache-server")
+        );
+        assert_eq!(
+            act_cache_server_dir(cache_root, 1),
+            PathBuf::from("/state/cache/act-cache-server-slot-1")
+        );
+
+        let port = allocate_ephemeral_port().expect("ephemeral port");
+        assert!(port > 0);
+
+        let plan = ActPlan {
+            event_file: PathBuf::from("/tmp/event.json"),
+            secret_file: None,
+            var_file: None,
+            artifact_dir: PathBuf::from("/tmp/art"),
+            artifact_server_port: Some(port),
+            workflow: ".github/workflows/ci.yml".into(),
+            job: Some("validate".into()),
+            event: "push".into(),
+            project_args: Vec::new(),
+            cache: Some(ActCachePlan {
+                action_cache_path: act_action_cache_dir(cache_root, 1),
+                cache_server_path: act_cache_server_dir(cache_root, 1),
+                project_slug: "frostedge".into(),
+                project_run_slot: 1,
+                pull_false: false,
+                include_container_volumes: true,
+                project_env: BTreeMap::new(),
+            }),
+            run_id: Some("frostedge-1234-abcdef1".into()),
+        };
+        let step = StepCfg {
+            name: "Validate".into(),
+            kind: crate::config::StepKind::Act,
+            run: None,
+            workflow: Some(".github/workflows/ci.yml".into()),
+            job: Some("validate".into()),
+            event: None,
+            platforms: BTreeMap::new(),
+            args: Vec::new(),
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            only_on: Vec::new(),
+            timeout: None,
+            cwd: None,
+            shell: None,
+            env: BTreeMap::new(),
+        };
+        let platforms = BTreeMap::from([("ubuntu-latest".to_string(), "img".to_string())]);
+        let args = build_args(&plan, &step, &platforms, &ActCfg::default(), false);
+        let joined = args.join(" ");
+
+        assert!(
+            joined.contains(&format!("--artifact-server-port {port}")),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--action-cache-path /state/cache/act-actions-slot-1"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--cache-server-path /state/cache/act-cache-server-slot-1"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-v lunacy-cache-frostedge-slot-1-cargo-target:/cache/cargo-target"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-v lunacy-cache-frostedge-slot-1-build:/cache/build"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--label lunacy.run_id=frostedge-1234-abcdef1"),
+            "{joined}"
+        );
+
+        // User-specified --artifact-server-port is respected without duplicating.
+        let mut custom_step = step.clone();
+        custom_step.args = vec!["--artifact-server-port=45678".into()];
+        let custom_args = build_args(&plan, &custom_step, &platforms, &ActCfg::default(), false);
+        assert_eq!(
+            custom_args
+                .iter()
+                .filter(|a| a.starts_with("--artifact-server-port"))
+                .count(),
+            1,
+            "{custom_args:?}"
+        );
+        assert!(custom_args.contains(&"--artifact-server-port=45678".to_string()));
+    }
+
+    #[test]
+    fn run_id_label_value_has_no_whitespace_or_quotes() {
+        assert_eq!(run_id_label_value("demo-999-1234567"), "demo-999-1234567");
+        assert_eq!(
+            run_id_label_value("My \"App\"-1-abc.def_g"),
+            "My__App_-1-abc.def_g"
+        );
+    }
+
+    #[test]
+    fn run_id_injects_container_label_even_without_cache_and_merges_user_opts() {
+        let plan = ActPlan {
+            event_file: PathBuf::from("/tmp/event.json"),
+            secret_file: None,
+            var_file: None,
+            artifact_dir: PathBuf::from("/tmp/art"),
+            artifact_server_port: None,
+            workflow: ".github/workflows/ci.yml".into(),
+            job: Some("build".into()),
+            event: "push".into(),
+            project_args: vec!["--container-options=--shm-size=1g".into()],
+            cache: None,
+            run_id: Some("demo-999-1234567".into()),
+        };
+        let step = StepCfg {
+            name: "Build".into(),
+            kind: crate::config::StepKind::Act,
+            run: None,
+            workflow: Some(".github/workflows/ci.yml".into()),
+            job: Some("build".into()),
+            event: None,
+            platforms: BTreeMap::new(),
+            args: vec!["--pull=false".into()],
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            only_on: Vec::new(),
+            timeout: None,
+            cwd: None,
+            shell: None,
+            env: BTreeMap::new(),
+        };
+        let args = build_args(&plan, &step, &BTreeMap::new(), &ActCfg::default(), false);
+        let co_indices: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--container-options" || a.starts_with("--container-options="))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            co_indices.len(),
+            1,
+            "must emit a single merged --container-options: {args:?}"
+        );
+        let co_val = &args[co_indices[0] + 1];
+        assert!(co_val.contains("--shm-size=1g"), "{co_val}");
+        assert!(
+            co_val.contains("--label lunacy.run_id=demo-999-1234567"),
+            "{co_val}"
+        );
+        assert!(args.contains(&"--pull=false".to_string()));
     }
 }

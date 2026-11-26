@@ -364,9 +364,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Markdown table of a run's steps, the way the Actions UI summarises a job.
 pub fn steps_markdown(run: &Run, limit: usize) -> String {
-    let mut out = String::from("| Step | Status | Duration |\n|---|---|---|\n");
+    let mut out = String::new();
+    if let Some(reason) = crate::model::sanitize_trigger_reason(run.trigger_reason.as_deref()) {
+        let escaped = escape_html(&reason);
+        out.push_str(&format!("**Trigger:** {escaped}\n\n"));
+    }
+    out.push_str("| Step | Status | Duration |\n|---|---|---|\n");
     for step in run.steps.iter().take(limit) {
         let duration = step
             .duration_ms
@@ -375,7 +386,7 @@ pub fn steps_markdown(run: &Run, limit: usize) -> String {
         out.push_str(&format!(
             "| {} {} | {} | {} |\n",
             step.status.emoji(),
-            step.name.replace('|', "\\|"),
+            escape_html(&step.name).replace('|', "\\|"),
             step.status.word(),
             duration
         ));
@@ -391,15 +402,22 @@ pub fn steps_markdown(run: &Run, limit: usize) -> String {
         if step.substeps.is_empty() {
             continue;
         }
-        out.push_str(&format!("\n<details><summary>{}</summary>\n\n", step.name));
+        out.push_str(&format!(
+            "\n<details><summary>{}</summary>\n\n",
+            escape_html(&step.name)
+        ));
         let mut job = String::new();
         for sub in &step.substeps {
             if sub.job != job {
                 job = sub.job.clone();
+                let job_label = if job.is_empty() {
+                    "job".to_string()
+                } else {
+                    escape_html(&job)
+                };
                 out.push_str(&format!(
                     "\n**{}** (`{}`)\n\n| Step | Status | Duration |\n|---|---|---|\n",
-                    if job.is_empty() { "job" } else { &job },
-                    sub.job_id
+                    job_label, sub.job_id
                 ));
             }
             let duration = sub
@@ -409,7 +427,7 @@ pub fn steps_markdown(run: &Run, limit: usize) -> String {
             out.push_str(&format!(
                 "| {} {} | {} | {} |\n",
                 sub.status.emoji(),
-                sub.name.replace('|', "\\|"),
+                escape_html(&sub.name).replace('|', "\\|"),
                 sub.status.word(),
                 duration
             ));
@@ -1126,5 +1144,58 @@ mod tests {
 
         assert_eq!(payloads[1]["conclusion"], "success");
         assert!(payloads[1].get("actions").is_none());
+    }
+
+    #[test]
+    fn steps_markdown_includes_trigger_reason_only_when_present() {
+        let mut run = run_with(vec![step(Phase::Ci, "Test", StepStatus::Success)]);
+        let without = steps_markdown(&run, 50);
+        assert!(
+            !without.contains("Trigger:"),
+            "unexpected Trigger line: {without}"
+        );
+
+        run.trigger_reason = Some("GitHub push webhook (master by alice)".into());
+        let with = steps_markdown(&run, 50);
+        assert!(
+            with.starts_with("**Trigger:** GitHub push webhook (master by alice)\n\n| Step |"),
+            "{with}"
+        );
+
+        run.trigger_reason = Some("Deploy <staging> & prod".into());
+        let escaped = steps_markdown(&run, 50);
+        assert!(
+            escaped.starts_with("**Trigger:** Deploy &lt;staging&gt; &amp; prod\n\n| Step |"),
+            "{escaped}"
+        );
+    }
+
+    #[test]
+    fn steps_markdown_escapes_html_in_summary_and_substep_job() {
+        let mut s = step(
+            Phase::Ci,
+            "Build </summary><script>alert(1)</script> & test",
+            StepStatus::Success,
+        );
+        s.substeps = vec![crate::model::Substep {
+            job: "Lint <web> & API".into(),
+            job_id: "lint".into(),
+            name: "Run".into(),
+            status: StepStatus::Success,
+            duration_ms: Some(1000),
+        }];
+        let run = run_with(vec![s]);
+        let md = steps_markdown(&run, 50);
+        assert!(
+            md.contains(
+                "<details><summary>Build &lt;/summary&gt;&lt;script&gt;alert(1)&lt;/script&gt; &amp; test</summary>"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("**Lint &lt;web&gt; &amp; API** (`lint`)"),
+            "{md}"
+        );
+        assert!(!md.contains("<script>"), "{md}");
     }
 }

@@ -61,6 +61,7 @@ fn project(fx: &common::Fixture, state_dir: &std::path::Path, ci_run: &str) -> P
         deploy_refs: Vec::new(),
         watch_tags: false,
         cache: None,
+        max_concurrent_runs: None,
         // `Test` is the interesting step; `After` exists only to prove a
         // failing `Test` skips everything behind it.
         ci: vec![
@@ -106,6 +107,9 @@ fn run_pipeline(
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
     let run = pipeline::run_pipeline(&ctx, p, sha, Trigger::Manual);
     assert!(
@@ -343,6 +347,7 @@ fn reporting_is_disabled_without_token_or_webhook() {
         deploy_refs: Vec::new(),
         watch_tags: false,
         cache: None,
+        max_concurrent_runs: None,
         ci: vec![shell_step("a", "true")],
         deploy: Vec::new(),
     };
@@ -581,6 +586,9 @@ fn cancelling_running_step_kills_process_and_skips_remaining() {
         act_lock: &act_lock,
         cancel: Some(&cancel),
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
 
     let started = Instant::now();
@@ -707,6 +715,9 @@ fn act_lock_wait_is_cancellable() {
         act_lock: &act_lock,
         cancel: Some(&cancel),
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
     let started = Instant::now();
     let run = pipeline::run_pipeline(&ctx, &p, &sha, Trigger::Manual);
@@ -819,6 +830,9 @@ fn pr_run_is_ci_only_uses_worktree_and_skips_deploy_github_check() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
     let spec = RunSpec {
         sha: pr_sha.clone(),
@@ -833,6 +847,7 @@ fn pr_run_is_ci_only_uses_worktree_and_skips_deploy_github_check() {
         }),
         deploy_only: false,
         force_deploy: false,
+        trigger_reason: Some("Poll detected PR #42 update".into()),
     };
     let run = pipeline::run_pipeline_spec(&ctx, &p, &spec);
 
@@ -841,6 +856,10 @@ fn pr_run_is_ci_only_uses_worktree_and_skips_deploy_github_check() {
 
     assert_eq!(run.status, RunStatus::Success, "steps: {:?}", run.steps);
     assert_eq!(run.trigger, Trigger::PullRequest);
+    assert_eq!(
+        run.trigger_reason.as_deref(),
+        Some("Poll detected PR #42 update")
+    );
     assert_eq!(run.pr_number, Some(42));
     assert_eq!(run.pr_title.as_deref(), Some("feat: pr change"));
     assert_eq!(run.pr_head_ref.as_deref(), Some("feat/pr-42"));
@@ -916,6 +935,9 @@ fn force_deploy_skips_ci_standalone_and_runs_act_when_ci_dir_referenced() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
     let spec = RunSpec {
         sha: sha.clone(),
@@ -924,9 +946,11 @@ fn force_deploy_skips_ci_standalone_and_runs_act_when_ci_dir_referenced() {
         pr: None,
         deploy_only: true,
         force_deploy: true,
+        trigger_reason: Some("  Force\ndeploy\tnow  ".into()),
     };
     let run = pipeline::run_pipeline_spec(&ctx, &p, &spec);
     assert_eq!(run.status, RunStatus::Success, "steps: {:?}", run.steps);
+    assert_eq!(run.trigger_reason.as_deref(), Some("Force deploy now"));
     assert!(run.deploy_only);
     assert_eq!(run.steps[0].status, StepStatus::Skipped);
     assert_eq!(run.steps[1].status, StepStatus::Success);
@@ -982,6 +1006,9 @@ fn force_deploy_skips_ci_standalone_and_runs_act_when_ci_dir_referenced() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
     let run2 = pipeline::run_pipeline_spec(&ctx2, &p2, &spec);
     assert_eq!(run2.status, RunStatus::Success, "steps: {:?}", run2.steps);
@@ -1041,6 +1068,9 @@ fn remote_tags_and_deploy_refs_gating() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
 
     // master does NOT match tags/v* -> deploy skipped with reason.
@@ -1054,6 +1084,7 @@ fn remote_tags_and_deploy_refs_gating() {
             pr: None,
             deploy_only: false,
             force_deploy: false,
+            trigger_reason: Some("Poll detected new commit on master".into()),
         },
     );
     assert_eq!(run_branch.status, RunStatus::Success);
@@ -1075,6 +1106,7 @@ fn remote_tags_and_deploy_refs_gating() {
             pr: None,
             deploy_only: false,
             force_deploy: false,
+            trigger_reason: Some("Poll detected new tag v1.0.0".into()),
         },
     );
     assert_eq!(run_tag.status, RunStatus::Success, "{:?}", run_tag.steps);
@@ -1114,6 +1146,9 @@ fn startup_emits_on_update_before_checkout_and_pr_base_sha_falls_back() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
     // Valid hex SHA that does not exist in git -> prepare_checkout fails.
     let missing_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
@@ -1182,6 +1217,9 @@ fn startup_emits_on_update_before_checkout_and_pr_base_sha_falls_back() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
     let pr_spec = RunSpec {
         sha: base_sha.clone(),
@@ -1196,6 +1234,7 @@ fn startup_emits_on_update_before_checkout_and_pr_base_sha_falls_back() {
         }),
         deploy_only: false,
         force_deploy: false,
+        trigger_reason: Some("Manual PR #55 trigger".into()),
     };
     let pr_run = pipeline::run_pipeline_spec(&ctx2, &p2, &pr_spec);
     assert_eq!(pr_run.status, RunStatus::Success, "{:?}", pr_run.steps);
@@ -1246,6 +1285,9 @@ fn on_log_chunk_streams_shell_output_matching_log_file() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: Some(on_log_chunk),
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
 
     let run = pipeline::run_pipeline(&ctx, &p, &sha, Trigger::Manual);
@@ -1366,6 +1408,9 @@ fn project_github_enabled_false_suppresses_github_reporting() {
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
 
     // With github_enabled = Some(false), zero GitHub API calls are made.

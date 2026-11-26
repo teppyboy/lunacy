@@ -11,6 +11,7 @@
 poll_interval = 300      # seconds between `git fetch` checks, per project (0 allowed when trigger_mode = "webhook")
 # trigger_mode = "both"  # both | webhook | poll ("webhook" skips periodic git/PR/tag polling)
 # step_timeout = 3600    # default per-step timeout in seconds (project/step override)
+# max_concurrent_runs = 1 # max pipelines running concurrently across the daemon (hot-reloads)
 log_level = "info"       # trace | debug | info | warn | error
 # Shell argv used for `kind = "shell"` steps, project/step `shell` overrides it.
 # Unix default: ["bash", "-c"]; Windows default: ["cmd", "/C"].
@@ -72,11 +73,15 @@ notify_on_start = false
 # native_command = ["act"]
 platforms = { "ubuntu-latest" = "catthehacker/ubuntu:act-latest" }
 # args = ["--pull=false"]
-# One act run at a time per machine: Lunacy takes `flock(2)` on this file.
+# Lock pool for `act` runs: Lunacy takes `flock(2)` on this file for slot 0
+# (and `<lock_file>.1`, `<lock_file>.2`, ... when `max_concurrent > 1`).
 # Point it at the same file a manual `make ci` uses (lunarum's
 # scripts/with-act-lock.sh locks ~/.local/state/act-gate.lock with `flock`), so
-# the two never run act concurrently. Default: <state_dir>/act.lock. `~/` expands.
+# the two never collide on slot 0. Default: <state_dir>/act.lock. `~/` expands.
 # lock_file = "~/.local/state/act-gate.lock"
+# Max concurrent `act` steps across the machine (defaults to general.max_concurrent_runs; hot-reloads).
+# Parallel slots isolate action cache, cache server, and ephemeral artifact server port automatically.
+# max_concurrent = 1
 # Aggressive build caching is enabled by default: persists act action/cache-server
 # dirs, mounts shared & per-project Docker cache volumes, sets DOCKER_BUILDKIT=1
 # and LUNACY_CACHE_DIR, and auto-adds --pull=false when mapped images exist locally.
@@ -104,6 +109,7 @@ poll_interval = 300
 # trigger_mode = "both"  # override general.trigger_mode per project: both | webhook | poll
 # step_timeout = 3600    # default per-step timeout in seconds for this project
 # timeout = 7200         # total pipeline timeout in seconds across all steps
+# max_concurrent_runs = 1 # max concurrent runs on this project (> 1 requires checkout = "worktree" or "none"; deploy still serializes)
 # watch_prs = false      # poll & build open GitHub PRs (CI-only; PRs never deploy)
 # deploy_refs = ["master", "release/*", "tags/v*"]  # refs allowed to deploy (empty = [branch])
 # watch_tags = false     # watch remote tags even when deploy_refs has no tags/ pattern

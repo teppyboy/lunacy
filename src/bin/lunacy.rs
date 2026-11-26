@@ -49,6 +49,9 @@ enum Cmd {
         /// Re-run even when the sha was already processed.
         #[arg(long)]
         force: bool,
+        /// Optional human-readable reason recorded on the run.
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -83,7 +86,8 @@ fn main() {
             project,
             sha,
             force,
-        } => once(config, project, sha, force),
+            reason,
+        } => once(config, project, sha, force, reason),
     };
     if let Err(e) = result {
         eprintln!("lunacy: {e:#}");
@@ -223,7 +227,23 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn once(path: PathBuf, project_name: String, sha: Option<String>, force: bool) -> Result<()> {
+fn resolve_once_reason(reason: Option<&str>, force: bool) -> Option<String> {
+    model::sanitize_trigger_reason(reason).or_else(|| {
+        Some(if force {
+            "CLI lunacy once --force".to_string()
+        } else {
+            "CLI lunacy once".to_string()
+        })
+    })
+}
+
+fn once(
+    path: PathBuf,
+    project_name: String,
+    sha: Option<String>,
+    force: bool,
+    reason: Option<String>,
+) -> Result<()> {
     let cfg = load(&path)?;
     let project = cfg.project(&project_name).cloned().with_context(|| {
         format!(
@@ -297,8 +317,21 @@ fn once(path: PathBuf, project_name: String, sha: Option<String>, force: bool) -
         act_lock: &act_lock,
         cancel: None,
         on_log_chunk: None,
+        deploy_lock: None,
+        repo_git_lock: None,
+        project_run_slot: 0,
     };
-    let run = pipeline::run_pipeline(&ctx, &project, &sha, Trigger::Manual);
+    let trigger_reason = resolve_once_reason(reason.as_deref(), force);
+    let spec = pipeline::RunSpec {
+        sha: sha.clone(),
+        trigger: Trigger::Manual,
+        git_ref: project.branch.clone(),
+        pr: None,
+        deploy_only: false,
+        force_deploy: false,
+        trigger_reason,
+    };
+    let run = pipeline::run_pipeline_spec(&ctx, &project, &spec);
     model::write_last_sha(&state_dir, &project.name, &sha)?;
     println!(
         "\n{} {} {} in {}s (run {})",
@@ -425,4 +458,51 @@ fn ctrlc_handler(shared: Arc<Mutex<Shared>>) -> Result<()> {
         let _ = shared;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn once_cli_parses_reason_and_defaults() {
+        let cli = Cli::try_parse_from([
+            "lunacy",
+            "once",
+            "demo",
+            "--force",
+            "--reason",
+            "  Smoke\ttest  ",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Once {
+                project,
+                force,
+                reason,
+                ..
+            } => {
+                assert_eq!(project, "demo");
+                assert!(force);
+                assert_eq!(
+                    resolve_once_reason(reason.as_deref(), force).as_deref(),
+                    Some("Smoke test")
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert_eq!(
+            resolve_once_reason(None, false).as_deref(),
+            Some("CLI lunacy once")
+        );
+        assert_eq!(
+            resolve_once_reason(None, true).as_deref(),
+            Some("CLI lunacy once --force")
+        );
+        assert_eq!(
+            resolve_once_reason(Some("   \n  "), true).as_deref(),
+            Some("CLI lunacy once --force")
+        );
+    }
 }

@@ -39,6 +39,7 @@ pub struct RunSpec {
     pub pr: Option<PrContext>,
     pub deploy_only: bool,
     pub force_deploy: bool,
+    pub trigger_reason: Option<String>,
 }
 
 /// True if a step references `LUNACY_CI_DIR` in its script, env, args, or cwd.
@@ -80,12 +81,60 @@ pub struct Ctx<'a> {
     pub github: Option<&'a Github>,
     /// Called on every step transition so the API shows live progress.
     pub on_update: &'a (dyn Fn(&Run) + Send + Sync),
-    /// Global act lock: one act run at a time per machine.
+    /// Global act lock base path (`act.lock` for slot 0, `act.lock.{i}` for slot `i > 0`).
     pub act_lock: &'a Path,
     /// Optional cancellation flag; when set to `true`, the pipeline aborts promptly.
     pub cancel: Option<&'a AtomicBool>,
     /// Optional live log-chunk callback for streaming step output (e.g. over WebSockets).
     pub on_log_chunk: Option<LogChunkCallback>,
+    /// Optional per-project deploy serialization lock (prevents concurrent deploys on one project).
+    pub deploy_lock: Option<&'a Mutex<()>>,
+    /// Optional per-project Git mutex serializing fetches and worktree mutations on `project.repo_path`.
+    pub repo_git_lock: Option<&'a Mutex<()>>,
+    /// Per-project concurrent run slot (`0` for the first/only concurrent run; `> 0` isolates project volumes).
+    pub project_run_slot: usize,
+}
+
+enum DeployLockOutcome<'a> {
+    Acquired(Option<std::sync::MutexGuard<'a, ()>>),
+    Cancelled,
+    TimedOut,
+}
+
+fn acquire_deploy_lock<'a>(
+    lock: Option<&'a Mutex<()>>,
+    cancel: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+) -> DeployLockOutcome<'a> {
+    let Some(lock) = lock else {
+        return DeployLockOutcome::Acquired(None);
+    };
+    loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return DeployLockOutcome::Cancelled;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return DeployLockOutcome::TimedOut;
+        }
+        match lock.try_lock() {
+            Ok(guard) => return DeployLockOutcome::Acquired(Some(guard)),
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                return DeployLockOutcome::Acquired(Some(p.into_inner()));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let sleep_for = match deadline {
+                    Some(d) => d
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50)),
+                    None => Duration::from_millis(50),
+                };
+                if sleep_for.is_zero() {
+                    return DeployLockOutcome::TimedOut;
+                }
+                std::thread::sleep(sleep_for);
+            }
+        }
+    }
 }
 
 fn is_cancelled(ctx: &Ctx<'_>) -> bool {
@@ -93,39 +142,70 @@ fn is_cancelled(ctx: &Ctx<'_>) -> bool {
 }
 
 /// Held for the lifetime of a checkout; a `worktree` is pruned on drop.
-struct CheckedOut {
+struct CheckedOut<'a> {
     workdir: PathBuf,
     /// `(repo, worktree path, temp dir)`; dropped after `Drop::drop` runs.
     worktree: Option<(PathBuf, PathBuf, TempDir)>,
+    git_lock: Option<&'a Mutex<()>>,
 }
 
-impl Drop for CheckedOut {
+impl Drop for CheckedOut<'_> {
     fn drop(&mut self) {
         if let Some((repo, path, _tmp)) = &self.worktree {
+            let _guard = self
+                .git_lock
+                .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
             // Unregister and delete the tree while its temp dir still exists.
             git::remove_worktree(repo, path);
         }
     }
 }
 
-fn prepare_checkout(
+/// Unique worktree leaf directory name per run so Git's `.git/worktrees/<leaf>` admin
+/// entry never collides across concurrent worktrees of the same repository.
+fn worktree_leaf_name(run_id: &str) -> String {
+    let safe: String = run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        "tree".to_string()
+    } else {
+        format!("tree-{safe}")
+    }
+}
+
+fn prepare_checkout<'a>(
     project: &ProjectCfg,
     sha: &str,
+    run_id: &str,
     checkout_mode: Checkout,
     state_dir: &Path,
-) -> Result<CheckedOut> {
+    git_lock: Option<&'a Mutex<()>>,
+) -> Result<CheckedOut<'a>> {
     let repo = &project.repo_path;
     match checkout_mode {
         Checkout::None => Ok(CheckedOut {
             workdir: repo.clone(),
             worktree: None,
+            git_lock,
         }),
         Checkout::InPlace => {
-            git::fast_forward(repo, &project.remote, &project.branch, sha)
-                .with_context(|| format!("fast-forwarding {}", repo.display()))?;
+            {
+                let _guard = git_lock.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+                git::fast_forward(repo, &project.remote, &project.branch, sha)
+                    .with_context(|| format!("fast-forwarding {}", repo.display()))?;
+            }
             Ok(CheckedOut {
                 workdir: repo.clone(),
                 worktree: None,
+                git_lock,
             })
         }
         Checkout::Worktree => {
@@ -134,11 +214,15 @@ fn prepare_checkout(
             let tmp = TempDir::new_in(&checkouts_dir)
                 .or_else(|_| TempDir::new())
                 .context("creating a temp dir for the worktree")?;
-            let path = tmp.path().join("tree");
-            git::add_worktree(repo, &path, sha)?;
+            let path = tmp.path().join(worktree_leaf_name(run_id));
+            {
+                let _guard = git_lock.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+                git::add_worktree(repo, &path, sha)?;
+            }
             Ok(CheckedOut {
                 workdir: path.clone(),
                 worktree: Some((repo.clone(), path, tmp)),
+                git_lock,
             })
         }
     }
@@ -154,6 +238,7 @@ pub fn run_pipeline(ctx: &Ctx<'_>, project: &ProjectCfg, sha: &str, trigger: Tri
         pr: None,
         deploy_only: false,
         force_deploy: false,
+        trigger_reason: None,
     };
     run_pipeline_spec(ctx, project, &spec)
 }
@@ -181,6 +266,7 @@ pub fn run_pipeline_spec(ctx: &Ctx<'_>, project: &ProjectCfg, spec: &RunSpec) ->
         .chain(project.deploy.iter().map(|s| new_step(Phase::Deploy, s)))
         .collect();
     let mut run = Run::new(&project.name, sha, subject, spec.trigger, steps);
+    run.trigger_reason = crate::model::sanitize_trigger_reason(spec.trigger_reason.as_deref());
     if !spec.git_ref.is_empty() {
         run.git_ref = Some(spec.git_ref.clone());
     }
@@ -215,7 +301,14 @@ pub fn run_pipeline_spec(ctx: &Ctx<'_>, project: &ProjectCfg, spec: &RunSpec) ->
         project.checkout
     };
 
-    let checkout = match prepare_checkout(project, sha, checkout_mode, ctx.state_dir) {
+    let checkout = match prepare_checkout(
+        project,
+        sha,
+        &run.id,
+        checkout_mode,
+        ctx.state_dir,
+        ctx.repo_git_lock,
+    ) {
         Ok(c) => c,
         Err(e) => {
             log::error!("[{}] checkout failed: {e:#}", project.name);
@@ -300,31 +393,76 @@ pub fn run_pipeline_spec(ctx: &Ctx<'_>, project: &ProjectCfg, spec: &RunSpec) ->
             (ctx.on_update)(&run);
             persist(ctx, &run);
         } else if ci_ok && !is_cancelled(ctx) {
-            let deploy_check = start_report(ctx, project, &run, repo.as_deref(), Phase::Deploy);
-            run_steps(
-                ctx,
-                project,
-                spec,
-                &mut run,
-                Phase::Deploy,
-                &workdir,
-                &mut ci_dir,
-                &throttle,
-                &deploy_check,
-                repo.as_deref(),
-                pipeline_deadline,
-                false,
-            );
-            finish_report(
-                ctx,
-                project,
-                &run,
-                &deploy_check,
-                Phase::Deploy,
-                repo.as_deref(),
-            );
-            if run.github_url.is_none() {
-                run.github_url = deploy_check.as_ref().and_then(|c| c.url.clone());
+            match acquire_deploy_lock(ctx.deploy_lock, ctx.cancel, pipeline_deadline) {
+                DeployLockOutcome::Acquired(_deploy_guard) => {
+                    let deploy_check =
+                        start_report(ctx, project, &run, repo.as_deref(), Phase::Deploy);
+                    run_steps(
+                        ctx,
+                        project,
+                        spec,
+                        &mut run,
+                        Phase::Deploy,
+                        &workdir,
+                        &mut ci_dir,
+                        &throttle,
+                        &deploy_check,
+                        repo.as_deref(),
+                        pipeline_deadline,
+                        false,
+                    );
+                    finish_report(
+                        ctx,
+                        project,
+                        &run,
+                        &deploy_check,
+                        Phase::Deploy,
+                        repo.as_deref(),
+                    );
+                    if run.github_url.is_none() {
+                        run.github_url = deploy_check.as_ref().and_then(|c| c.url.clone());
+                    }
+                }
+                DeployLockOutcome::Cancelled => {
+                    run.status = RunStatus::Cancelled;
+                    for step in run.steps.iter_mut().filter(|s| s.phase == Phase::Deploy) {
+                        step.status = StepStatus::Skipped;
+                    }
+                    (ctx.on_update)(&run);
+                    persist(ctx, &run);
+                }
+                DeployLockOutcome::TimedOut => {
+                    if let Some(first_deploy) =
+                        run.steps.iter().position(|s| s.phase == Phase::Deploy)
+                    {
+                        let name = run.steps[first_deploy].name.clone();
+                        let secs = project.timeout.unwrap_or(0);
+                        let log_path =
+                            run_log_path(ctx.state_dir, &project.name, &run.id, first_deploy);
+                        if let Some(parent) = log_path.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        let msg = format!(
+                            "[lunacy] pipeline timed out after {secs}s while waiting for project deploy lock\n"
+                        );
+                        let _ = fs::write(&log_path, &msg);
+                        if let Some(cb) = &ctx.on_log_chunk {
+                            cb(first_deploy, &msg);
+                        }
+                        set_step(&mut run, first_deploy, StepStatus::Timeout, Some(0), None);
+                        run.failed_step = Some(name);
+                        for step in run
+                            .steps
+                            .iter_mut()
+                            .skip(first_deploy + 1)
+                            .filter(|s| s.phase == Phase::Deploy)
+                        {
+                            step.status = StepStatus::Skipped;
+                        }
+                    }
+                    (ctx.on_update)(&run);
+                    persist(ctx, &run);
+                }
             }
         } else {
             if ci_ok && is_cancelled(ctx) {
@@ -716,9 +854,13 @@ fn base_env(
     }
     if cache_enabled(ctx, project) {
         let cache_root = ctx.cfg.act().effective_cache_dir(ctx.state_dir);
-        let project_cache = cache_root
-            .join("projects")
-            .join(crate::config::project_cache_slug(&project.name));
+        let slug = crate::config::project_cache_slug(&project.name);
+        let dir_name = if ctx.project_run_slot == 0 {
+            slug
+        } else {
+            format!("{slug}-slot-{}", ctx.project_run_slot)
+        };
+        let project_cache = cache_root.join("projects").join(dir_name);
         let _ = fs::create_dir_all(&project_cache);
         env.insert(
             "LUNACY_CACHE_DIR".into(),
@@ -897,10 +1039,41 @@ fn run_act_step(
         .join(format!("step{index}"));
     fs::create_dir_all(&artifact_dir)?;
 
+    let act_max_concurrent = ctx.cfg.effective_act_max_concurrent();
+    // Acquire an `act` flock slot before building per-slot cache/port arguments.
+    let act_lock = match ActLock::acquire_slot(
+        ctx.act_lock,
+        act_max_concurrent,
+        ctx.cancel,
+        Some(step_deadline),
+    )? {
+        LockOutcome::Acquired(lock) => lock,
+        LockOutcome::Cancelled => {
+            emit_human_line("[lunacy] cancelled while waiting for act lock");
+            return Ok((Outcome::Cancelled, Vec::new()));
+        }
+        LockOutcome::TimedOut => {
+            emit_human_line(&format!(
+                "[lunacy] timed out after {}s while waiting for act lock",
+                effective_timeout.as_secs()
+            ));
+            return Ok((Outcome::Timeout, Vec::new()));
+        }
+    };
+
+    let remaining = step_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        emit_human_line(&format!(
+            "[lunacy] timed out after {}s",
+            effective_timeout.as_secs()
+        ));
+        return Ok((Outcome::Timeout, Vec::new()));
+    }
+
     let cache_plan = if cache_enabled(ctx, project) {
         let cache_root = act_cfg.effective_cache_dir(ctx.state_dir);
-        let action_cache_path = cache_root.join("act-actions");
-        let cache_server_path = cache_root.join("act-cache-server");
+        let action_cache_path = act::act_action_cache_dir(&cache_root, act_lock.slot);
+        let cache_server_path = act::act_cache_server_dir(&cache_root, act_lock.slot);
         fs::create_dir_all(&action_cache_path)?;
         fs::create_dir_all(&cache_server_path)?;
 
@@ -915,10 +1088,17 @@ fn run_act_step(
             action_cache_path,
             cache_server_path,
             project_slug: crate::config::project_cache_slug(&project.name),
+            project_run_slot: ctx.project_run_slot,
             pull_false,
             include_container_volumes: !self_hosted,
             project_env: project.env.clone(),
         })
+    } else {
+        None
+    };
+
+    let artifact_server_port = if act_max_concurrent > 1 {
+        act::allocate_ephemeral_port()
     } else {
         None
     };
@@ -928,11 +1108,13 @@ fn run_act_step(
         secret_file,
         var_file,
         artifact_dir,
+        artifact_server_port,
         workflow,
         job: step.job.clone(),
         event: event_name,
         project_args: project.act_args.clone(),
         cache: cache_plan,
+        run_id: (!self_hosted).then(|| run.id.clone()),
     };
     let args = act::build_args(&plan, step, &platform_map, &act_cfg, wsl);
 
@@ -979,32 +1161,6 @@ fn run_act_step(
         })
     };
 
-    // One act run at a time on this machine: act names containers after the
-    // workflow and job, so parallel runs destroy each other.
-    let _lock = match ActLock::acquire(ctx.act_lock, ctx.cancel, Some(step_deadline))? {
-        LockOutcome::Acquired(lock) => lock,
-        LockOutcome::Cancelled => {
-            emit_human_line("[lunacy] cancelled while waiting for act lock");
-            return Ok((Outcome::Cancelled, Vec::new()));
-        }
-        LockOutcome::TimedOut => {
-            emit_human_line(&format!(
-                "[lunacy] timed out after {}s while waiting for act lock",
-                effective_timeout.as_secs()
-            ));
-            return Ok((Outcome::Timeout, Vec::new()));
-        }
-    };
-
-    let remaining = step_deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        emit_human_line(&format!(
-            "[lunacy] timed out after {}s",
-            effective_timeout.as_secs()
-        ));
-        return Ok((Outcome::Timeout, Vec::new()));
-    }
-
     let containers_before = list_act_containers(wsl);
 
     let spec = ExecSpec {
@@ -1025,7 +1181,7 @@ fn run_act_step(
     let result = exec::exec(&spec, Some(sink), ctx.cancel)?;
 
     if matches!(result.outcome, Outcome::Cancelled | Outcome::Timeout) {
-        cleanup_new_act_containers(wsl, &containers_before);
+        cleanup_new_act_containers(wsl, &containers_before, Some(run.id.as_str()));
         if let Ok(mut p) = progress.lock() {
             let final_status = match result.outcome {
                 Outcome::Cancelled => StepStatus::Cancelled,
@@ -1036,6 +1192,7 @@ fn run_act_step(
         }
     }
 
+    drop(act_lock);
     let substeps = progress.lock().map(|p| p.substeps()).unwrap_or_default();
     Ok((result.outcome, substeps))
 }
@@ -1047,6 +1204,49 @@ fn docker_command(wsl: bool) -> std::process::Command {
         cmd
     } else {
         std::process::Command::new("docker")
+    }
+}
+
+/// Run a short-lived best-effort `docker` command with a bounded timeout, returning stdout on exit 0.
+fn run_docker_stdout(mut cmd: std::process::Command, timeout: Duration) -> Option<String> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let text = reader.join().unwrap_or_default();
+                return status.success().then_some(text);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
     }
 }
 
@@ -1062,28 +1262,18 @@ fn all_platform_images_present_locally(platforms: &BTreeMap<String, String>, wsl
         return false;
     }
     images.into_iter().all(|img| {
-        docker_command(wsl)
-            .args(["image", "inspect", img])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        let mut cmd = docker_command(wsl);
+        cmd.args(["image", "inspect", img]);
+        run_docker_stdout(cmd, Duration::from_secs(3)).is_some()
     })
 }
 
 fn list_act_containers(wsl: bool) -> Option<BTreeSet<String>> {
-    let out = docker_command(wsl)
-        .args(["ps", "-aq", "--filter", "name=^/?act-"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
+    let mut cmd = docker_command(wsl);
+    cmd.args(["ps", "-aq", "--filter", "name=^/?act-"]);
+    let stdout = run_docker_stdout(cmd, Duration::from_secs(3))?;
     Some(
-        String::from_utf8_lossy(&out.stdout)
+        stdout
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
@@ -1092,15 +1282,108 @@ fn list_act_containers(wsl: bool) -> Option<BTreeSet<String>> {
     )
 }
 
-fn cleanup_new_act_containers(wsl: bool, before: &Option<BTreeSet<String>>) {
-    let Some(before) = before else { return };
-    let Some(after) = list_act_containers(wsl) else {
-        return;
+fn list_labeled_run_containers(wsl: bool, run_id: &str) -> BTreeSet<String> {
+    if run_id.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut cmd = docker_command(wsl);
+    cmd.args([
+        "ps",
+        "-aq",
+        "--filter",
+        &format!(
+            "label={}={}",
+            act::CONTAINER_RUN_ID_LABEL,
+            act::run_id_label_value(run_id)
+        ),
+    ]);
+    let Some(stdout) = run_docker_stdout(cmd, Duration::from_secs(3)) else {
+        return BTreeSet::new();
     };
-    let new_ids: Vec<&String> = after.difference(before).collect();
-    if new_ids.is_empty() {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// True when `docker inspect` output matches `run_id` via the `lunacy.run_id` label
+/// or via a checkout/artifact mount or working directory path containing `run_id`.
+fn container_inspect_matches_run(inspect_output: &str, run_id: &str) -> bool {
+    if run_id.is_empty() {
+        return false;
+    }
+    let label = act::run_id_label_value(run_id);
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(inspect_output) {
+        let items: &[serde_json::Value] = match val.as_array() {
+            Some(arr) => arr.as_slice(),
+            None => std::slice::from_ref(&val),
+        };
+        for item in items {
+            if item
+                .pointer(&format!("/Config/Labels/{}", act::CONTAINER_RUN_ID_LABEL))
+                .and_then(|v| v.as_str())
+                == Some(label.as_str())
+            {
+                return true;
+            }
+            if let Some(mounts) = item.get("Mounts").and_then(|v| v.as_array()) {
+                for m in mounts {
+                    if m.get("Source")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.contains(run_id))
+                    {
+                        return true;
+                    }
+                }
+            }
+            if item
+                .pointer("/Config/WorkingDir")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains(run_id))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    inspect_output.contains(&format!("{}={label}", act::CONTAINER_RUN_ID_LABEL))
+        || inspect_output.contains(run_id)
+}
+
+fn cleanup_new_act_containers(
+    wsl: bool,
+    before: &Option<BTreeSet<String>>,
+    run_id_filter: Option<&str>,
+) {
+    let Some(before) = before else { return };
+    let mut to_remove: BTreeSet<String> = BTreeSet::new();
+    if let Some(run_id) = run_id_filter {
+        // Direct label lookup catches both job and service containers tagged with `lunacy.run_id`.
+        to_remove.extend(list_labeled_run_containers(wsl, run_id));
+    }
+    if let Some(after) = list_act_containers(wsl) {
+        let mut new_ids: Vec<String> = after.difference(before).cloned().collect();
+        if let Some(run_id) = run_id_filter {
+            // Parallel act runs share the Docker daemon; only remove containers whose
+            // inspect output matches this run's `lunacy.run_id` label or unique checkout path.
+            new_ids.retain(|id| {
+                if to_remove.contains(id) {
+                    return false;
+                }
+                let mut cmd = docker_command(wsl);
+                cmd.args(["inspect", id]);
+                run_docker_stdout(cmd, Duration::from_secs(3))
+                    .is_some_and(|out| container_inspect_matches_run(&out, run_id))
+            });
+        }
+        to_remove.extend(new_ids);
+    }
+    if to_remove.is_empty() {
         return;
     }
+    let new_ids: Vec<String> = to_remove.into_iter().collect();
     log::info!(
         "cleaning up {} leftover act container(s): {:?}",
         new_ids.len(),
@@ -1108,14 +1391,10 @@ fn cleanup_new_act_containers(wsl: bool, before: &Option<BTreeSet<String>>) {
     );
     let mut cmd = docker_command(wsl);
     cmd.args(["rm", "-f"]);
-    for id in new_ids {
+    for id in &new_ids {
         cmd.arg(id);
     }
-    let _ = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
+    let _ = run_docker_stdout(cmd, Duration::from_secs(5));
 }
 
 /// Remove the run's act clone. Files act created with `--bind` can be root-owned,
@@ -1181,32 +1460,49 @@ fn write_kv_file(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-struct ActLock {
-    file: fs::File,
+/// Compute the lock file path for a slot in the `act` flock pool.
+///
+/// Slot `0` uses `base_path` directly (compatible with external `flock` tools);
+/// slot `i > 0` uses `<base_path>.{i}` (e.g. `act.lock.1`, `act.lock.2`).
+pub fn act_lock_slot_path(base_path: &Path, slot: usize) -> PathBuf {
+    if slot == 0 {
+        base_path.to_path_buf()
+    } else {
+        let mut os = base_path.as_os_str().to_os_string();
+        os.push(format!(".{slot}"));
+        PathBuf::from(os)
+    }
 }
 
-enum LockOutcome {
+/// Held exclusive `flock(2)` slot in the machine-wide `act` lock pool.
+pub struct ActLock {
+    file: fs::File,
+    pub slot: usize,
+}
+
+/// Result of attempting to acquire an [`ActLock`] slot.
+pub enum LockOutcome {
     Acquired(ActLock),
     Cancelled,
     TimedOut,
 }
 
 impl ActLock {
-    fn acquire(
-        path: &Path,
+    /// Acquire one exclusive `flock(2)` slot from `0..max_slots`, probing non-blockingly
+    /// and sleeping up to 150 ms between rounds while checking `cancel` and `deadline`.
+    pub fn acquire_slot(
+        base_path: &Path,
+        max_slots: usize,
         cancel: Option<&AtomicBool>,
         deadline: Option<Instant>,
     ) -> Result<LockOutcome> {
         use fs2::FileExt;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let slots = max_slots.max(1);
+        if let Some(parent) = base_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
         }
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("opening act lock {}", path.display()))?;
         let contended_os = fs2::lock_contended_error().raw_os_error();
         loop {
             if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
@@ -1215,25 +1511,37 @@ impl ActLock {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(LockOutcome::TimedOut);
             }
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(LockOutcome::Acquired(ActLock { file })),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || (contended_os.is_some() && e.raw_os_error() == contended_os) =>
-                {
-                    let sleep_for = match deadline {
-                        Some(d) => d
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(100)),
-                        None => Duration::from_millis(100),
-                    };
-                    if sleep_for.is_zero() {
-                        return Ok(LockOutcome::TimedOut);
+            for slot in 0..slots {
+                let path = act_lock_slot_path(base_path, slot);
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                    .with_context(|| format!("opening act lock {}", path.display()))?;
+                match file.try_lock_exclusive() {
+                    Ok(()) => return Ok(LockOutcome::Acquired(ActLock { file, slot })),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || (contended_os.is_some() && e.raw_os_error() == contended_os) =>
+                    {
+                        continue;
                     }
-                    std::thread::sleep(sleep_for);
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("locking {}", path.display()));
+                    }
                 }
-                Err(e) => return Err(e).with_context(|| format!("locking {}", path.display())),
             }
+            let sleep_for = match deadline {
+                Some(d) => d
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(150)),
+                None => Duration::from_millis(150),
+            };
+            if sleep_for.is_zero() {
+                return Ok(LockOutcome::TimedOut);
+            }
+            std::thread::sleep(sleep_for);
         }
     }
 }
@@ -1291,4 +1599,237 @@ fn finish(
         },
         run.duration_secs()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn act_lock_slot_paths_and_concurrent_pool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("act.lock");
+        assert_eq!(act_lock_slot_path(&base, 0), base);
+        assert_eq!(act_lock_slot_path(&base, 1), dir.path().join("act.lock.1"));
+        assert_eq!(act_lock_slot_path(&base, 2), dir.path().join("act.lock.2"));
+
+        // Acquire 2 slots concurrently when max_slots = 2.
+        let lock0 = match ActLock::acquire_slot(&base, 2, None, None).unwrap() {
+            LockOutcome::Acquired(l) => l,
+            _ => panic!("expected slot 0"),
+        };
+        assert_eq!(lock0.slot, 0);
+        assert!(base.is_file(), "slot 0 must use exact base_path");
+
+        let lock1 = match ActLock::acquire_slot(&base, 2, None, None).unwrap() {
+            LockOutcome::Acquired(l) => l,
+            _ => panic!("expected slot 1"),
+        };
+        assert_eq!(lock1.slot, 1);
+        assert!(dir.path().join("act.lock.1").is_file());
+
+        // 3rd acquisition must block/time out while both slots are held.
+        let blocked = ActLock::acquire_slot(
+            &base,
+            2,
+            None,
+            Some(Instant::now() + Duration::from_millis(200)),
+        )
+        .unwrap();
+        assert!(matches!(blocked, LockOutcome::TimedOut));
+
+        // Releasing slot 0 allows a 3rd waiter to acquire slot 0 immediately.
+        let base_clone = base.clone();
+        let waiter = std::thread::spawn(move || {
+            ActLock::acquire_slot(
+                &base_clone,
+                2,
+                None,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+            .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        drop(lock0);
+        let lock_next = match waiter.join().unwrap() {
+            LockOutcome::Acquired(l) => l,
+            _ => panic!("expected waiter to acquire released slot"),
+        };
+        assert_eq!(lock_next.slot, 0);
+
+        // Cancellation interrupts waiting acquisition cleanly.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        let base_clone2 = base.clone();
+        let cancelled_waiter = std::thread::spawn(move || {
+            ActLock::acquire_slot(
+                &base_clone2,
+                2,
+                Some(cancel_clone.as_ref()),
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+            .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        cancel.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            cancelled_waiter.join().unwrap(),
+            LockOutcome::Cancelled
+        ));
+
+        drop(lock_next);
+        drop(lock1);
+    }
+
+    #[test]
+    fn worktree_leaf_name_is_run_unique_and_sanitized() {
+        assert_eq!(
+            worktree_leaf_name("demo-1700000000-abcdef1"),
+            "tree-demo-1700000000-abcdef1"
+        );
+        assert_eq!(worktree_leaf_name("a/b:c d"), "tree-a_b_c_d");
+        assert_eq!(worktree_leaf_name(""), "tree");
+    }
+
+    #[test]
+    fn container_inspect_matches_label_or_checkout_path_and_rejects_sibling_run() {
+        let run_a = "demo-1000-aaaaaaa";
+        let run_b = "demo-1000-bbbbbbb";
+
+        // Matches via lunacy.run_id Docker label (e.g. service container without repo bind mount).
+        let by_label = serde_json::json!([{
+            "Config": {
+                "Labels": { "lunacy.run_id": run_a },
+                "WorkingDir": "/app"
+            },
+            "Mounts": []
+        }])
+        .to_string();
+        assert!(container_inspect_matches_run(&by_label, run_a));
+        assert!(!container_inspect_matches_run(&by_label, run_b));
+
+        // Matches via bind mount checkout path containing run_id.
+        let by_mount = serde_json::json!([{
+            "Config": { "Labels": {}, "WorkingDir": "/workspace" },
+            "Mounts": [{ "Source": format!("/var/lib/lunacy/checkouts/{run_a}/repo") }]
+        }])
+        .to_string();
+        assert!(container_inspect_matches_run(&by_mount, run_a));
+        assert!(!container_inspect_matches_run(&by_mount, run_b));
+
+        // Unrelated sibling run container must NOT match.
+        let sibling = serde_json::json!([{
+            "Config": {
+                "Labels": { "lunacy.run_id": run_b },
+                "WorkingDir": "/workspace"
+            },
+            "Mounts": [{ "Source": format!("/var/lib/lunacy/checkouts/{run_b}/repo") }]
+        }])
+        .to_string();
+        assert!(!container_inspect_matches_run(&sibling, run_a));
+        assert!(!container_inspect_matches_run(&sibling, ""));
+    }
+
+    #[test]
+    fn base_env_isolates_lunacy_cache_dir_per_project_run_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let repo = dir.path().join("repo");
+        let act_lock = state_dir.join("act.lock");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.general.state_dir = Some(state_dir.clone());
+        let project = ProjectCfg {
+            name: "My App".into(),
+            repo_path: repo.clone(),
+            remote: "origin".into(),
+            branch: "master".into(),
+            enabled: None,
+            github_repo: None,
+            github_enabled: None,
+            checkout: Checkout::Worktree,
+            poll_interval: None,
+            trigger_mode: None,
+            step_timeout: None,
+            timeout: None,
+            env: BTreeMap::new(),
+            contexts: Default::default(),
+            discord_enabled: None,
+            discord_webhook_url: None,
+            discord_webhook_url_file: None,
+            notify_on_start: None,
+            discord_notify_on: None,
+            discord_username: None,
+            discord_mention_on_failure: None,
+            shell: None,
+            platforms: BTreeMap::new(),
+            act_args: Vec::new(),
+            watch_prs: false,
+            deploy_refs: Vec::new(),
+            watch_tags: false,
+            cache: Some(true),
+            max_concurrent_runs: Some(2),
+            ci: Vec::new(),
+            deploy: Vec::new(),
+        };
+        let run = Run::new(
+            &project.name,
+            "1111111111111111111111111111111111111111",
+            "test".into(),
+            Trigger::Manual,
+            Vec::new(),
+        );
+        let spec = RunSpec {
+            sha: run.sha.clone(),
+            trigger: Trigger::Manual,
+            git_ref: "master".into(),
+            pr: None,
+            deploy_only: false,
+            force_deploy: false,
+            trigger_reason: None,
+        };
+        let noop = |_: &Run| {};
+
+        let ctx0 = Ctx {
+            cfg: &cfg,
+            state_dir: &state_dir,
+            os: Os::current(),
+            github: None,
+            on_update: &noop,
+            act_lock: &act_lock,
+            cancel: None,
+            on_log_chunk: None,
+            deploy_lock: None,
+            repo_git_lock: None,
+            project_run_slot: 0,
+        };
+        let env0 = base_env(&ctx0, &run, &project, &spec, &repo, None);
+        let expected0 = cfg
+            .act()
+            .effective_cache_dir(&state_dir)
+            .join("projects")
+            .join("my-app");
+        assert_eq!(
+            env0.get("LUNACY_CACHE_DIR").map(String::as_str),
+            Some(expected0.to_string_lossy().as_ref())
+        );
+
+        let ctx1 = Ctx {
+            project_run_slot: 1,
+            ..ctx0
+        };
+        let env1 = base_env(&ctx1, &run, &project, &spec, &repo, None);
+        let expected1 = cfg
+            .act()
+            .effective_cache_dir(&state_dir)
+            .join("projects")
+            .join("my-app-slot-1");
+        assert_eq!(
+            env1.get("LUNACY_CACHE_DIR").map(String::as_str),
+            Some(expected1.to_string_lossy().as_ref())
+        );
+        assert!(expected1.is_dir());
+    }
 }

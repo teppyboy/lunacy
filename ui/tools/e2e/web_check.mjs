@@ -1,4 +1,4 @@
-// Headless Chrome CDP check for the lunacy web build (WASM + fetch).
+// Headless Chrome CDP check for the lunacy web build (WASM + WebSocket + fetch).
 // Usage: node web_check.mjs <cdpPort> <httpPort> <token> <runId> <coordsJson>
 
 const [cdpPort, httpPort, token, runId, coordsRaw] = process.argv.slice(2);
@@ -22,7 +22,15 @@ let seq = 0;
 const pending = new Map();
 const requests = new Map();
 const responses = [];
+const wsSockets = [];
+const wsFrames = [];
 const consoleErrors = [];
+
+const resetNetwork = () => {
+  responses.length = 0;
+  wsSockets.length = 0;
+  wsFrames.length = 0;
+};
 
 ws.onmessage = (ev) => {
   const msg = JSON.parse(ev.data);
@@ -49,6 +57,20 @@ ws.onmessage = (ev) => {
       status: response.status,
       hasAuth: Boolean(req.headers.Authorization || req.headers.authorization),
     });
+  } else if (msg.method === 'Network.webSocketCreated') {
+    wsSockets.push({
+      requestId: msg.params.requestId,
+      url: msg.params.url,
+    });
+  } else if (msg.method === 'Network.webSocketFrameReceived') {
+    const payload = msg.params?.response?.payloadData;
+    if (typeof payload === 'string') {
+      try {
+        wsFrames.push(JSON.parse(payload));
+      } catch {
+        // Ignore non-JSON frames.
+      }
+    }
   } else if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
     consoleErrors.push(msg.params.args.map((a) => a.value ?? a.description ?? '').join(' '));
   } else if (msg.method === 'Runtime.exceptionThrown') {
@@ -74,7 +96,9 @@ const waitFor = async (pred, timeoutMs, label) => {
     if (await pred()) return;
     await sleep(100);
   }
-  throw new Error(`timeout waiting for ${label}; responses=${JSON.stringify(responses.slice(-10))}`);
+  throw new Error(
+    `timeout waiting for ${label}; responses=${JSON.stringify(responses.slice(-10))}; wsSockets=${JSON.stringify(wsSockets.slice(-5))}; wsFrames=${JSON.stringify(wsFrames.slice(-5).map((f) => f.type))}`,
+  );
 };
 
 const clickAt = async (pt) => {
@@ -111,61 +135,76 @@ await send('Emulation.setDeviceMetricsOverride', {
   mobile: false,
 });
 
-// 1) Initial load without token -> WebGPU boots and /api/ returns 401
+// 1) Initial load without token -> WebGPU boots and /api/ returns 401 or WS reports auth_error
 await send('Page.navigate', { url: `${base}/` });
-await waitFor(async () => {
-  const r = await send('Runtime.evaluate', {
-    expression: "document.querySelector('#status')?.textContent || 'GONE'",
-  });
-  const txt = r.result?.value;
-  if (txt && txt.startsWith('lunacy could not start:')) {
-    throw new Error(`web boot failed: ${txt}`);
-  }
-  return txt === 'GONE' && responses.some((x) => x.url.includes('/api/projects') && x.status === 401);
-}, 15000, 'initial unauthorized /api/projects');
+await waitFor(
+  async () => {
+    const r = await send('Runtime.evaluate', {
+      expression: "document.querySelector('#status')?.textContent || 'GONE'",
+    });
+    const txt = r.result?.value;
+    if (txt && txt.startsWith('lunacy could not start:')) {
+      throw new Error(`web boot failed: ${txt}`);
+    }
+    const got401 = responses.some((x) => x.url.includes('/api/') && x.status === 401);
+    const gotWsAuthErr = wsFrames.some((f) => f.type === 'auth_error');
+    return txt === 'GONE' && (got401 || gotWsAuthErr);
+  },
+  15000,
+  'initial unauthorized /api/ or WS auth failure',
+);
 
-// 2) Seed token in localStorage and reload `/` -> all /api/ calls return 2xx with Bearer auth
-responses.length = 0;
+// 2) Seed token in localStorage and reload `/` -> WS /api/ws connects + receives snapshot + GET /api/system 200,
+//    and does NOT spam periodic GET /api/projects while WS is connected.
+resetNetwork();
 await send('Runtime.evaluate', {
   expression: `localStorage.setItem('lunacy.token', ${JSON.stringify(token)})`,
 });
 await send('Page.reload');
 await waitFor(
   () =>
-    responses.some((x) => x.url.endsWith('/api/projects') && x.status === 200 && x.hasAuth) &&
+    wsSockets.some((s) => s.url.includes('/api/ws')) &&
+    wsFrames.some((f) => f.type === 'snapshot') &&
     responses.some((x) => x.url.endsWith('/api/system') && x.status === 200 && x.hasAuth),
   15000,
-  'authenticated / load',
+  'authenticated / load (WS snapshot + GET /api/system)',
 );
+await sleep(2500);
+const projectPolls = responses.filter((x) => x.url.endsWith('/api/projects'));
+if (projectPolls.length > 1) {
+  throw new Error(`expected no periodic GET /api/projects while WS connected, saw ${projectPolls.length}`);
+}
 const badOnRoot = responses.filter((x) => x.url.includes('/api/') && (x.status < 200 || x.status >= 300 || !x.hasAuth));
 if (badOnRoot.length) throw new Error(`unexpected non-2xx/unauthed call on /: ${JSON.stringify(badOnRoot)}`);
 
 // 3) Deep link `/#/runs/<id>` (navigate via about:blank so it performs a fresh WASM boot)
 await send('Page.navigate', { url: 'about:blank' });
 await sleep(100);
-responses.length = 0;
+resetNetwork();
 await send('Page.navigate', { url: `${base}/#/runs/${encodeURIComponent(runId)}` });
 await waitFor(
-  () => responses.some((x) => x.url.includes(`/api/runs/${runId}`) && x.status === 200 && x.hasAuth),
+  () =>
+    wsFrames.some((f) => f.type === 'run_updated' && f.run?.id === runId) ||
+    responses.some((x) => x.url.includes(`/api/runs/${runId}`) && x.status === 200 && x.hasAuth),
   15000,
   '/#/runs/<id> deep link',
 );
 
-// 4) Path deep link `/runs/<id>` -> redirects to `#/runs/<id>` and fetches run with auth
+// 4) Path deep link `/runs/<id>` -> redirects to `#/runs/<id>` and loads run cleanly
 await send('Page.navigate', { url: 'about:blank' });
 await sleep(100);
-responses.length = 0;
+resetNetwork();
 await send('Page.navigate', { url: `${base}/runs/${encodeURIComponent(runId)}` });
 await waitFor(
   async () => {
     const h = await send('Runtime.evaluate', { expression: 'location.hash' });
-    return (
-      h.result?.value === `#/runs/${runId}` &&
-      responses.some((x) => x.url.includes(`/api/runs/${runId}`) && x.status === 200 && x.hasAuth)
-    );
+    const loaded =
+      wsFrames.some((f) => f.type === 'run_updated' && f.run?.id === runId) ||
+      responses.some((x) => x.url.includes(`/api/runs/${runId}`) && x.status === 200 && x.hasAuth);
+    return h.result?.value === `#/runs/${runId}` && loaded;
   },
   15000,
-  '/runs/<id> redirect + API load',
+  '/runs/<id> redirect + run load',
 );
 const badOnDeep = responses.filter((x) => x.url.includes('/api/') && (x.status < 200 || x.status >= 300 || !x.hasAuth));
 if (badOnDeep.length) throw new Error(`bad API call on /runs/${runId}: ${JSON.stringify(badOnDeep)}`);
@@ -173,10 +212,12 @@ if (badOnDeep.length) throw new Error(`bad API call on /runs/${runId}: ${JSON.st
 // 5) Canvas click flow on web: navigate `/` cleanly, open Settings, edit poll_interval -> 150, Save -> PUT /api/config 200
 await send('Page.navigate', { url: 'about:blank' });
 await sleep(100);
-responses.length = 0;
+resetNetwork();
 await send('Page.navigate', { url: `${base}/` });
 await waitFor(
-  () => responses.some((x) => x.url.endsWith('/api/projects') && x.status === 200),
+  () =>
+    wsFrames.some((f) => f.type === 'snapshot') ||
+    responses.some((x) => x.url.endsWith('/api/projects') && x.status === 200),
   15000,
   'reload / before settings click',
 );
@@ -207,5 +248,10 @@ await waitFor(
 if (consoleErrors.length) {
   throw new Error(`browser console/exception errors: ${JSON.stringify(consoleErrors)}`);
 }
-console.log(JSON.stringify({ ok: true, checked: ['/', '/#/runs/' + runId, '/runs/' + runId, 'PUT /api/config'] }));
+console.log(
+  JSON.stringify({
+    ok: true,
+    checked: ['/', '/api/ws', '/#/runs/' + runId, '/runs/' + runId, 'PUT /api/config'],
+  }),
+);
 process.exit(0);

@@ -278,6 +278,26 @@ pub struct Health {
     pub version: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebhookInfo {
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub deliveries: u64,
+    #[serde(default)]
+    pub last_event: Option<String>,
+    #[serde(default)]
+    pub last_repo: Option<String>,
+    #[serde(default)]
+    pub last_delivery_id: Option<String>,
+    #[serde(default)]
+    pub last_received_at: Option<String>,
+    #[serde(default)]
+    pub last_outcome: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SystemInfo {
     #[serde(default)]
@@ -294,6 +314,8 @@ pub struct SystemInfo {
     pub docker: DockerInfo,
     #[serde(default)]
     pub git: ToolInfo,
+    #[serde(default)]
+    pub webhook: Option<WebhookInfo>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -346,6 +368,10 @@ pub struct ApiError {
 pub struct CancelResult {
     #[serde(default)]
     pub cancelling: bool,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub orphaned: bool,
     #[serde(default)]
     pub run_id: String,
     #[serde(default)]
@@ -513,6 +539,8 @@ pub struct DeployProjectCheck {
     pub deploy_refs: Vec<String>,
     #[serde(default)]
     pub cache_enabled: bool,
+    #[serde(default)]
+    pub trigger_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

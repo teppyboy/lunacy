@@ -656,6 +656,7 @@ pub struct LogState {
     pub loading: bool,
     pub error: Option<String>,
     pub mode: Option<LogMode>,
+    pub offset: u64,
 }
 
 /// How reachable the daemon is.
@@ -878,6 +879,17 @@ pub struct State {
     pub force: bool,
 
     pub bus: Bus,
+    pub ws: crate::ws::WsClient,
+    /// True once the WebSocket has authenticated and/or delivered its initial snapshot.
+    pub ws_connected: bool,
+    ws_connecting: bool,
+    ws_disabled_until_reconnect: bool,
+    ws_backoff_secs: f64,
+    ws_next_retry: f64,
+    ws_grace_until: f64,
+    ws_sub_run: Option<String>,
+    ws_sub_log: Option<(String, usize, Option<usize>)>,
+
     pub update_status: UpdateStatus,
     pub update_dismissed: bool,
     pub auto_update_check: bool,
@@ -961,6 +973,15 @@ impl State {
             clearing_cache: false,
             force: false,
             bus: Bus::default(),
+            ws: crate::ws::WsClient::default(),
+            ws_connected: false,
+            ws_connecting: false,
+            ws_disabled_until_reconnect: false,
+            ws_backoff_secs: 1.0,
+            ws_next_retry: 0.0,
+            ws_grace_until: 0.0,
+            ws_sub_run: None,
+            ws_sub_log: None,
             update_status: UpdateStatus::Idle,
             update_dismissed: false,
             auto_update_check: true,
@@ -1162,13 +1183,22 @@ impl State {
             ..Editor::default()
         };
         self.bus.cancel();
+        self.ws.disconnect();
+        self.ws_connected = false;
+        self.ws_connecting = false;
+        self.ws_disabled_until_reconnect = false;
+        self.ws_backoff_secs = 1.0;
+        self.ws_next_retry = 0.0;
+        self.ws_grace_until = 0.0;
+        self.ws_sub_run = None;
+        self.ws_sub_log = None;
         self.next_projects = 0.0;
         self.next_runs = 0.0;
         self.next_run = 0.0;
         self.next_log = 0.0;
         self.next_system = 0.0;
-        self.asked_system = false;
-        self.request_projects();
+        self.asked_system = true;
+        self.start_ws();
         self.request_config();
         self.request_system();
         if matches!(
@@ -1187,6 +1217,7 @@ impl State {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.bus.set_waker(waker.clone());
+            self.ws.set_waker(waker.clone());
             self.updater.set_waker(waker);
         }
         #[cfg(target_arch = "wasm32")]
@@ -1196,7 +1227,347 @@ impl State {
     /// Web: the handle `spawn_local` answers use to land back in `poll`.
     #[cfg(target_arch = "wasm32")]
     pub fn adopt(&mut self, handle: rune::AppHandle<State>) {
-        self.bus.attach(handle);
+        self.bus.attach(handle.clone());
+        self.ws.attach(handle);
+    }
+
+    /// Starts (or restarts) the WebSocket transport for the active `live` connection.
+    pub fn start_ws(&mut self) {
+        if self.demo || self.ws_disabled_until_reconnect || self.link == Link::Unauthorized {
+            return;
+        }
+        let base = self.server();
+        if base.is_empty() {
+            return;
+        }
+        let token = self.token();
+        self.ws_connected = false;
+        self.ws_sub_run = None;
+        self.ws_sub_log = None;
+        if self.ws.connect(&base, &token) {
+            self.ws_connecting = true;
+            self.ws_grace_until = self.clock + 0.45;
+        } else {
+            self.ws_connecting = false;
+            self.ws_grace_until = 0.0;
+            self.ws_next_retry = self.clock + self.ws_backoff_secs;
+            self.ws_backoff_secs = match self.ws_backoff_secs {
+                b if b < 1.5 => 2.0,
+                b if b < 3.0 => 4.0,
+                b if b < 6.0 => 8.0,
+                _ => 15.0,
+            };
+        }
+    }
+
+    /// Synchronizes active run & log subscriptions with the live WebSocket connection.
+    pub fn sync_ws_subscriptions(&mut self) {
+        if !self.ws_connected || self.demo {
+            return;
+        }
+        let want_run = match &self.view {
+            View::Run { id } => Some(id.clone()),
+            _ => None,
+        };
+        if want_run != self.ws_sub_run {
+            match &want_run {
+                Some(run_id) => {
+                    self.ws.send(crate::ws::ClientMsg::SubscribeRun {
+                        run_id: run_id.clone(),
+                    });
+                }
+                None => {
+                    if self.ws_sub_run.is_some() {
+                        self.ws.send(crate::ws::ClientMsg::UnsubscribeRun);
+                    }
+                }
+            }
+            self.ws_sub_run = want_run.clone();
+        }
+
+        let want_log = match (&want_run, self.open_step) {
+            (Some(run_id), Some(step)) => {
+                let mode = self
+                    .logs
+                    .get(&(run_id.clone(), step))
+                    .and_then(|e| e.mode)
+                    .unwrap_or(LogMode::Tail);
+                Some((run_id.clone(), step, mode.tail()))
+            }
+            _ => None,
+        };
+        if want_log != self.ws_sub_log {
+            match &want_log {
+                Some((run_id, step, tail)) => {
+                    let mode = if tail.is_some() {
+                        LogMode::Tail
+                    } else {
+                        LogMode::Full
+                    };
+                    let entry = self.logs.entry((run_id.clone(), *step)).or_default();
+                    if entry.mode != Some(mode) {
+                        entry.loading = true;
+                        entry.error = None;
+                        entry.mode = Some(mode);
+                    }
+                    self.ws.send(crate::ws::ClientMsg::SubscribeLog {
+                        run_id: run_id.clone(),
+                        step: *step,
+                        tail: *tail,
+                    });
+                }
+                None => {
+                    if self.ws_sub_log.is_some() {
+                        self.ws.send(crate::ws::ClientMsg::UnsubscribeLog);
+                    }
+                }
+            }
+            self.ws_sub_log = want_log;
+        }
+    }
+
+    /// Processes a single WebSocket transport event; returns whether the view must redraw.
+    pub fn handle_ws_event(&mut self, gen: u64, event: crate::ws::WsEvent, tx: &mut Tx) -> bool {
+        use crate::ws::{ServerMsg, WsEvent};
+
+        if self.demo || gen != self.ws.generation() {
+            return false;
+        }
+        let now = self.clock.max(tx.clock());
+        match event {
+            WsEvent::Opened => false,
+            WsEvent::Unauthorized => {
+                self.ws_connected = false;
+                self.ws_connecting = false;
+                self.ws_disabled_until_reconnect = true;
+                self.ws_sub_run = None;
+                self.ws_sub_log = None;
+                self.ws.disconnect();
+                let first = self.link != Link::Unauthorized;
+                self.link = Link::Unauthorized;
+                if first {
+                    tx.animated();
+                    self.toast(
+                        tx,
+                        ToastKind::Error,
+                        "Unauthorized",
+                        &Failure::Unauthorized.message(),
+                    );
+                }
+                true
+            }
+            WsEvent::Unsupported => {
+                self.ws_connected = false;
+                self.ws_connecting = false;
+                self.ws_disabled_until_reconnect = true;
+                self.ws_sub_run = None;
+                self.ws_sub_log = None;
+                self.ws.disconnect();
+                self.next_projects = 0.0;
+                self.next_runs = 0.0;
+                self.next_run = 0.0;
+                self.next_log = 0.0;
+                self.refresh(tx);
+                false
+            }
+            WsEvent::Closed { why: _ } => {
+                let was_connected = self.ws_connected;
+                self.ws_connected = false;
+                self.ws_connecting = false;
+                self.ws_sub_run = None;
+                self.ws_sub_log = None;
+                if !self.ws_disabled_until_reconnect && self.link != Link::Unauthorized {
+                    self.ws_next_retry = now + self.ws_backoff_secs;
+                    self.ws_backoff_secs = match self.ws_backoff_secs {
+                        b if b < 1.5 => 2.0,
+                        b if b < 3.0 => 4.0,
+                        b if b < 6.0 => 8.0,
+                        _ => 15.0,
+                    };
+                    self.next_projects = 0.0;
+                    self.next_runs = 0.0;
+                    self.next_run = 0.0;
+                    self.next_log = 0.0;
+                    self.refresh(tx);
+                }
+                was_connected
+            }
+            WsEvent::Message(msg) => match msg {
+                ServerMsg::AuthOk { version } => {
+                    if !version.is_empty() {
+                        self.version = version;
+                    }
+                    self.ws_connected = true;
+                    self.ws_connecting = false;
+                    self.ws_backoff_secs = 1.0;
+                    self.note_reachable(tx);
+                    self.sync_ws_subscriptions();
+                    true
+                }
+                ServerMsg::AuthError { .. } => self.handle_ws_event(gen, WsEvent::Unauthorized, tx),
+                ServerMsg::Snapshot { version, projects } => {
+                    if !version.is_empty() {
+                        self.version = version;
+                    }
+                    self.ws_connected = true;
+                    self.ws_connecting = false;
+                    self.ws_backoff_secs = 1.0;
+                    self.note_reachable(tx);
+                    let changed = self.apply_projects(projects, tx);
+                    self.sync_ws_subscriptions();
+                    if let View::Project { name } = self.view.clone() {
+                        if self.runs_for.as_deref() != Some(name.as_str()) && !self.runs_loading {
+                            self.request_runs(&name);
+                        }
+                    }
+                    changed || true
+                }
+                ServerMsg::ProjectsUpdated { projects } => {
+                    let refresh_project_runs = if let View::Project { name } = &self.view {
+                        let prev = self.projects.iter().find(|p| &p.name == name);
+                        let next = projects.iter().find(|p| &p.name == name);
+                        match (prev, next) {
+                            (Some(a), Some(b)) => {
+                                a.running != b.running
+                                    || a.last_run.as_ref().map(|r| (&r.id, r.status))
+                                        != b.last_run.as_ref().map(|r| (&r.id, r.status))
+                                    || a.current_run.as_ref().map(|r| (&r.id, r.status))
+                                        != b.current_run.as_ref().map(|r| (&r.id, r.status))
+                            }
+                            (None, Some(_)) => true,
+                            _ => false,
+                        }
+                        .then(|| name.clone())
+                    } else {
+                        None
+                    };
+                    let changed = self.apply_projects(projects, tx);
+                    if let Some(name) = refresh_project_runs {
+                        self.request_runs(&name);
+                    }
+                    changed
+                }
+                ServerMsg::RunUpdated { run } => {
+                    if !matches!(&self.view, View::Run { id } if id == &run.id) {
+                        return false;
+                    }
+                    self.apply_run(*run, tx)
+                }
+                ServerMsg::RunNotFound { run_id } => {
+                    if !matches!(&self.view, View::Run { id } if id == &run_id) {
+                        return false;
+                    }
+                    self.run = None;
+                    self.run_error = Some("unknown run".into());
+                    true
+                }
+                ServerMsg::LogSnapshot {
+                    run_id,
+                    step,
+                    tail,
+                    text,
+                    offset,
+                } => {
+                    let mode = if tail.is_some() {
+                        LogMode::Tail
+                    } else {
+                        LogMode::Full
+                    };
+                    let active = self.run.as_ref().is_some_and(|r| r.id == run_id)
+                        && self.open_step == Some(step);
+                    let in_steps_accordion = !self.log_view_raw
+                        && self
+                            .run
+                            .as_ref()
+                            .and_then(|r| r.steps.get(step))
+                            .is_some_and(|st| !st.substeps.is_empty());
+                    let entry = self.logs.entry((run_id, step)).or_default();
+                    if entry.mode.is_some_and(|m| m != mode) {
+                        return false;
+                    }
+                    let was_empty = entry.text.is_empty();
+                    let changed = entry.text != text || entry.loading || entry.error.is_some();
+                    entry.text = text;
+                    entry.loading = false;
+                    entry.error = None;
+                    entry.mode = Some(mode);
+                    entry.offset = offset;
+                    if active && !in_steps_accordion && (was_empty || self.stick_log_pending) {
+                        self.stick_log_pending = false;
+                        tx.scroll_to_bottom_instant("run-log-scroll");
+                    }
+                    changed
+                }
+                ServerMsg::LogChunk {
+                    run_id,
+                    step,
+                    chunk,
+                    offset,
+                } => {
+                    if chunk.is_empty() {
+                        return false;
+                    }
+                    let active = self.run.as_ref().is_some_and(|r| r.id == run_id)
+                        && self.open_step == Some(step);
+                    let in_steps_accordion = !self.log_view_raw
+                        && self
+                            .run
+                            .as_ref()
+                            .and_then(|r| r.steps.get(step))
+                            .is_some_and(|st| !st.substeps.is_empty());
+                    let entry = self.logs.entry((run_id, step)).or_default();
+                    if entry.loading || (offset > 0 && entry.offset > 0 && offset <= entry.offset) {
+                        return false;
+                    }
+                    entry.text.push_str(&chunk);
+                    if entry.mode == Some(LogMode::Tail) {
+                        if let Some(limit) = LogMode::Tail.tail() {
+                            crate::ws::clamp_tail_lines(&mut entry.text, limit);
+                        }
+                    }
+                    entry.loading = false;
+                    entry.error = None;
+                    entry.offset = offset;
+                    if active && !in_steps_accordion && self.stick_log_pending {
+                        self.stick_log_pending = false;
+                        tx.scroll_to_bottom_instant("run-log-scroll");
+                    }
+                    true
+                }
+                ServerMsg::ConfigUpdated => {
+                    if self.editor.loaded && !self.editor.dirty() {
+                        self.request_config();
+                    }
+                    false
+                }
+                ServerMsg::WebhookReceived {
+                    event,
+                    repo,
+                    received_at,
+                    queued,
+                    delivery_id,
+                    outcome,
+                } => {
+                    let Some(sys) = self.system.as_mut() else {
+                        return false;
+                    };
+                    let wh = sys.webhook.get_or_insert_with(Default::default);
+                    wh.configured = true;
+                    wh.deliveries = wh.deliveries.saturating_add(1);
+                    if !event.is_empty() {
+                        wh.last_event = Some(event);
+                    }
+                    wh.last_repo = repo;
+                    if received_at.is_some() {
+                        wh.last_received_at = received_at;
+                    }
+                    wh.last_delivery_id = delivery_id;
+                    wh.last_outcome = outcome.or_else(|| queued.then(|| "queued".to_string()));
+                    true
+                }
+                ServerMsg::Pong | ServerMsg::Unknown => false,
+            },
+        }
     }
 
     /// The server URL as the rail shows it: no scheme, so it fits.
@@ -1299,6 +1670,20 @@ impl State {
         entry.loading = true;
         entry.error = None;
         entry.mode = Some(mode);
+        entry.offset = 0;
+        if self.ws_connected && !self.demo {
+            let want = Some((run.to_string(), index, mode.tail()));
+            if self.ws_sub_log == want {
+                self.ws.send(crate::ws::ClientMsg::SubscribeLog {
+                    run_id: run.to_string(),
+                    step: index,
+                    tail: mode.tail(),
+                });
+            } else {
+                self.sync_ws_subscriptions();
+            }
+            return;
+        }
         self.send(
             Slot::Log,
             Call::Log {
@@ -1552,6 +1937,12 @@ impl State {
             Failure::Unauthorized => {
                 let first = self.link != Link::Unauthorized;
                 self.link = Link::Unauthorized;
+                self.ws_connected = false;
+                self.ws_connecting = false;
+                self.ws_disabled_until_reconnect = true;
+                self.ws_sub_run = None;
+                self.ws_sub_log = None;
+                self.ws.disconnect();
                 if first {
                     toast = Some((ToastKind::Error, "Unauthorized".into(), failure.message()));
                 }
@@ -1619,20 +2010,40 @@ impl State {
             }
             Call::Trigger { project, .. } => {
                 self.triggering = None;
-                if matches!(failure, Failure::Api { status: 409, .. }) {
-                    toast = Some((
-                        ToastKind::Info,
-                        "Already running".into(),
-                        format!(
-                            "{project} is still running. Wait for it to finish, or force a run."
-                        ),
-                    ));
-                } else {
-                    toast = Some((
-                        ToastKind::Error,
-                        format!("Could not start {project}"),
-                        failure.message(),
-                    ));
+                match &failure {
+                    Failure::Api {
+                        status: 409,
+                        message,
+                        ..
+                    } if message.trim().is_empty()
+                        || message.to_ascii_lowercase().contains("running") =>
+                    {
+                        toast = Some((
+                            ToastKind::Info,
+                            "Already running".into(),
+                            format!(
+                                "{project} is still running. Wait for it to finish, or force a run."
+                            ),
+                        ));
+                    }
+                    Failure::Api {
+                        status: 409,
+                        message,
+                        ..
+                    } => {
+                        toast = Some((
+                            ToastKind::Error,
+                            "Could not start run".into(),
+                            message.clone(),
+                        ));
+                    }
+                    _ => {
+                        toast = Some((
+                            ToastKind::Error,
+                            format!("Could not start {project}"),
+                            failure.message(),
+                        ));
+                    }
                 }
             }
             Call::CancelRun { .. } | Call::CancelProject { .. } => {
@@ -1676,58 +2087,104 @@ impl State {
         true
     }
 
+    fn apply_projects(&mut self, projects: Vec<ProjectView>, tx: &mut Tx) -> bool {
+        self.loaded = true;
+        self.projects_error = None;
+        let before: Vec<(String, ProjectState)> = self
+            .projects
+            .iter()
+            .map(|p| (p.name.clone(), p.state()))
+            .collect();
+        let after: Vec<(String, ProjectState)> = projects
+            .iter()
+            .map(|p| (p.name.clone(), p.state()))
+            .collect();
+        if self.ready && before != after {
+            for (name, state) in &after {
+                let prev = before.iter().find(|(n, _)| n == name).map(|(_, s)| *s);
+                if *state == ProjectState::Running && prev != Some(ProjectState::Running) {
+                    self.toast(
+                        tx,
+                        ToastKind::Info,
+                        "Run started",
+                        &format!("{name} picked up work."),
+                    );
+                }
+            }
+        }
+        self.projects = projects;
+        if let Some(cid) = self.cancelling.as_deref() {
+            let still_running = self.projects.iter().any(|p| {
+                p.running
+                    && (p.name == cid
+                        || p.current_run
+                            .as_ref()
+                            .is_some_and(|r| r.id == cid && r.status.is_running()))
+            });
+            let finished_seen = self.projects.iter().any(|p| {
+                (!p.running && p.name == cid) || p.last_run.as_ref().is_some_and(|r| r.id == cid)
+            });
+            if !still_running && finished_seen {
+                self.cancelling = None;
+            }
+        }
+        // A project that vanished from the config takes the detail view with it.
+        if let View::Project { name } = &self.view {
+            if !self.projects.iter().any(|p| &p.name == name) {
+                self.view = View::Projects;
+            }
+        }
+        true
+    }
+
+    fn apply_run(&mut self, run: Run, tx: &mut Tx) -> bool {
+        let prev_open = self.open_step;
+        let open = self.open_step.filter(|i| *i < run.steps.len());
+        let step_finished = open.is_some_and(|idx| {
+            self.run
+                .as_ref()
+                .and_then(|r| r.steps.get(idx))
+                .is_some_and(|s| s.status.is_live())
+                && !run.steps[idx].status.is_live()
+        });
+        let changed = self.run.as_ref() != Some(&run);
+        self.open_step = open;
+        if !run.status.is_running() && self.cancelling.as_deref() == Some(run.id.as_str()) {
+            self.cancelling = None;
+        }
+        self.run = Some(run);
+        self.run_error = None;
+        let in_steps_accordion = !self.log_view_raw
+            && open.is_some_and(|idx| {
+                self.run
+                    .as_ref()
+                    .and_then(|r| r.steps.get(idx))
+                    .is_some_and(|st| !st.substeps.is_empty())
+            });
+        if prev_open != open && open.is_some() && !in_steps_accordion {
+            self.stick_log_pending = true;
+            tx.scroll_to_bottom_instant("run-log-scroll");
+        }
+        if self.ws_connected && !self.demo {
+            self.sync_ws_subscriptions();
+        } else if step_finished {
+            if let (Some(r), Some(idx)) = (self.run.clone(), open) {
+                let mode = self
+                    .logs
+                    .get(&(r.id.clone(), idx))
+                    .and_then(|e| e.mode)
+                    .unwrap_or(LogMode::Tail);
+                self.request_log(&r.id, idx, mode);
+            }
+        } else {
+            self.request_next_log();
+        }
+        changed || step_finished
+    }
+
     fn apply(&mut self, call: Call, answer: Answer, tx: &mut Tx) -> bool {
         match answer {
-            Answer::Projects(projects) => {
-                self.loaded = true;
-                self.projects_error = None;
-                let before: Vec<(String, ProjectState)> = self
-                    .projects
-                    .iter()
-                    .map(|p| (p.name.clone(), p.state()))
-                    .collect();
-                let after: Vec<(String, ProjectState)> = projects
-                    .iter()
-                    .map(|p| (p.name.clone(), p.state()))
-                    .collect();
-                if self.ready && before != after {
-                    for (name, state) in &after {
-                        let prev = before.iter().find(|(n, _)| n == name).map(|(_, s)| *s);
-                        if *state == ProjectState::Running && prev != Some(ProjectState::Running) {
-                            self.toast(
-                                tx,
-                                ToastKind::Info,
-                                "Run started",
-                                &format!("{name} picked up work."),
-                            );
-                        }
-                    }
-                }
-                self.projects = projects;
-                if let Some(cid) = self.cancelling.as_deref() {
-                    let still_running = self.projects.iter().any(|p| {
-                        p.running
-                            && (p.name == cid
-                                || p.current_run
-                                    .as_ref()
-                                    .is_some_and(|r| r.id == cid && r.status.is_running()))
-                    });
-                    let finished_seen = self.projects.iter().any(|p| {
-                        (!p.running && p.name == cid)
-                            || p.last_run.as_ref().is_some_and(|r| r.id == cid)
-                    });
-                    if !still_running && finished_seen {
-                        self.cancelling = None;
-                    }
-                }
-                // A project that vanished from the config takes the detail view with it.
-                if let View::Project { name } = &self.view {
-                    if !self.projects.iter().any(|p| &p.name == name) {
-                        self.view = View::Projects;
-                    }
-                }
-                true
-            }
+            Answer::Projects(projects) => self.apply_projects(projects, tx),
             Answer::Project(p) => {
                 if let Some(slot) = self.projects.iter_mut().find(|x| x.name == p.name) {
                     *slot = *p;
@@ -1743,48 +2200,7 @@ impl State {
                 self.runs = runs;
                 true
             }
-            Answer::Run(run) => {
-                let prev_open = self.open_step;
-                let open = self.open_step.filter(|i| *i < run.steps.len());
-                let step_finished = open.is_some_and(|idx| {
-                    self.run
-                        .as_ref()
-                        .and_then(|r| r.steps.get(idx))
-                        .is_some_and(|s| s.status.is_live())
-                        && !run.steps[idx].status.is_live()
-                });
-                let changed = self.run.as_ref() != Some(run.as_ref());
-                self.open_step = open;
-                if !run.status.is_running() && self.cancelling.as_deref() == Some(run.id.as_str()) {
-                    self.cancelling = None;
-                }
-                self.run = Some(*run);
-                self.run_error = None;
-                let in_steps_accordion = !self.log_view_raw
-                    && open.is_some_and(|idx| {
-                        self.run
-                            .as_ref()
-                            .and_then(|r| r.steps.get(idx))
-                            .is_some_and(|st| !st.substeps.is_empty())
-                    });
-                if prev_open != open && open.is_some() && !in_steps_accordion {
-                    self.stick_log_pending = true;
-                    tx.scroll_to_bottom_instant("run-log-scroll");
-                }
-                if step_finished {
-                    if let (Some(r), Some(idx)) = (self.run.clone(), open) {
-                        let mode = self
-                            .logs
-                            .get(&(r.id.clone(), idx))
-                            .and_then(|e| e.mode)
-                            .unwrap_or(LogMode::Tail);
-                        self.request_log(&r.id, idx, mode);
-                    }
-                } else {
-                    self.request_next_log();
-                }
-                changed || step_finished
-            }
+            Answer::Run(run) => self.apply_run(*run, tx),
             Answer::Log {
                 run,
                 index,
@@ -1845,19 +2261,41 @@ impl State {
                 match ok {
                     Ok(res) => {
                         let target = if res.project.is_empty() {
-                            id
+                            id.clone()
                         } else {
-                            res.project
+                            res.project.clone()
                         };
-                        self.toast(
-                            tx,
-                            ToastKind::Info,
-                            "Cancelling run",
-                            &format!("{target}: cancellation requested."),
-                        );
+                        if res.orphaned {
+                            self.toast(
+                                tx,
+                                ToastKind::Success,
+                                "Cancelled dead run",
+                                &format!("{target}: dead run was marked cancelled."),
+                            );
+                            if let Some(run) = self.run.as_mut() {
+                                if run.id == res.run_id || run.id == id {
+                                    run.status = crate::model::RunStatus::Cancelled;
+                                }
+                            }
+                        } else {
+                            self.toast(
+                                tx,
+                                ToastKind::Info,
+                                "Cancelling run",
+                                &format!("{target}: cancellation requested."),
+                            );
+                        }
                         self.next_projects = 0.0;
                         self.next_runs = 0.0;
                         self.next_run = 0.0;
+                        if !self.demo && (!self.ws_connected || res.orphaned) {
+                            self.request_projects();
+                            match self.view.clone() {
+                                View::Run { id: open_id } => self.request_run(&open_id),
+                                View::Project { name } => self.request_runs(&name),
+                                _ => {}
+                            }
+                        }
                         self.refresh(tx);
                     }
                     Err(err) => {
@@ -2076,6 +2514,9 @@ impl State {
         }
 
         let was_broken = self.link.is_broken();
+        for (gen, ev) in self.ws.drain() {
+            changed |= self.handle_ws_event(gen, ev, tx);
+        }
         for (call, result) in self.bus.drain() {
             if self.wants(&call) {
                 changed |= self.answer(call, result, tx);
@@ -2132,37 +2573,63 @@ impl State {
         // talking to the daemon. Demo scenes set `ready` themselves.
         self.ready = true;
 
-        // The daemon version is stable: ask once, so the rail can show it from the first frame.
+        // The daemon version & webhook status are fetched once on startup.
         if !self.asked_system {
             self.asked_system = true;
             self.request_system();
         }
 
-        // Config and diagnostics are read on demand: they only change when the user saves or a
-        // page opens. Projects, the open run, its log and a project's history are polled.
-        if self.clock >= self.next_projects {
-            self.next_projects = self.clock + PROJECTS_EVERY;
-            self.request_projects();
+        // Start or retry the WebSocket transport when disconnected and allowed.
+        if !self.ws_connected
+            && !self.ws_connecting
+            && !self.ws_disabled_until_reconnect
+            && self.link != Link::Unauthorized
+            && self.clock >= self.ws_next_retry
+        {
+            self.start_ws();
         }
 
-        let running = match (&self.view, &self.run) {
-            (View::Run { id }, Some(run)) if &run.id == id => run.status.is_running(),
-            (View::Run { .. }, _) => true,
-            _ => false,
-        };
-        if matches!(self.view, View::Run { .. }) && self.clock >= self.next_run {
-            self.next_run = self.clock + if running { RUN_EVERY } else { RUN_SETTLE_EVERY };
-            if let View::Run { id } = self.view.clone() {
-                self.request_run(&id);
+        // When WebSocket is connected, live events drive Projects, Run, and Log updates without
+        // periodic HTTP polling. Only fall back to HTTP polling while disconnected (after a brief
+        // initial handshake grace window so WS-capable daemons avoid redundant GET /api/projects).
+        let http_fallback =
+            !self.ws_connected && (!self.ws_connecting || self.clock >= self.ws_grace_until);
+
+        if self.ws_connected {
+            self.sync_ws_subscriptions();
+            if let View::Project { name } = self.view.clone() {
+                if self.runs_for.as_deref() != Some(name.as_str())
+                    && !self.runs_loading
+                    && self.runs_error.is_none()
+                {
+                    self.request_runs(&name);
+                }
             }
-        }
-        if matches!(self.view, View::Run { .. }) {
-            self.request_next_log();
-        }
-        if let View::Project { name } = self.view.clone() {
-            if self.clock >= self.next_runs {
-                self.next_runs = self.clock + RUNS_EVERY;
-                self.request_runs(&name);
+        } else if http_fallback && self.link != Link::Unauthorized {
+            if self.clock >= self.next_projects {
+                self.next_projects = self.clock + PROJECTS_EVERY;
+                self.request_projects();
+            }
+
+            let running = match (&self.view, &self.run) {
+                (View::Run { id }, Some(run)) if &run.id == id => run.status.is_running(),
+                (View::Run { .. }, _) => true,
+                _ => false,
+            };
+            if matches!(self.view, View::Run { .. }) && self.clock >= self.next_run {
+                self.next_run = self.clock + if running { RUN_EVERY } else { RUN_SETTLE_EVERY };
+                if let View::Run { id } = self.view.clone() {
+                    self.request_run(&id);
+                }
+            }
+            if matches!(self.view, View::Run { .. }) {
+                self.request_next_log();
+            }
+            if let View::Project { name } = self.view.clone() {
+                if self.clock >= self.next_runs {
+                    self.next_runs = self.clock + RUNS_EVERY;
+                    self.request_runs(&name);
+                }
             }
         }
 
@@ -2176,16 +2643,26 @@ impl State {
         }
 
         // One wake for the nearest deadline, so an idle window draws nothing.
-        let mut due = self.next_projects;
-        match &self.view {
-            View::Run { .. } => {
-                due = due.min(self.next_run);
-                if self.open_step_needs_log_poll() {
-                    due = due.min(self.next_log);
+        let mut due = f64::INFINITY;
+        if !self.ws_connected && self.link != Link::Unauthorized {
+            if self.ws_connecting {
+                due = due.min(self.ws_grace_until);
+            } else {
+                if !self.ws_disabled_until_reconnect {
+                    due = due.min(self.ws_next_retry);
+                }
+                due = due.min(self.next_projects);
+                match &self.view {
+                    View::Run { .. } => {
+                        due = due.min(self.next_run);
+                        if self.open_step_needs_log_poll() {
+                            due = due.min(self.next_log);
+                        }
+                    }
+                    View::Project { .. } => due = due.min(self.next_runs),
+                    _ => {}
                 }
             }
-            View::Project { .. } => due = due.min(self.next_runs),
-            _ => {}
         }
         if let Some(toast_due) = self.toasts.iter().map(|t| t.until).reduce(f64::min) {
             due = due.min(toast_due);
@@ -2228,6 +2705,7 @@ impl State {
         self.drawer_open = false;
         self.set_hash("");
         self.next_projects = 0.0;
+        self.sync_ws_subscriptions();
         self.refresh(tx);
     }
 
@@ -2241,6 +2719,10 @@ impl State {
         self.runs_error = None;
         self.next_runs = 0.0;
         self.set_hash("");
+        self.sync_ws_subscriptions();
+        if self.ws_connected && !self.demo {
+            self.request_runs(name);
+        }
         self.refresh(tx);
     }
 
@@ -2258,6 +2740,7 @@ impl State {
         self.next_run = 0.0;
         self.next_log = 0.0;
         self.set_hash(&format!("#/runs/{id}"));
+        self.sync_ws_subscriptions();
         self.refresh(tx);
     }
 
@@ -2295,6 +2778,7 @@ impl State {
         if page == SettingsPage::Deploy {
             self.request_deploy_checks();
         }
+        self.sync_ws_subscriptions();
         self.refresh(tx);
     }
 
@@ -2361,6 +2845,7 @@ impl State {
         if !self.editor.loaded {
             self.request_config();
         }
+        self.sync_ws_subscriptions();
         self.refresh(tx);
     }
 
@@ -2713,6 +3198,7 @@ mod tests {
                 loading: false,
                 error: None,
                 mode: Some(LogMode::Tail),
+                offset: 0,
             },
         );
         s.clock = 100.0;
@@ -2852,6 +3338,7 @@ mod tests {
                 loading: false,
                 error: None,
                 mode: Some(LogMode::Tail),
+                offset: 0,
             },
         );
         assert!(!s.open_step_needs_log_poll());
@@ -2875,6 +3362,8 @@ mod tests {
                 id: "r-live".into(),
                 ok: Ok(CancelResult {
                     cancelling: true,
+                    cancelled: false,
+                    orphaned: false,
                     run_id: "r-live".into(),
                     project: "lunarum".into(),
                 }),
@@ -2884,6 +3373,35 @@ mod tests {
         assert_eq!(s.cancelling, None);
         assert_eq!(s.toasts.len(), 1);
         assert_eq!(s.toasts[0].title, "Cancelling run");
+
+        // Dead / orphaned run cancellation emits "Cancelled dead run" toast and marks run cancelled.
+        s.run = Some(Run {
+            id: "r-dead".into(),
+            project: "lunarum".into(),
+            status: RunStatus::Running,
+            ..Run::default()
+        });
+        s.apply(
+            Call::CancelRun {
+                id: "r-dead".into(),
+            },
+            Answer::Cancelled {
+                id: "r-dead".into(),
+                ok: Ok(CancelResult {
+                    cancelling: false,
+                    cancelled: true,
+                    orphaned: true,
+                    run_id: "r-dead".into(),
+                    project: "lunarum".into(),
+                }),
+            },
+            &mut tx,
+        );
+        assert_eq!(
+            s.toasts.last().map(|t| t.title.as_str()),
+            Some("Cancelled dead run")
+        );
+        assert_eq!(s.run.as_ref().map(|r| r.status), Some(RunStatus::Cancelled));
 
         s.cancelling = Some("r-live".into());
         s.apply(
@@ -2908,6 +3426,8 @@ mod tests {
                 id: "lunarum".into(),
                 ok: Ok(CancelResult {
                     cancelling: true,
+                    cancelled: false,
+                    orphaned: false,
                     run_id: String::new(),
                     project: "lunarum".into(),
                 }),
@@ -2915,6 +3435,194 @@ mod tests {
             &mut tx,
         );
         assert_eq!(s.cancelling, None);
+    }
+
+    #[test]
+    fn ws_events_update_state_and_suppress_http_polling() {
+        use crate::model::{Run, RunStatus, SystemInfo};
+        use crate::ws::{ServerMsg, WsEvent};
+
+        let mut s = State::new(Conn {
+            server: "http://127.0.0.1:7878".into(),
+            token: "tok".into(),
+        });
+        let mut tx = Tx::default();
+        let gen = s.ws.generation();
+
+        // Snapshot marks WS connected and loads projects & version.
+        assert!(s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::Snapshot {
+                version: "0.9.0".into(),
+                projects: crate::demo::projects(),
+            }),
+            &mut tx,
+        ));
+        assert!(s.ws_connected);
+        assert!(s.loaded);
+        assert_eq!(s.link, Link::Ok);
+        assert_eq!(s.version, "0.9.0");
+
+        // Open a run and receive RunUpdated + LogSnapshot + LogChunk.
+        s.open_run("r-ws", &mut tx);
+        s.open_step = Some(0);
+        assert!(s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::RunUpdated {
+                run: Box::new(Run {
+                    id: "r-ws".into(),
+                    project: "lunarum".into(),
+                    status: RunStatus::Running,
+                    ..Run::default()
+                }),
+            }),
+            &mut tx,
+        ));
+        assert_eq!(s.run.as_ref().map(|r| r.id.as_str()), Some("r-ws"));
+
+        assert!(s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::LogSnapshot {
+                run_id: "r-ws".into(),
+                step: 0,
+                tail: Some(2000),
+                text: "line 1\n".into(),
+                offset: 7,
+            }),
+            &mut tx,
+        ));
+        assert!(s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::LogChunk {
+                run_id: "r-ws".into(),
+                step: 0,
+                chunk: "line 2\n".into(),
+                offset: 14,
+            }),
+            &mut tx,
+        ));
+        assert_eq!(
+            s.logs.get(&("r-ws".into(), 0)).map(|l| l.text.as_str()),
+            Some("line 1\nline 2\n")
+        );
+
+        // WebhookReceived updates system.webhook counters live.
+        s.system = Some(SystemInfo::default());
+        assert!(s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::WebhookReceived {
+                event: "push".into(),
+                repo: Some("teppyboy/lunarum".into()),
+                received_at: Some("2026-11-26T12:00:00Z".into()),
+                queued: true,
+                delivery_id: Some("d-1".into()),
+                outcome: None,
+            }),
+            &mut tx,
+        ));
+        let wh = s.system.as_ref().unwrap().webhook.as_ref().unwrap();
+        assert!(wh.configured);
+        assert_eq!(wh.deliveries, 1);
+        assert_eq!(wh.last_event.as_deref(), Some("push"));
+        assert_eq!(wh.last_repo.as_deref(), Some("teppyboy/lunarum"));
+        assert_eq!(wh.last_delivery_id.as_deref(), Some("d-1"));
+        assert_eq!(wh.last_outcome.as_deref(), Some("queued"));
+
+        // Subsequent WebhookReceived without repo/delivery_id/outcome overwrites stale values.
+        assert!(s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::WebhookReceived {
+                event: "ping".into(),
+                repo: None,
+                received_at: Some("2026-11-26T12:01:00Z".into()),
+                queued: false,
+                delivery_id: None,
+                outcome: None,
+            }),
+            &mut tx,
+        ));
+        let wh = s.system.as_ref().unwrap().webhook.as_ref().unwrap();
+        assert_eq!(wh.deliveries, 2);
+        assert_eq!(wh.last_event.as_deref(), Some("ping"));
+        assert_eq!(wh.last_repo, None);
+        assert_eq!(wh.last_delivery_id, None);
+        assert_eq!(wh.last_outcome, None);
+
+        // RunNotFound clears active run and reports error instead of hanging on loading.
+        assert!(s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::RunNotFound {
+                run_id: "r-ws".into(),
+            }),
+            &mut tx,
+        ));
+        assert!(s.run.is_none());
+        assert_eq!(s.run_error.as_deref(), Some("unknown run"));
+
+        // Closed triggers exponential backoff (1 -> 2 -> 4 -> 8 -> 15).
+        s.clock = 10.0;
+        assert!(s.handle_ws_event(gen, WsEvent::Closed { why: "eof".into() }, &mut tx,));
+        assert!(!s.ws_connected);
+        assert_eq!(s.ws_next_retry, 11.0);
+        assert_eq!(s.ws_backoff_secs, 2.0);
+
+        // Unauthorized disables WS retries until reconnect.
+        assert!(s.handle_ws_event(gen, WsEvent::Unauthorized, &mut tx));
+        assert_eq!(s.link, Link::Unauthorized);
+        assert!(s.ws_disabled_until_reconnect);
+    }
+
+    #[test]
+    fn trigger_409_distinguishes_already_running_from_other_conflicts() {
+        let mut s = State::new(Conn::default());
+        let mut tx = Tx::default();
+
+        s.triggering = Some("alpha".into());
+        s.fail(
+            Call::Trigger {
+                project: "alpha".into(),
+                force: false,
+            },
+            Failure::Api {
+                status: 409,
+                message: "project alpha is already running".into(),
+                field: None,
+            },
+            &mut tx,
+        );
+        let t1 = s.toasts.last().expect("running toast");
+        assert_eq!(t1.title, "Already running");
+        assert_eq!(t1.kind, ToastKind::Info);
+
+        s.triggering = Some("alpha".into());
+        s.fail(
+            Call::Trigger {
+                project: "alpha".into(),
+                force: false,
+            },
+            Failure::Api {
+                status: 409,
+                message: "project is paused".into(),
+                field: None,
+            },
+            &mut tx,
+        );
+        let t2 = s.toasts.last().expect("conflict toast");
+        assert_eq!(t2.title, "Could not start run");
+        assert_eq!(t2.body, "project is paused");
+        assert_eq!(t2.kind, ToastKind::Error);
+    }
+
+    #[test]
+    fn start_ws_with_invalid_url_does_not_wedge_connecting() {
+        let mut s = State::new(Conn {
+            server: "not-a-valid-url".into(),
+            token: String::new(),
+        });
+        s.live.server = "not-a-valid-url".into();
+        s.start_ws();
+        assert!(!s.ws_connecting);
+        assert!(s.ws_next_retry > 0.0);
     }
 
     #[test]

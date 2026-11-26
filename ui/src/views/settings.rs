@@ -106,10 +106,12 @@ pub fn view(
         }
         let pages_w = if layout_w < 960.0 { 172.0 } else { 212.0 };
         let pages = col()
+            .key("settings-pages")
             .w(pages_w)
             .shrink()
             .h_full()
             .min_h(0.0)
+            .pr(theme::SECTION_BORDER)
             .fill(k.c.layer_01)
             .border_sides([0.0, theme::SECTION_BORDER, 0.0, 0.0], k.c.border_strong)
             .child(widgets::scroll_bar(
@@ -319,7 +321,7 @@ fn config_page(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>, compa
         ));
     }
     body = body.child(match page {
-        SettingsPage::General => general(s, k),
+        SettingsPage::General => general(s, k, compact),
         SettingsPage::Server => server(s, k),
         SettingsPage::Github => github(s, k, compact),
         SettingsPage::Discord => discord(s, k, compact),
@@ -329,7 +331,7 @@ fn config_page(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>, compa
     body
 }
 
-fn general(s: &State, k: &Kit) -> El {
+fn general(s: &State, k: &Kit, compact: bool) -> El {
     let e = &s.editor;
     let mut c = col().w_full().gap(18.0);
     c = c.child(widgets::section(
@@ -367,7 +369,35 @@ fn general(s: &State, k: &Kit) -> El {
         "Default shell",
         Some("Command used to run shell steps, e.g. `bash -lc`. Empty uses the platform default."),
     ));
-    let _ = e;
+    let trigger_mode = e.s("general.trigger_mode");
+    let trigger_idx = match trigger_mode.as_str() {
+        "webhook" => Some(1),
+        "poll" => Some(2),
+        _ => Some(0),
+    };
+    c = c.child(
+        widgets::labelled(
+            k,
+            "Trigger mode",
+            Some("Webhook mode triggers runs immediately from GitHub webhooks without polling git remotes."),
+            widgets::segmented(
+                k,
+                compact,
+                &["Both", "Webhook", "Poll"],
+                trigger_idx,
+                |s: &mut State, picked: usize, _tx: &mut Tx| {
+                    let val = match picked {
+                        1 => "webhook",
+                        2 => "poll",
+                        _ => "both",
+                    };
+                    s.editor.set_str("general.trigger_mode", val);
+                },
+            )
+            .key("general-trigger-mode"),
+        )
+        .key("field-general.trigger_mode"),
+    );
     c
 }
 
@@ -445,6 +475,121 @@ fn github(s: &State, k: &Kit, compact: bool) -> El {
         "Token",
         Some("A PAT with `repo` scope for commit statuses. Masked once stored."),
     ));
+
+    c = c.child(widgets::divider(k));
+    c = c.child(widgets::section(
+        k,
+        "Webhooks",
+        Some("Receive GitHub webhook events at `/api/github/webhook` to trigger runs immediately."),
+    ));
+    c = c.child(secret_field(
+        s,
+        k,
+        "github.webhook_secret",
+        "Webhook secret",
+        Some("Shared HMAC-SHA256 secret for repository webhooks or GitHub Apps."),
+    ));
+
+    let public_url = e.s("server.public_url");
+    let sys_wh = s.system.as_ref().and_then(|sys| sys.webhook.as_ref());
+    let payload_url = if !public_url.trim().is_empty() {
+        format!(
+            "{}/api/github/webhook",
+            public_url.trim().trim_end_matches('/')
+        )
+    } else if let Some(ep) = sys_wh
+        .map(|w| w.endpoint.as_str())
+        .filter(|ep| !ep.is_empty())
+    {
+        ep.to_string()
+    } else {
+        "/api/github/webhook".to_string()
+    };
+    let missing_public_url = public_url.trim().is_empty()
+        && sys_wh.is_none_or(|w| {
+            !w.endpoint.starts_with("http://") && !w.endpoint.starts_with("https://")
+        });
+
+    let mut wh_card = col()
+        .key("github-webhook-info")
+        .w_full()
+        .padding(14.0)
+        .gap(6.0)
+        .radius(k.radius.lg)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_base)
+        .child(widgets::caption(k, "WEBHOOK ENDPOINT"))
+        .child(widgets::kv_for(
+            k,
+            compact,
+            "Payload URL",
+            widgets::value_for(k, compact, &payload_url),
+        ))
+        .child(widgets::divider(k))
+        .child(widgets::kv_for(
+            k,
+            compact,
+            "Content type",
+            widgets::value_for(k, compact, "application/json"),
+        ))
+        .child(widgets::divider(k))
+        .child(widgets::kv_for(
+            k,
+            compact,
+            "Events",
+            widgets::value_for(k, compact, "push, pull_request, check_run"),
+        ));
+
+    if let Some(wh) = sys_wh {
+        let mut status_text = format!(
+            "{} {}",
+            wh.deliveries,
+            if wh.deliveries == 1 {
+                "delivery"
+            } else {
+                "deliveries"
+            }
+        );
+        if let Some(ev) = wh.last_event.as_deref().filter(|v| !v.is_empty()) {
+            status_text.push_str(&format!(" · last: {ev}"));
+            if let Some(repo) = wh.last_repo.as_deref().filter(|v| !v.is_empty()) {
+                status_text.push_str(&format!(" ({repo})"));
+            }
+        }
+        let status_summary = text(status_text)
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .min_w(0.0);
+        wh_card = wh_card.child(widgets::divider(k)).child(widgets::kv_for(
+            k,
+            compact,
+            "Live status",
+            row()
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(if wh.configured {
+                    widgets::pill(k, "Configured", theme::status(k).success)
+                } else {
+                    widgets::pill(k, "Not configured", k.c.text_faint)
+                })
+                .child(if compact {
+                    status_summary.wrap_anywhere().shrink()
+                } else {
+                    status_summary.wrap().shrink()
+                }),
+        ));
+    }
+
+    if missing_public_url {
+        wh_card = wh_card.child(
+            text("Set Server → Public URL so GitHub can deliver webhooks to a full URL.")
+                .font(k.ty.caption())
+                .color(k.c.text_muted)
+                .wrap(),
+        );
+    }
+    c = c.child(wh_card);
 
     c = c.child(widgets::divider(k));
     c = c.child(widgets::section(k, "GitHub App", Some("Optional. The App's installation writes check runs, which the UI links as \"View on GitHub\".")));
@@ -1371,8 +1516,38 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
     c = c.child(widgets::section(
         k,
         "Pull requests, deploys & cache",
-        Some("Control which branches and tags deploy, whether PRs run CI, and per-project build caching."),
+        Some("Control trigger mode, which branches and tags deploy, whether PRs run CI, and per-project build caching."),
     ));
+    let trigger_mode_path = format!("{base}.trigger_mode");
+    let trigger_mode_val = e.s(&trigger_mode_path);
+    let trigger_mode_idx = match trigger_mode_val.as_str() {
+        "both" => Some(1),
+        "webhook" => Some(2),
+        "poll" => Some(3),
+        _ => Some(0),
+    };
+    let trigger_mode_owner = trigger_mode_path.clone();
+    c = c.child(
+        widgets::labelled(
+            k,
+            "Trigger mode",
+            None,
+            widgets::segmented(
+                k,
+                compact,
+                &["Inherit", "Both", "Webhook", "Poll"],
+                trigger_mode_idx,
+                move |s: &mut State, picked: usize, _tx: &mut Tx| match picked {
+                    1 => s.editor.set_str(&trigger_mode_owner, "both"),
+                    2 => s.editor.set_str(&trigger_mode_owner, "webhook"),
+                    3 => s.editor.set_str(&trigger_mode_owner, "poll"),
+                    _ => s.editor.set(&trigger_mode_owner, serde_json::Value::Null),
+                },
+            )
+            .key(format!("project-trigger-mode-{i}")),
+        )
+        .key(format!("field-{trigger_mode_path}")),
+    );
     let watch_prs_path = format!("{base}.watch_prs");
     c = c.child(toggle_row(
         k,
@@ -1683,7 +1858,9 @@ fn appearance_page(s: &State, k: &Kit, cx: &Cx<State>, compact: bool) -> El {
             }
             theme::ThemeMode::Light => "Always light surfaces.",
             theme::ThemeMode::Dark => "Always standard dark surfaces.",
-            theme::ThemeMode::Oled => "True #000000 black canvas with stepped near-black cards.",
+            theme::ThemeMode::Oled => {
+                "Pure #000000 black surfaces defined by crisp neutral borders."
+            }
         }),
         widgets::choice_row_for(
             k,

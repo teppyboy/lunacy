@@ -850,7 +850,9 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool, layout_w: f32) -> El {
         .gap(0.0)
         .fill(k.c.layer_01);
     if !compact {
-        panel = panel.border_sides([0.0, theme::SECTION_BORDER, 0.0, 0.0], k.c.border_strong);
+        panel = panel
+            .pr(theme::SECTION_BORDER)
+            .border_sides([0.0, theme::SECTION_BORDER, 0.0, 0.0], k.c.border_strong);
     }
     panel
         .child(widgets::scroll_bar(
@@ -933,6 +935,7 @@ fn drawer_overlays(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4])
         .w(drawer_w + safe[3])
         .h_full()
         .pt(safe[0])
+        .pr(theme::SECTION_BORDER)
         .pb(safe[2])
         .pl(safe[3])
         .fill(k.c.layer_01)
@@ -1273,6 +1276,14 @@ mod tests {
                     },
                 )
             });
+            assert_responsive_scene("settings-github", w, h, |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Github,
+                    },
+                )
+            });
             assert_responsive_scene("settings-connection", w, h, |s| {
                 crate::demo::load(
                     s,
@@ -1437,6 +1448,7 @@ mod tests {
                         loading: false,
                         error: None,
                         mode: Some(LogMode::Tail),
+                        offset: 0,
                     },
                 );
                 s.logs.insert(
@@ -1446,6 +1458,7 @@ mod tests {
                         loading: false,
                         error: None,
                         mode: Some(LogMode::Tail),
+                        offset: 0,
                     },
                 );
             },
@@ -1601,8 +1614,20 @@ mod tests {
         let oled = theme::kit_mode(theme::ThemeMode::Oled, false, false);
         assert_eq!(oled.c.page.hex(), "#000000ff");
         assert_eq!(oled.c.bg_deep.hex(), "#000000ff");
-        assert_eq!(oled.c.layer_01.hex(), "#0b0d12ff");
-        assert_eq!(oled.c.layer_02.hex(), "#131620ff");
+        assert_eq!(oled.c.layer_01.hex(), "#000000ff");
+        assert_eq!(oled.c.layer_02.hex(), "#000000ff");
+        assert_eq!(oled.c.bg_base.hex(), "#1a1a1aff");
+        assert_ne!(oled.c.bg_base, oled.c.layer_01);
+        assert_eq!(oled.c.surface_base.hex(), "#000000ff");
+        assert_eq!(oled.c.surface_weak.hex(), "#000000ff");
+        assert_eq!(oled.c.surface_disabled.hex(), "#000000ff");
+        assert_eq!(oled.c.surface_raised.hex(), "#000000ff");
+        assert_eq!(oled.c.surface_raised_base.hex(), "#000000ff");
+        assert_eq!(oled.c.bg_button_neutral.hex(), "#000000ff");
+        assert_eq!(oled.c.layer_03.hex(), "#141414ff");
+        assert_eq!(oled.c.layer_04.hex(), "#1c1c1cff");
+        assert_eq!(oled.c.border_base.hex(), "#2e2e2eff");
+        assert_eq!(oled.c.border_strong.hex(), "#454545ff");
         let dark = theme::kit(true);
         assert_eq!(theme::status(&oled).success, theme::status(&dark).success);
 
@@ -1758,6 +1783,7 @@ mod tests {
                         loading: false,
                         error: None,
                         mode: Some(LogMode::Tail),
+                        offset: 0,
                     },
                 );
             },
@@ -2514,24 +2540,372 @@ mod tests {
 
     #[test]
     fn stepped_surface_hierarchy_across_dark_light_and_oled() {
+        let assert_achromatic = |name: &str, c: Color| {
+            assert!(
+                (c.r - c.g).abs() < 1e-6 && (c.g - c.b).abs() < 1e-6,
+                "{name} must be pure neutral gray (r==g==b), got {:?}",
+                c
+            );
+        };
+        let assert_all_neutral_tokens = |label: &str, k: &Kit| {
+            let c = &k.c;
+            assert_ne!(
+                c.bg_base, c.layer_01,
+                "{label}: bg_base must differ from layer_01 for SegmentedControl active pill contrast"
+            );
+            for (field, col) in [
+                ("page", c.page),
+                ("bg_base", c.bg_base),
+                ("bg_deep", c.bg_deep),
+                ("layer_01", c.layer_01),
+                ("layer_02", c.layer_02),
+                ("layer_03", c.layer_03),
+                ("layer_04", c.layer_04),
+                ("bg_inverse", c.bg_inverse),
+                ("bg_contrast", c.bg_contrast),
+                ("bg_button_neutral", c.bg_button_neutral),
+                ("bg_icon_button_contrast", c.bg_icon_button_contrast),
+                ("submit_fg", c.submit_fg),
+                ("submit_icon", c.submit_icon),
+                ("text_base", c.text_base),
+                ("text_muted", c.text_muted),
+                ("text_faint", c.text_faint),
+                ("text_inverse", c.text_inverse),
+                ("text_contrast", c.text_contrast),
+                ("text_strong", c.text_strong),
+                ("text_weak", c.text_weak),
+                ("text_invert_strong", c.text_invert_strong),
+                ("icon_base", c.icon_base),
+                ("icon_muted", c.icon_muted),
+                ("icon_faint", c.icon_faint),
+                ("icon_inverse", c.icon_inverse),
+                ("icon_contrast", c.icon_contrast),
+                ("icon_weaker", c.icon_weaker),
+                ("border_muted", c.border_muted),
+                ("border_base", c.border_base),
+                ("border_strong", c.border_strong),
+                ("border_weak", c.border_weak),
+                ("border_hover", c.border_hover),
+                ("border_disabled", c.border_disabled),
+                ("hover", c.hover),
+                ("pressed", c.pressed),
+                ("surface_base", c.surface_base),
+                ("surface_weak", c.surface_weak),
+                ("surface_hover", c.surface_hover),
+                ("surface_raised", c.surface_raised),
+                ("surface_raised_base", c.surface_raised_base),
+                ("surface_raised_hover", c.surface_raised_hover),
+                ("surface_float", c.surface_float),
+                ("surface_disabled", c.surface_disabled),
+                ("std_border", c.std_border),
+                ("std_icon", c.std_icon),
+                ("std_icon_invert", c.std_icon_invert),
+                ("std_icon_strong", c.std_icon_strong),
+                ("std_text", c.std_text),
+                ("knob", c.knob),
+                ("knob_on", c.knob_on),
+            ] {
+                assert_achromatic(&format!("{label}.{field}"), col);
+            }
+        };
+
         let dark = theme::kit_mode(theme::ThemeMode::Dark, true, false);
-        assert_eq!(dark.c.bg_deep.hex(), "#0b0d12ff");
-        assert_eq!(dark.c.page.hex(), "#11141bff");
-        assert_eq!(dark.c.layer_01.hex(), "#171b26ff");
-        assert_eq!(dark.c.layer_02.hex(), "#1e2331ff");
-        assert_eq!(dark.c.border_strong.hex(), "#525e7aff");
+        assert_eq!(dark.c.bg_deep.hex(), "#0a0a0aff");
+        assert_eq!(dark.c.page.hex(), "#0f0f0fff");
+        assert_eq!(dark.c.layer_01.hex(), "#141414ff");
+        assert_eq!(dark.c.layer_02.hex(), "#1a1a1aff");
+        assert_eq!(dark.c.bg_base.hex(), "#242424ff");
+        assert_eq!(dark.c.layer_03.hex(), "#242424ff");
+        assert_eq!(dark.c.layer_04.hex(), "#2e2e2eff");
+        assert_eq!(dark.c.border_base.hex(), "#333333ff");
+        assert_eq!(dark.c.border_strong.hex(), "#454545ff");
+        assert_all_neutral_tokens("dark", &dark);
 
         let light = theme::kit_mode(theme::ThemeMode::Light, false, false);
-        assert_eq!(light.c.page.hex(), "#f4f6faff");
-        assert_eq!(light.c.layer_01.hex(), "#e9edf5ff");
+        assert_eq!(light.c.bg_deep.hex(), "#ffffffff");
+        assert_eq!(light.c.page.hex(), "#fafafaff");
+        assert_eq!(light.c.layer_01.hex(), "#efefefff");
+        assert_eq!(light.c.bg_base.hex(), "#ffffffff");
         assert_eq!(light.c.layer_02.hex(), "#ffffffff");
-        assert_eq!(light.c.border_strong.hex(), "#8f9db5ff");
+        assert_eq!(light.c.layer_03.hex(), "#e8e8e8ff");
+        assert_eq!(light.c.layer_04.hex(), "#ffffffff");
+        assert_eq!(light.c.border_strong.hex(), "#999999ff");
+        assert_all_neutral_tokens("light", &light);
 
         let oled = theme::kit_mode(theme::ThemeMode::Oled, true, false);
         assert_eq!(oled.c.page.hex(), "#000000ff");
         assert_eq!(oled.c.bg_deep.hex(), "#000000ff");
-        assert_eq!(oled.c.layer_01.hex(), "#0b0d12ff");
-        assert_eq!(oled.c.layer_02.hex(), "#131620ff");
-        assert_eq!(oled.c.border_strong.hex(), "#5d6985ff");
+        assert_eq!(oled.c.layer_01.hex(), "#000000ff");
+        assert_eq!(oled.c.layer_02.hex(), "#000000ff");
+        assert_eq!(oled.c.surface_base.hex(), "#000000ff");
+        assert_eq!(oled.c.bg_base.hex(), "#1a1a1aff");
+        assert_eq!(oled.c.layer_03.hex(), "#141414ff");
+        assert_eq!(oled.c.layer_04.hex(), "#1c1c1cff");
+        assert_eq!(oled.c.border_base.hex(), "#2e2e2eff");
+        assert_eq!(oled.c.border_strong.hex(), "#454545ff");
+        assert_all_neutral_tokens("oled", &oled);
+    }
+
+    #[test]
+    fn selected_sidebar_and_pane_rows_respect_right_border_inset() {
+        let assert_inset = |rt: &Runtime<State>, pane_key: &str, row_key: &str| {
+            let els = rt.elements();
+            let pane = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some(pane_key) && !e.exiting)
+                .unwrap_or_else(|| panic!("missing pane {pane_key}"));
+            let row = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some(row_key) && !e.exiting)
+                .unwrap_or_else(|| panic!("missing row {row_key}"));
+            let pane_right = pane.rect[0] + pane.rect[2];
+            let row_right = row.rect[0] + row.rect[2];
+            assert!(
+                row_right <= pane_right - theme::SECTION_BORDER + 0.01,
+                "{row_key} right edge ({row_right:.2}) overlaps {pane_key} right border (pane_right={pane_right:.2}, border={})",
+                theme::SECTION_BORDER
+            );
+        };
+
+        // 1) Left rail selected project item (`rail-lunarum`).
+        let rt_proj = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Project {
+                        name: "lunarum".into(),
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert_inset(&rt_proj, "rail", "rail-lunarum");
+        assert_inset(&rt_proj, "rail", "nav-Projects");
+
+        // 2) Run steps desktop pane (`step-0` selected).
+        let rid = crate::demo::running_run().expect("running demo run").id;
+        let rt_run = setup_runtime(
+            move |s| {
+                crate::demo::load(s, View::Run { id: rid });
+                s.open_step = Some(0);
+            },
+            1180.0,
+            760.0,
+        );
+        assert_inset(&rt_run, "run-steps", "step-0");
+
+        // 3) Settings desktop sidebar (`settings-nav-General` selected).
+        let rt_set = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::General,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert_inset(&rt_set, "settings-pages", "settings-nav-General");
+
+        // 4) Compact drawer (`rail-drawer` right border).
+        let rt_drawer = setup_runtime(
+            |s| {
+                crate::demo::load(s, View::Projects);
+                s.drawer_open = true;
+            },
+            390.0,
+            844.0,
+        );
+        assert_inset(&rt_drawer, "rail-drawer", "nav-Projects");
+    }
+
+    #[test]
+    fn webhook_settings_and_diagnostics_transport_render() {
+        let rt_gen = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::General,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_gen.find("field-general.trigger_mode").is_some());
+        assert!(rt_gen.find("general-trigger-mode").is_some());
+
+        let rt_gh = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Github,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_gh.find("field-github.webhook_secret").is_some());
+        assert!(rt_gh.find("github-webhook-info").is_some());
+
+        let rt_proj = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Projects,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_proj.find("field-project[0].trigger_mode").is_some());
+        assert!(rt_proj.find("project-trigger-mode-0").is_some());
+
+        // Diagnostics shows Transport (WS live vs HTTP fallback) and GitHub Webhook status.
+        let rt_diag_ws = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Diagnostics,
+                    },
+                );
+                s.ws_connected = true;
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_diag_ws.find("diagnostics-transport").is_some());
+        assert!(rt_diag_ws.find("diagnostics-webhook").is_some());
+        let diag_texts: Vec<String> = rt_diag_ws
+            .elements()
+            .into_iter()
+            .filter_map(|e| e.text)
+            .collect();
+        assert!(diag_texts.iter().any(|t| t == "WebSocket (live)"));
+
+        let rt_diag_http = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Diagnostics,
+                    },
+                );
+                s.ws_connected = false;
+            },
+            1180.0,
+            760.0,
+        );
+        let diag_texts_http: Vec<String> = rt_diag_http
+            .elements()
+            .into_iter()
+            .filter_map(|e| e.text)
+            .collect();
+        assert!(diag_texts_http.iter().any(|t| t == "HTTP fallback"));
+    }
+
+    #[test]
+    fn settings_projects_e2e_scroll_targets_stay_in_view() {
+        let assert_in_viewport = |rt: &Runtime<State>, key: &str, label: &str| {
+            let els = rt.elements();
+            let body = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("settings-body") && !e.exiting)
+                .expect("settings-body");
+            let target = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key) && !e.exiting)
+                .unwrap_or_else(|| panic!("{label}: missing {key}"));
+            let cy = target.rect[1] + target.rect[3] * 0.5;
+            assert!(
+                cy >= body.rect[1] + 2.0 && cy <= body.rect[1] + body.rect[3] - 2.0,
+                "{label}: {key} center y={cy:.1} outside settings-body [{:.1}, {:.1}] (target rect={:?})",
+                body.rect[1],
+                body.rect[1] + body.rect[3],
+                target.rect
+            );
+        };
+
+        // T6 desktop 1280x840: wheel -350 -> field-project[0].env/control; wheel -800 on new project -> add-shell-ci
+        let mut rt_env = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Projects,
+                    },
+                )
+            },
+            1280.0,
+            840.0,
+        );
+        let (bx, by) = rt_env.find("settings-body").expect("settings-body");
+        rt_env.wheel_xy(bx, by, 0.0, -350.0);
+        for _ in 0..20 {
+            rt_env.frame(0.016);
+            rt_env.settle_all();
+        }
+        assert_in_viewport(&rt_env, "field-project[0].env", "T6 env 1280x840");
+
+        let mut rt_new = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Projects,
+                    },
+                );
+                let mut tx = rune::Tx::default();
+                s.add_project(&mut tx);
+            },
+            1280.0,
+            840.0,
+        );
+        let (bx, by) = rt_new.find("settings-body").expect("settings-body");
+        rt_new.wheel_xy(bx, by, 0.0, -800.0);
+        for _ in 0..20 {
+            rt_new.frame(0.016);
+            rt_new.settle_all();
+        }
+        assert_in_viewport(&rt_new, "add-shell-ci", "T6 add-shell-ci 1280x840");
+
+        // Responsive layouts: step-row-ci-0 visible after scroll across all 4 viewports.
+        for (w, h, wheels) in [
+            (390.0, 844.0, vec![-800.0, -800.0]),
+            (360.0, 780.0, vec![-800.0, -800.0]),
+            (768.0, 1024.0, vec![-900.0, -900.0]),
+            (1180.0, 760.0, vec![-950.0]),
+        ] {
+            let mut rt = setup_runtime(
+                |s| {
+                    crate::demo::load(
+                        s,
+                        View::Settings {
+                            page: SettingsPage::Projects,
+                        },
+                    )
+                },
+                w,
+                h,
+            );
+            let (bx, by) = rt.find("settings-body").expect("settings-body");
+            for dy in wheels {
+                rt.wheel_xy(bx, by, 0.0, dy);
+                for _ in 0..20 {
+                    rt.frame(0.016);
+                    rt.settle_all();
+                }
+            }
+            assert_in_viewport(&rt, "step-row-ci-0", &format!("resp {w}x{h}"));
+        }
     }
 }

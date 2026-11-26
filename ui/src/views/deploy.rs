@@ -390,6 +390,29 @@ fn project_card(
                 ))
                 .child(widgets::divider(k))
                 .child(widgets::kv_for(k, compact, "Checkout mode", checkout_val))
+                .children(
+                    proj.trigger_mode
+                        .as_deref()
+                        .filter(|m| !m.is_empty())
+                        .map(|mode| {
+                            col().w_full().gap(0.0).child(widgets::divider(k)).child(
+                                widgets::kv_for(
+                                    k,
+                                    compact,
+                                    "Trigger mode",
+                                    widgets::pill(
+                                        k,
+                                        mode,
+                                        if mode == "webhook" {
+                                            theme::status(k).success
+                                        } else {
+                                            k.c.text_accent
+                                        },
+                                    ),
+                                ),
+                            )
+                        }),
+                )
                 .child(widgets::divider(k))
                 .child(widgets::kv_for(
                     k,

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -29,6 +31,7 @@ RUNE_DIR = pathlib.Path(
     )
 )
 TOKEN = "e2e-token"
+WEBHOOK_SECRET = "e2e-webhook-secret"
 
 
 def free_port() -> int:
@@ -346,6 +349,9 @@ listen = "127.0.0.1:{self.port}"
 token = "{TOKEN}"
 web_root = "{self.web_dist}"
 
+[github]
+webhook_secret = "{WEBHOOK_SECRET}"
+
 [act]
 command = ["act"]
 args = ["--pull=false", "--artifact-server-port={self.act_port}"]
@@ -561,6 +567,65 @@ def test_contract(sb: Sandbox) -> str:
     st, sysinfo = api_call(sb.port, "/api/system")
     assert st == 200 and isinstance(sysinfo, dict)
     assert sysinfo.get("state_dir") and sysinfo.get("config_path")
+    wh = sysinfo.get("webhook")
+    assert isinstance(wh, dict) and wh.get("configured") is True, sysinfo
+
+    # Verify signed GitHub webhook ping updates GET /api/system webhook status.
+    ping_body = json.dumps({"zen": "keep it logically awesome"}).encode()
+    sig = "sha256=" + hmac.new(WEBHOOK_SECRET.encode(), ping_body, hashlib.sha256).hexdigest()
+    ping_req = urllib.request.Request(
+        f"http://127.0.0.1:{sb.port}/api/github/webhook",
+        data=ping_body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "ping",
+            "X-GitHub-Delivery": "e2e-ping-1",
+            "X-Hub-Signature-256": sig,
+        },
+    )
+    with urllib.request.urlopen(ping_req, timeout=5) as resp:
+        assert resp.status == 200
+        ping_res = json.loads(resp.read().decode("utf-8"))
+        assert ping_res.get("ok") is True and ping_res.get("pong") is True, ping_res
+    st, sysinfo_after = api_call(sb.port, "/api/system")
+    assert st == 200 and isinstance(sysinfo_after, dict)
+    wh_after = sysinfo_after.get("webhook") or {}
+    assert wh_after.get("deliveries", 0) >= 1 and wh_after.get("last_event") == "ping", wh_after
+
+    # Verify dead/orphaned run cancellation reconciles cleanly via API.
+    dead_id = "alpha-orphaned-dead"
+    dead_dir = sb.dir / "state" / "runs" / "alpha"
+    dead_dir.mkdir(parents=True, exist_ok=True)
+    (dead_dir / f"{dead_id}.json").write_text(
+        json.dumps(
+            {
+                "id": dead_id,
+                "project": "alpha",
+                "sha": "0000000000000000000000000000000000000000",
+                "subject": "orphaned dead run",
+                "status": "running",
+                "started_at": int(time.time()) - 60,
+                "finished_at": None,
+                "failed_step": None,
+                "github_url": None,
+                "steps": [
+                    {
+                        "phase": "ci",
+                        "name": "Stuck step",
+                        "status": "running",
+                        "kind": "shell",
+                        "substeps": [],
+                    }
+                ],
+            }
+        )
+    )
+    st, dead_cancel = api_call(sb.port, f"/api/runs/{dead_id}/cancel", method="POST", json_body={})
+    assert st == 202 and isinstance(dead_cancel, dict), (st, dead_cancel)
+    assert dead_cancel.get("orphaned") is True and dead_cancel.get("cancelled") is True, dead_cancel
+    st, dead_run = api_call(sb.port, f"/api/runs/{dead_id}")
+    assert st == 200 and isinstance(dead_run, dict) and dead_run.get("status") == "cancelled", dead_run
 
     st, deploy_checks = api_call(sb.port, "/api/deploy/checks")
     assert st == 200 and isinstance(deploy_checks, dict)
@@ -613,7 +678,7 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
     assert not has_key(t_dismiss, "toast-1"), "dismissed toast must vanish"
     wait_project_idle(sb.port, "alpha")
 
-    print("[e2e] T3: 409 already running toast & live slow run log...")
+    print("[e2e] T3: Live WebSocket push update, 409 conflict & live slow run log...")
     wait_project_idle(sb.port, "slow", timeout=40.0)
 
     def on_mark_slow(name: str) -> None:
@@ -621,9 +686,18 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
             st, _ = api_call(sb.port, "/api/projects/slow/trigger", method="POST", json_body={"force": True})
             assert st == 202
 
-    sc = Script(1.0).mark("fire-slow", 0.45).tap("run-now-slow", 0.7)
-    t_409 = sb.run_ui("slow_409", sc.events, at=sc.t + 0.3, on_mark=on_mark_slow)
-    assert "Already running" in " ".join(subtree_texts(t_409, "toast-layer"))
+    # External trigger pushes `projects_updated` over WebSocket within milliseconds (well before
+    # any 2s HTTP poll interval), transitioning `slow` to running and surfacing `cancel-slow`.
+    sc = Script(1.0).mark("fire-slow", 0.45)
+    t_ws_running = sb.run_ui("slow_ws_running", sc.events, at=sc.t + 0.15, on_mark=on_mark_slow)
+    assert has_key(t_ws_running, "cancel-slow"), (
+        "expected WebSocket push to surface cancel-slow within 0.6s of external trigger"
+    )
+    run_now_slow = find_el(t_ws_running, "run-now-slow")
+    assert (
+        run_now_slow.get("disabled") is True
+        or run_now_slow.get("help") == "Already running"
+    ), f"expected run-now-slow disabled once running, got {run_now_slow}"
 
     def slow_running_project() -> dict | None:
         st, p = api_call(sb.port, "/api/projects/slow")
@@ -638,6 +712,9 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
         return None
 
     slow_p = wait_until(slow_running_project, timeout=10, desc="slow marked running")
+    st_409, body_409 = api_call(sb.port, "/api/projects/slow/trigger", method="POST", json_body={"force": True})
+    assert st_409 == 409, f"expected 409 while slow is running, got {st_409}: {body_409}"
+
     slow_id = slow_p["current_run"]["id"]
     sc = Script(1.0).tap("project-slow", 0.7).tap(f"run-{slow_id}", 0.7).tap("step-0", 0.7)
     t_slow_live = sb.run_ui("slow_live", sc.events, at=sc.t + 0.3)
@@ -785,6 +862,7 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
     assert disk["server"]["public_url"] == f"http://127.0.0.1:{sb.port}"
     assert disk["github"]["mode"] == "status"
     assert disk["github"]["token"] == "ghp_e2e_test"
+    assert disk["github"]["webhook_secret"] == WEBHOOK_SECRET, "masked github.webhook_secret was clobbered!"
     assert disk["discord"]["notify_on_start"] is True
     assert disk["act"]["args"] == ["--pull=false", f"--artifact-server-port={sb.act_port}", "--verbose"]
     assert disk["act"]["platforms"]["ubuntu-22.04"] == "-self-hosted"
@@ -1024,11 +1102,11 @@ def test_responsive_layouts(sb: Sandbox, alpha_run_id: str) -> None:
             sc = sc.wheel("settings-nav-strip", dx=-240.0, after=0.35)
         sc = sc.tap("settings-nav-Projects", 0.5).tap("project-edit-0", 0.4)
         if win_w <= 420.0:
-            sc = sc.wheel("settings-body", -700.0, 0.35).wheel("settings-body", -700.0, 0.35)
+            sc = sc.wheel("settings-body", -800.0, 0.35).wheel("settings-body", -800.0, 0.35)
         elif compact:
-            sc = sc.wheel("settings-body", -850.0, 0.35).wheel("settings-body", -850.0, 0.35)
+            sc = sc.wheel("settings-body", -900.0, 0.35).wheel("settings-body", -900.0, 0.35)
         else:
-            sc = sc.wheel("settings-body", -900.0, 0.35)
+            sc = sc.wheel("settings-body", -950.0, 0.35)
         sc = sc.tap("step-row-ci-0", 0.4)
         t_step = sb.run_ui(f"resp_{tag}_step_editor", sc.events, at=sc.t + 0.3, size=size)
         assert has_key(t_step, "step-form") and has_key(t_step, "step-kind")

@@ -174,6 +174,8 @@ class Store:
                 proj["last_run"] = copy.deepcopy(run)
             return 202, {
                 "cancelling": True,
+                "cancelled": True,
+                "orphaned": False,
                 "run_id": run["id"],
                 "project": run.get("project", ""),
             }
@@ -484,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
         """The daemon's validation, as far as the UI can trip it."""
         store = self.mock.store
         general = body.get("general") or {}
-        if general.get("poll_interval", 300) == 0:
+        if general.get("poll_interval", 300) == 0 and general.get("trigger_mode") != "webhook":
             self._error(400, "must be at least 1 second", "general.poll_interval")
             return
         if general.get("step_timeout") == 0:

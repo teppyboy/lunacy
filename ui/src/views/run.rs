@@ -722,6 +722,7 @@ fn steps_pane(
         let mut pane = col()
             .key("run-steps")
             .w_full()
+            .pb(theme::SECTION_BORDER)
             .fill(k.c.layer_01)
             .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
             .child(widgets::scroll_bar(scroller, k));
@@ -738,6 +739,7 @@ fn steps_pane(
         .shrink()
         .h_full()
         .min_h(0.0)
+        .pr(theme::SECTION_BORDER)
         .fill(k.c.layer_01)
         .border_sides([0.0, theme::SECTION_BORDER, 0.0, 0.0], k.c.border_strong)
         .child(widgets::scroll_bar(
@@ -826,13 +828,18 @@ fn step_row(
         .py(if compact { 8.0 } else { 6.0 })
         .gap(9.0)
         .center_y()
-        .fill(if selected { k.c.layer_03 } else { k.c.layer_01 })
+        .fill(if selected {
+            k.c.layer_03
+        } else {
+            rune::Color::TRANSPARENT
+        })
         .hover(if selected { k.c.layer_03 } else { k.c.hover })
         .press_scale(0.992)
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             if s.open_step == Some(index) {
                 s.open_step = None;
                 s.stick_log_pending = false;
+                s.sync_ws_subscriptions();
             } else {
                 s.open_step = Some(index);
                 s.shell_log_collapsed = false;
@@ -1286,6 +1293,8 @@ fn substeps_accordion(
             .radius(k.radius.md)
             .fill(k.c.layer_02)
             .border(1.0, k.c.border_base)
+            .border_layout()
+            .clip_rounded(k.radius.md)
             .child(header);
         if expanded {
             card = card.child(expanded_log_box(
@@ -1384,6 +1393,8 @@ fn substep_card(
         .radius(k.radius.md)
         .fill(k.c.layer_02)
         .border(1.0, k.c.border_base)
+        .border_layout()
+        .clip_rounded(k.radius.md)
         .child(header);
 
     if expanded {

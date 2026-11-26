@@ -166,6 +166,7 @@ pub fn load(s: &mut State, view: View) {
                                 loading: false,
                                 error: None,
                                 mode: Some(LogMode::Tail),
+                                offset: 0,
                             },
                         );
                     }

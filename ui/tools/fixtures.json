@@ -16,6 +16,16 @@
     },
     "git": {
       "version": "git version 2.47.1"
+    },
+    "webhook": {
+      "configured": true,
+      "endpoint": "https://lunacy.example.com/api/github/webhook",
+      "deliveries": 12,
+      "last_event": "push",
+      "last_repo": "teppyboy/lunarum",
+      "last_delivery_id": "demo-delivery-001",
+      "last_received_at": "2026-11-26T12:00:00Z",
+      "last_outcome": "queued"
     }
   },
   "deploy_checks": {
@@ -41,6 +51,7 @@
         "watch_prs": true,
         "deploy_refs": ["master", "tags/v*"],
         "cache_enabled": true,
+        "trigger_mode": "both",
         "git": {
           "repo_exists": true,
           "is_git_repo": true,
@@ -118,6 +129,7 @@
         "watch_prs": false,
         "deploy_refs": [],
         "cache_enabled": true,
+        "trigger_mode": "poll",
         "git": {
           "repo_exists": true,
           "is_git_repo": true,

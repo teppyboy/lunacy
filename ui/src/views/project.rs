@@ -288,7 +288,9 @@ fn body(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
             .gap(0.0)
             .radius(k.radius.lg)
             .fill(k.c.layer_02)
-            .border(1.0, k.c.border_base);
+            .border(1.0, k.c.border_base)
+            .border_layout()
+            .clip_rounded(k.radius.lg);
         for (i, run) in s.runs.iter().enumerate() {
             rows = rows.child(run_row(
                 k,
@@ -309,7 +311,9 @@ fn open_prs_section(k: &Kit, prs: &[PrSummary], compact: bool) -> El {
         .gap(0.0)
         .radius(k.radius.lg)
         .fill(k.c.layer_02)
-        .border(1.0, k.c.border_base);
+        .border(1.0, k.c.border_base)
+        .border_layout()
+        .clip_rounded(k.radius.lg);
     for (i, pr) in prs.iter().enumerate() {
         let last = i + 1 == prs.len();
         let status_pill = match pr.status {

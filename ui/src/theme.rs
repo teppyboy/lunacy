@@ -120,23 +120,61 @@ fn sync_elevation_borders(k: &mut Kit) {
         &mut k.elevation.floating,
         &mut k.elevation.overlay,
         &mut k.elevation.button_neutral,
+        &mut k.elevation.button_contrast,
+        &mut k.elevation.elements,
+        &mut k.elevation.md,
+        &mut k.elevation.knob,
     ] {
         for sh in list.iter_mut() {
             if sh.spread > 0.0 {
                 sh.color = k.c.border_base;
+            } else {
+                sh.color = Color::BLACK.alpha(sh.color.a);
             }
         }
     }
 }
 
+fn sync_neutral_roles(k: &mut Kit, inv_ink: Color) {
+    k.c.bg_inverse = k.c.text_base;
+    k.c.bg_contrast = k.c.text_base;
+    k.c.bg_icon_button_contrast = k.c.text_base;
+    k.c.surface_float = k.c.text_base;
+
+    k.c.submit_fg = inv_ink;
+    k.c.submit_icon = inv_ink;
+    k.c.text_inverse = inv_ink;
+    k.c.text_contrast = inv_ink;
+    k.c.icon_inverse = inv_ink;
+    k.c.icon_contrast = inv_ink;
+    k.c.text_invert_strong = inv_ink;
+    k.c.std_icon_invert = inv_ink;
+
+    k.c.text_strong = k.c.text_base;
+    k.c.text_weak = k.c.text_muted;
+    k.c.icon_base = k.c.text_base;
+    k.c.icon_muted = k.c.text_muted;
+    k.c.icon_faint = k.c.text_faint;
+    k.c.icon_weaker = k.c.text_muted;
+
+    k.c.std_text = k.c.text_base;
+    k.c.std_icon = k.c.text_muted;
+    k.c.std_icon_strong = k.c.text_base;
+
+    k.c.knob = Color::WHITE;
+    k.c.knob_on = Color::WHITE;
+}
+
 fn apply_dark(k: &mut Kit) {
-    k.c.bg_deep = srgb_hex(0x0b0d12);
-    k.c.page = srgb_hex(0x11141b);
-    k.c.bg_base = srgb_hex(0x151923);
-    k.c.layer_01 = srgb_hex(0x171b26);
-    k.c.layer_02 = srgb_hex(0x1e2331);
-    k.c.layer_03 = srgb_hex(0x272d3f);
-    k.c.layer_04 = srgb_hex(0x30374c);
+    // Crisp pure neutral achromatic grays (R == G == B, zero blue tint).
+    // `bg_base` is raised above `layer_01` so `SegmentedControl` active pills stand out cleanly.
+    k.c.bg_deep = srgb_hex(0x0a0a0a);
+    k.c.page = srgb_hex(0x0f0f0f);
+    k.c.layer_01 = srgb_hex(0x141414);
+    k.c.layer_02 = srgb_hex(0x1a1a1a);
+    k.c.bg_base = srgb_hex(0x242424);
+    k.c.layer_03 = srgb_hex(0x242424);
+    k.c.layer_04 = srgb_hex(0x2e2e2e);
 
     k.c.surface_base = k.c.layer_02;
     k.c.surface_weak = k.c.layer_02;
@@ -145,29 +183,36 @@ fn apply_dark(k: &mut Kit) {
     k.c.surface_raised_base = k.c.layer_02;
     k.c.bg_button_neutral = k.c.layer_02;
 
-    k.c.hover = srgb_hex(0x232939);
-    k.c.surface_hover = srgb_hex(0x232939);
-    k.c.surface_raised_hover = srgb_hex(0x272d3f);
-    k.c.pressed = srgb_hex(0x2c3347);
+    k.c.hover = srgb_hex(0x202020);
+    k.c.surface_hover = srgb_hex(0x222222);
+    k.c.surface_raised_hover = srgb_hex(0x262626);
+    k.c.pressed = srgb_hex(0x2c2c2c);
 
-    k.c.border_muted = srgb_hex(0x2a3142);
-    k.c.border_weak = srgb_hex(0x2a3142);
-    k.c.border_disabled = srgb_hex(0x242a3a);
-    k.c.border_base = srgb_hex(0x3a4358);
-    k.c.std_border = srgb_hex(0x3a4358);
-    k.c.border_hover = srgb_hex(0x4f5a75);
-    k.c.border_strong = srgb_hex(0x525e7a);
+    k.c.border_muted = srgb_hex(0x262626);
+    k.c.border_weak = srgb_hex(0x262626);
+    k.c.border_disabled = srgb_hex(0x1f1f1f);
+    k.c.border_base = srgb_hex(0x333333);
+    k.c.std_border = srgb_hex(0x333333);
+    k.c.border_hover = srgb_hex(0x474747);
+    k.c.border_strong = srgb_hex(0x454545);
 
+    k.c.text_base = srgb_hex(0xededed);
+    k.c.text_muted = srgb_hex(0xa1a1a1);
+    k.c.text_faint = srgb_hex(0x737373);
+
+    sync_neutral_roles(k, k.c.page);
     sync_elevation_borders(k);
 }
 
 fn apply_light(k: &mut Kit) {
+    // Crisp neutral grays with zero blue slate cast.
+    // `bg_base` is pure white inside `#efefef` `layer_01` tracks for crisp `SegmentedControl` pills.
     k.c.bg_deep = srgb_hex(0xffffff);
-    k.c.page = srgb_hex(0xf4f6fa);
-    k.c.bg_base = srgb_hex(0xf0f3f8);
-    k.c.layer_01 = srgb_hex(0xe9edf5);
+    k.c.page = srgb_hex(0xfafafa);
+    k.c.layer_01 = srgb_hex(0xefefef);
+    k.c.bg_base = srgb_hex(0xffffff);
     k.c.layer_02 = srgb_hex(0xffffff);
-    k.c.layer_03 = srgb_hex(0xdfe5f0);
+    k.c.layer_03 = srgb_hex(0xe8e8e8);
     k.c.layer_04 = srgb_hex(0xffffff);
 
     k.c.surface_base = k.c.layer_02;
@@ -177,52 +222,65 @@ fn apply_light(k: &mut Kit) {
     k.c.surface_raised_base = k.c.layer_02;
     k.c.bg_button_neutral = k.c.layer_02;
 
-    k.c.hover = srgb_hex(0xdce2ee);
-    k.c.surface_hover = srgb_hex(0xe4e9f2);
-    k.c.surface_raised_hover = srgb_hex(0xf7f9fc);
-    k.c.pressed = srgb_hex(0xd2dae8);
+    k.c.hover = srgb_hex(0xeaeaea);
+    k.c.surface_hover = srgb_hex(0xf0f0f0);
+    k.c.surface_raised_hover = srgb_hex(0xf7f7f7);
+    k.c.pressed = srgb_hex(0xe0e0e0);
 
-    k.c.border_muted = srgb_hex(0xd5dce8);
-    k.c.border_weak = srgb_hex(0xd5dce8);
-    k.c.border_disabled = srgb_hex(0xe0e6f0);
-    k.c.border_base = srgb_hex(0xbcc6d8);
-    k.c.std_border = srgb_hex(0xbcc6d8);
-    k.c.border_hover = srgb_hex(0x9eabbf);
-    k.c.border_strong = srgb_hex(0x8f9db5);
+    k.c.border_muted = srgb_hex(0xe5e5e5);
+    k.c.border_weak = srgb_hex(0xe5e5e5);
+    k.c.border_disabled = srgb_hex(0xeeeeee);
+    k.c.border_base = srgb_hex(0xd4d4d4);
+    k.c.std_border = srgb_hex(0xd4d4d4);
+    k.c.border_hover = srgb_hex(0xa3a3a3);
+    k.c.border_strong = srgb_hex(0x999999);
 
+    k.c.text_base = srgb_hex(0x171717);
+    k.c.text_muted = srgb_hex(0x525252);
+    k.c.text_faint = srgb_hex(0x737373);
+
+    sync_neutral_roles(k, Color::WHITE);
     sync_elevation_borders(k);
 }
 
 fn apply_oled(k: &mut Kit) {
-    // True black canvas with stepped near-black cool-slate surfaces and crisp borders/rings.
+    // Vercel Geist Dark pure black: every primary surface is #000000, defined by crisp borders.
+    // `bg_base` is subtly raised (`#1a1a1a`) so `SegmentedControl` active pills stand out cleanly
+    // against pure-black `layer_01` tracks while all major surfaces remain `#000000`.
     k.c.page = Color::BLACK;
     k.c.bg_deep = Color::BLACK;
-    k.c.bg_base = srgb_hex(0x0b0d12);
-    k.c.layer_01 = srgb_hex(0x0b0d12);
-    k.c.layer_02 = srgb_hex(0x131620);
-    k.c.layer_03 = srgb_hex(0x1c2130);
-    k.c.layer_04 = srgb_hex(0x252b3d);
+    k.c.layer_01 = Color::BLACK;
+    k.c.layer_02 = Color::BLACK;
+    k.c.bg_base = srgb_hex(0x1a1a1a);
 
-    k.c.surface_base = k.c.layer_02;
-    k.c.surface_weak = k.c.layer_02;
-    k.c.surface_disabled = k.c.layer_02;
-    k.c.surface_raised = k.c.layer_02;
-    k.c.surface_raised_base = k.c.layer_02;
-    k.c.bg_button_neutral = k.c.layer_02;
+    k.c.surface_base = Color::BLACK;
+    k.c.surface_weak = Color::BLACK;
+    k.c.surface_disabled = Color::BLACK;
+    k.c.surface_raised = Color::BLACK;
+    k.c.surface_raised_base = Color::BLACK;
+    k.c.bg_button_neutral = Color::BLACK;
 
-    k.c.hover = srgb_hex(0x1c2130);
-    k.c.surface_hover = srgb_hex(0x1c2130);
-    k.c.surface_raised_hover = srgb_hex(0x212738);
-    k.c.pressed = srgb_hex(0x252b3d);
+    k.c.layer_03 = srgb_hex(0x141414);
+    k.c.layer_04 = srgb_hex(0x1c1c1c);
 
-    k.c.border_muted = srgb_hex(0x282f40);
-    k.c.border_weak = srgb_hex(0x282f40);
-    k.c.border_disabled = srgb_hex(0x1f2534);
-    k.c.border_base = srgb_hex(0x414a60);
-    k.c.border_hover = srgb_hex(0x525e7a);
-    k.c.std_border = srgb_hex(0x414a60);
-    k.c.border_strong = srgb_hex(0x5d6985);
+    k.c.hover = srgb_hex(0x111111);
+    k.c.surface_hover = srgb_hex(0x121212);
+    k.c.surface_raised_hover = srgb_hex(0x161616);
+    k.c.pressed = srgb_hex(0x1c1c1c);
 
+    k.c.border_muted = srgb_hex(0x1f1f1f);
+    k.c.border_weak = srgb_hex(0x1f1f1f);
+    k.c.border_disabled = srgb_hex(0x171717);
+    k.c.border_base = srgb_hex(0x2e2e2e);
+    k.c.std_border = srgb_hex(0x2e2e2e);
+    k.c.border_hover = srgb_hex(0x454545);
+    k.c.border_strong = srgb_hex(0x454545);
+
+    k.c.text_base = srgb_hex(0xededed);
+    k.c.text_muted = srgb_hex(0xa1a1a1);
+    k.c.text_faint = srgb_hex(0x6e6e6e);
+
+    sync_neutral_roles(k, Color::BLACK);
     sync_elevation_borders(k);
 }
 

@@ -48,6 +48,8 @@ pub struct General {
     pub step_timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_mode: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -59,6 +61,7 @@ impl Default for General {
             poll_interval: default_poll(),
             step_timeout: None,
             shell: None,
+            trigger_mode: None,
             extra: extra(),
         }
     }
@@ -85,6 +88,8 @@ pub struct Github {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<App>,
     #[serde(flatten)]
@@ -176,6 +181,8 @@ pub struct Project {
     pub watch_tags: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_mode: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

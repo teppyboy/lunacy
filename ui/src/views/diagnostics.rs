@@ -108,6 +108,66 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
         "Server URL",
         widgets::value_for(k, compact, &s.server_display()),
     ));
+    daemon = daemon.child(widgets::divider(k));
+    daemon = daemon.child(
+        widgets::kv_for(
+            k,
+            compact,
+            "Transport",
+            if s.ws_connected {
+                widgets::pill(k, "WebSocket (live)", theme::status(k).success)
+            } else {
+                widgets::pill(k, "HTTP fallback", k.c.text_muted)
+            },
+        )
+        .key("diagnostics-transport"),
+    );
+    daemon = daemon.child(widgets::divider(k));
+    let webhook_val = match info.webhook.as_ref() {
+        Some(wh) => {
+            let pill = if wh.configured {
+                widgets::pill(k, "Configured", theme::status(k).success)
+            } else {
+                widgets::pill(k, "Not configured", k.c.text_faint)
+            };
+            let mut summary = format!(
+                "{} {}",
+                wh.deliveries,
+                if wh.deliveries == 1 {
+                    "delivery"
+                } else {
+                    "deliveries"
+                }
+            );
+            if let Some(ev) = wh.last_event.as_deref().filter(|v| !v.is_empty()) {
+                summary.push_str(&format!(" · last: {ev}"));
+                if let Some(repo) = wh.last_repo.as_deref().filter(|v| !v.is_empty()) {
+                    summary.push_str(&format!(" ({repo})"));
+                }
+                if let Some(ts) = wh.last_received_at.as_deref().filter(|v| !v.is_empty()) {
+                    summary.push_str(&format!(" at {ts}"));
+                }
+            }
+            let summary_el = text(summary)
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .min_w(0.0);
+            row()
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(pill)
+                .child(if compact {
+                    summary_el.wrap_anywhere().shrink()
+                } else {
+                    summary_el.wrap().shrink()
+                })
+        }
+        None => widgets::pill(k, "Not configured", k.c.text_faint),
+    };
+    daemon = daemon.child(
+        widgets::kv_for(k, compact, "GitHub Webhook", webhook_val).key("diagnostics-webhook"),
+    );
     c = c.child(daemon);
 
     c = c.child(widgets::section(

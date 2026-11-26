@@ -16,6 +16,7 @@ pub mod theme;
 pub mod updater;
 pub mod views;
 pub mod widgets;
+pub mod ws;
 
 pub use app::build;
 

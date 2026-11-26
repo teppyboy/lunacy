@@ -4,6 +4,7 @@
 use rune::{col, el, icon, row, text, Align, Color, El, Icon, Tx};
 use rune_kit::{Badge, Kit};
 
+use crate::icons;
 use crate::model::{ProjectState, RunStatus, StepStatus};
 use crate::theme::{self, Status};
 
@@ -58,7 +59,30 @@ pub fn pill(k: &Kit, label: impl Into<String>, ink: Color) -> El {
         .center()
         .radius(k.radius.sm)
         .fill(theme::status(k).tint(ink))
-        .child(text(label).font(k.ty.small_medium).color(ink))
+        .child(text(label).font(k.ty.small_medium).color(ink).nowrap())
+}
+
+/// A pill with a crisp leading 12pt stroke icon.
+pub fn pill_with_icon(k: &Kit, ic: &'static Icon, label: impl Into<String>, ink: Color) -> El {
+    row()
+        .h(20.0)
+        .px(7.0)
+        .gap(4.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .fill(theme::status(k).tint(ink))
+        .child(icon(ic, 12.0).color(ink).a11y_hidden())
+        .child(text(label).font(k.ty.small_medium).color(ink).nowrap())
+}
+
+/// A deploy-only badge (`Rocket` + "Deploy only").
+pub fn deploy_only_pill(k: &Kit) -> El {
+    pill_with_icon(k, &icons::ROCKET, "Deploy only", theme::status(k).running)
+}
+
+/// A paused project badge (`Pause` + "Paused").
+pub fn paused_pill(k: &Kit) -> El {
+    pill_with_icon(k, &icons::PAUSE, "Paused", k.c.text_faint)
 }
 
 /// A run's status pill.
@@ -149,6 +173,26 @@ pub fn section(k: &Kit, title: &str, blurb: Option<&str>) -> El {
     col().w_full().gap(14.0).child(head)
 }
 
+/// A titled section with a subtle leading 14pt icon.
+pub fn section_icon(k: &Kit, ic: &'static Icon, title: &str, blurb: Option<&str>) -> El {
+    let mut head = col().w_full().gap(3.0).child(
+        row()
+            .gap(7.0)
+            .center_y()
+            .child(icon(ic, 14.0).color(k.c.icon_muted).a11y_hidden())
+            .child(text(title).font(k.ty.ui_medium).color(k.c.text_base)),
+    );
+    if let Some(blurb) = blurb {
+        head = head.child(
+            text(blurb)
+                .font(k.ty.caption())
+                .color(k.c.text_muted)
+                .wrap(),
+        );
+    }
+    col().w_full().gap(14.0).child(head)
+}
+
 /// A label above a control, with optional help text under it.
 pub fn labelled(k: &Kit, label: &str, help: Option<&str>, control: El) -> El {
     let mut c = col()
@@ -172,16 +216,9 @@ pub fn compact_icon(el: El, compact: bool) -> El {
     }
 }
 
-/// A simple 3-line hamburger icon for the compact navigation drawer toggle.
+/// A 3-line menu icon for the compact navigation drawer toggle.
 pub fn hamburger(ink: Color) -> El {
-    let bar = || el().w(16.0).h(1.5).radius(0.75).fill(ink);
-    col()
-        .gap(3.5)
-        .center()
-        .a11y_hidden()
-        .child(bar())
-        .child(bar())
-        .child(bar())
+    icon(&icons::MENU, 18.0).color(ink).a11y_hidden()
 }
 
 /// A row of two fields side by side on desktop, stacked on compact viewports.
@@ -206,6 +243,15 @@ pub fn pair_for(compact: bool, left: El, right: El) -> El {
 /// Muted uppercase caption for a group of rows.
 pub fn caption(k: &Kit, label: &str) -> El {
     text(label).font(k.ty.small_medium).color(k.c.text_faint)
+}
+
+/// Muted uppercase caption paired with a subtle 12pt leading icon.
+pub fn caption_icon(k: &Kit, ic: &'static Icon, label: &str) -> El {
+    row()
+        .gap(5.0)
+        .center_y()
+        .child(icon(ic, 12.0).color(k.c.icon_faint).a11y_hidden())
+        .child(caption(k, label))
 }
 
 /// A single-line read-only value, for diagnostics.
@@ -333,13 +379,42 @@ pub fn mono_chip(k: &Kit, value: &str) -> El {
         .child(
             text(value.to_string())
                 .font(k.ty.mono)
-                .color(k.c.text_muted),
+                .color(k.c.text_muted)
+                .nowrap(),
         )
+}
+
+/// A monospace chip with a crisp leading 12pt icon.
+pub fn mono_chip_icon(k: &Kit, ic: &'static Icon, value: &str) -> El {
+    row()
+        .h(20.0)
+        .px(6.0)
+        .gap(4.0)
+        .center_y()
+        .radius(k.radius.xs)
+        .fill(k.c.layer_03)
+        .child(icon(ic, 12.0).color(k.c.icon_faint).a11y_hidden())
+        .child(
+            text(value.to_string())
+                .font(k.ty.mono)
+                .color(k.c.text_muted)
+                .nowrap(),
+        )
+}
+
+/// A commit SHA chip (`GIT_COMMIT` icon + 7-character short SHA).
+pub fn sha_chip(k: &Kit, sha: &str) -> El {
+    mono_chip_icon(k, &icons::GIT_COMMIT, &short_sha(sha))
 }
 
 /// Distinct pull-request pill (`PR #42`).
 pub fn pr_pill(k: &Kit, number: u64) -> El {
-    pill(k, format!("PR #{number}"), k.c.text_accent)
+    pill_with_icon(
+        k,
+        &icons::GIT_PULL_REQUEST,
+        format!("PR #{number}"),
+        k.c.text_accent,
+    )
 }
 
 /// Formats a git ref for compact UI badges (`refs/tags/v1.0` -> `tags/v1.0`, `refs/heads/main` -> `main`).
@@ -353,14 +428,50 @@ pub fn short_ref(git_ref: &str) -> &str {
 /// Returns a `PR #N` pill or a ref chip when `run` is a PR or non-default branch/tag.
 pub fn run_ref_badge(k: &Kit, run: &crate::model::Run, default_branch: Option<&str>) -> Option<El> {
     if let Some(pr) = run.pr_number {
-        return Some(pr_pill(k, pr));
+        let mut p = pr_pill(k, pr);
+        if let Some(reason) = run.trigger_display() {
+            p = p.help(reason);
+        }
+        return Some(p);
     }
     let raw = run.git_ref.as_deref().filter(|r| !r.is_empty())?;
     let display = short_ref(raw);
     if default_branch.is_some_and(|b| b == display || b == raw) {
         return None;
     }
-    Some(mono_chip(k, display))
+    let ic = if raw.starts_with("refs/tags/") || display.starts_with("tags/") {
+        &icons::TAG
+    } else {
+        &icons::GIT_BRANCH
+    };
+    Some(mono_chip_icon(k, ic, display))
+}
+
+/// Subtle neutral trigger pill (`Webhook`, `Manual`, `Poll`, `PR`, `Force deploy`, `Tag`) with a
+/// leading icon and tooltip showing `run.trigger_display()`. Skipped when `deploy_only` already
+/// shows `"Deploy only"` and `trigger == "force_deploy"`, or when `pr_number` already shows
+/// `"PR #N"` and `trigger == "pull_request"`, to avoid visual duplication.
+pub fn trigger_pill(k: &Kit, run: &crate::model::Run, key: impl Into<String>) -> Option<El> {
+    if (run.deploy_only && run.trigger.as_deref() == Some("force_deploy"))
+        || (run.pr_number.is_some() && run.trigger.as_deref() == Some("pull_request"))
+    {
+        return None;
+    }
+    let label = run.trigger_label()?;
+    let ic = match run.trigger.as_deref() {
+        Some("webhook") => &icons::ZAP,
+        Some("manual") => &icons::PLAY,
+        Some("poll") => &icons::CLOCK,
+        Some("pull_request") => &icons::GIT_PULL_REQUEST,
+        Some("force_deploy") => &icons::ROCKET,
+        Some("tag") => &icons::TAG,
+        _ => &icons::INFO,
+    };
+    let mut p = pill_with_icon(k, ic, label, k.c.text_muted).key(key);
+    if let Some(reason) = run.trigger_display() {
+        p = p.help(reason);
+    }
+    Some(p)
 }
 
 /// The reason a skipped step was skipped, or `None` when it was skipped for another reason.
@@ -430,16 +541,24 @@ pub fn empty_state(k: &Kit, title: &str, body: &str) -> El {
         )
 }
 
-/// A failure banner inside a panel: the message, and optionally a retry button.
+/// A failure or informational banner inside a panel.
 pub fn notice(k: &Kit, ink: Color, message: &str) -> El {
+    let st = theme::status(k);
+    let ic = if ink == st.failure || ink == st.error {
+        &icons::ALERT_CIRCLE
+    } else if ink == st.success {
+        &icons::CHECK_CIRCLE
+    } else {
+        &icons::INFO
+    };
     row()
         .w_full()
         .gap(8.0)
         .padding(10.0)
         .radius(k.radius.md)
-        .fill(theme::status(k).tint(ink))
+        .fill(st.tint(ink))
         .items_start()
-        .child(dot(ink, 7.0).mt(5.0))
+        .child(icon(ic, 14.0).color(ink).mt(2.0).a11y_hidden())
         .child(
             text(message.to_string())
                 .font(k.ty.small)
@@ -575,6 +694,22 @@ pub fn choice_row_for<S: 'static>(
     placeholder: Option<&str>,
     on_pick: impl Fn(&mut S, &str, &mut Tx) + Clone + 'static,
 ) -> El {
+    let items: Vec<(String, String, Option<&'static Icon>)> = options
+        .iter()
+        .map(|(v, l)| (v.clone(), l.clone(), None))
+        .collect();
+    choice_row_for_icons(k, compact, &items, current, placeholder, on_pick)
+}
+
+/// Responsive `choice_row` with optional leading 14pt icons per option.
+pub fn choice_row_for_icons<S: 'static>(
+    k: &Kit,
+    compact: bool,
+    options: &[(String, String, Option<&'static Icon>)],
+    current: Option<&str>,
+    placeholder: Option<&str>,
+    on_pick: impl Fn(&mut S, &str, &mut Tx) + Clone + 'static,
+) -> El {
     let mut r = row().w_full().gap(6.0).flex_wrap();
     if options.is_empty() {
         return r.child(
@@ -584,41 +719,46 @@ pub fn choice_row_for<S: 'static>(
         );
     }
     let chip_h = if compact { 44.0 } else { 26.0 };
-    for (value, label) in options {
+    for (value, label, opt_icon) in options {
         let on = current == Some(value.as_str());
         let fill = if on { k.c.layer_04 } else { k.c.layer_01 };
+        let ink = if on { k.c.text_base } else { k.c.text_muted };
         let pick = on_pick.clone();
         let value = value.clone();
-        r = r.child(
-            el().key(format!("choice-{value}"))
-                .role("radio")
-                .label(label.clone())
-                .a11y_value(if on { "selected" } else { "not selected" })
-                .min_h(chip_h)
-                .min_w(if compact { 44.0 } else { 0.0 })
-                .px(if compact { 14.0 } else { 10.0 })
-                .py(if compact { 8.0 } else { 0.0 })
-                .center_y()
-                .radius(k.radius.md)
-                .fill(fill)
-                .border(
-                    1.0,
-                    if on {
-                        k.c.border_strong
-                    } else {
-                        k.c.border_muted
-                    },
-                )
-                .hover(k.c.hover)
-                .cursor(rune::Cursor::Pointer)
-                .on_press_tx(move |s: &mut S, tx: &mut Tx| pick(s, &value, tx))
-                .child(
-                    text(label.clone())
-                        .font(k.ty.small_medium)
-                        .color(if on { k.c.text_base } else { k.c.text_muted })
-                        .wrap(),
-                ),
+        let mut chip = row()
+            .key(format!("choice-{value}"))
+            .role("radio")
+            .label(label.clone())
+            .a11y_value(if on { "selected" } else { "not selected" })
+            .min_h(chip_h)
+            .min_w(if compact { 44.0 } else { 0.0 })
+            .px(if compact { 14.0 } else { 10.0 })
+            .py(if compact { 8.0 } else { 0.0 })
+            .gap(6.0)
+            .center_y()
+            .radius(k.radius.md)
+            .fill(fill)
+            .border(
+                1.0,
+                if on {
+                    k.c.border_strong
+                } else {
+                    k.c.border_muted
+                },
+            )
+            .hover(k.c.hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press_tx(move |s: &mut S, tx: &mut Tx| pick(s, &value, tx));
+        if let Some(ic) = opt_icon {
+            chip = chip.child(icon(ic, 14.0).color(ink).a11y_hidden());
+        }
+        chip = chip.child(
+            text(label.clone())
+                .font(k.ty.small_medium)
+                .color(ink)
+                .wrap(),
         );
+        r = r.child(chip);
     }
     r
 }
@@ -631,46 +771,60 @@ pub fn segmented<S: 'static>(
     selected: Option<usize>,
     on_pick: impl Fn(&mut S, usize, &mut Tx) + Clone + 'static,
 ) -> El {
+    segmented_with_icons(k, compact, labels, &[], selected, on_pick)
+}
+
+/// Responsive segmented picker with optional leading 14pt icons per segment.
+pub fn segmented_with_icons<S: 'static>(
+    k: &Kit,
+    compact: bool,
+    labels: &[&str],
+    icons: &[Option<&'static Icon>],
+    selected: Option<usize>,
+    on_pick: impl Fn(&mut S, usize, &mut Tx) + Clone + 'static,
+) -> El {
     if !compact {
-        return rune_kit::SegmentedControl::new(labels, selected)
-            .fit()
-            .on_pick(on_pick)
-            .build(k);
+        let mut ctrl = rune_kit::SegmentedControl::new(labels, selected).fit();
+        if !icons.is_empty() {
+            ctrl = ctrl.icons(icons);
+        }
+        return ctrl.on_pick(on_pick).build(k);
     }
     let mut r = row().role("radiogroup").gap(6.0).flex_wrap();
     for (i, label) in labels.iter().enumerate() {
         let on = selected == Some(i);
         let fill = if on { k.c.layer_04 } else { k.c.layer_01 };
+        let ink = if on { k.c.text_base } else { k.c.text_muted };
         let pick = on_pick.clone();
-        r = r.child(
-            el().key(format!("segment{i}"))
-                .role("radio")
-                .label(*label)
-                .a11y_value(if on { "selected" } else { "not selected" })
-                .min_h(44.0)
-                .min_w(44.0)
-                .px(14.0)
-                .py(8.0)
-                .center()
-                .radius(k.radius.md)
-                .fill(fill)
-                .border(
-                    1.0,
-                    if on {
-                        k.c.border_strong
-                    } else {
-                        k.c.border_muted
-                    },
-                )
-                .hover(k.c.hover)
-                .cursor(rune::Cursor::Pointer)
-                .on_press_tx(move |s: &mut S, tx: &mut Tx| pick(s, i, tx))
-                .child(text(*label).font(k.ty.small_medium).color(if on {
-                    k.c.text_base
+        let mut seg = row()
+            .key(format!("segment{i}"))
+            .role("radio")
+            .label(*label)
+            .a11y_value(if on { "selected" } else { "not selected" })
+            .min_h(44.0)
+            .min_w(44.0)
+            .px(14.0)
+            .py(8.0)
+            .gap(6.0)
+            .center()
+            .radius(k.radius.md)
+            .fill(fill)
+            .border(
+                1.0,
+                if on {
+                    k.c.border_strong
                 } else {
-                    k.c.text_muted
-                })),
-        );
+                    k.c.border_muted
+                },
+            )
+            .hover(k.c.hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press_tx(move |s: &mut S, tx: &mut Tx| pick(s, i, tx));
+        if let Some(ic) = icons.get(i).copied().flatten() {
+            seg = seg.child(icon(ic, 14.0).color(ink).a11y_hidden());
+        }
+        seg = seg.child(text(*label).font(k.ty.small_medium).color(ink).nowrap());
+        r = r.child(seg);
     }
     r
 }

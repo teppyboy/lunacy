@@ -221,6 +221,7 @@ class Script:
 class Sandbox:
     def __init__(self) -> None:
         self.dir = pathlib.Path(tempfile.mkdtemp(dir="/tmp", prefix="lunacy-e2e."))
+        self.bin_dir = self.dir / "bin"
         self.port = free_port()
         self.cdp_port = free_port()
         self.act_port = free_port()
@@ -250,10 +251,13 @@ class Sandbox:
                     pass
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def env(self) -> dict[str, str]:
+    def env(self, *, rune_dirs_root: pathlib.Path | None = None) -> dict[str, str]:
         e = dict(os.environ)
+        for leaked in ("RUNE_PREFS_DIR", "LUNACY_SERVER", "LUNACY_TOKEN"):
+            e.pop(leaked, None)
         e["TMPDIR"] = "/tmp"
-        e["RUNE_DIRS_ROOT"] = str(self.dir / "rune-dirs")
+        e["PATH"] = f"{self.bin_dir}{os.pathsep}{e.get('PATH', '')}"
+        e["RUNE_DIRS_ROOT"] = str(rune_dirs_root or (self.dir / "rune-dirs"))
         lvp_icd = "/home/tretrauit/Android/Sdk/emulator/lib64/vulkan/lvp_icd.json"
         if not e.get("VK_ICD_FILENAMES") and pathlib.Path(lvp_icd).is_file():
             e["VK_ICD_FILENAMES"] = lvp_icd
@@ -261,6 +265,36 @@ class Sandbox:
 
     def setup(self) -> None:
         assert self.port != 7878
+        self.bin_dir.mkdir(exist_ok=True)
+        docker_shim = self.bin_dir / "docker"
+        docker_shim.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  info)\n"
+            "    echo \"27.0.0-e2e\"\n"
+            "    exit 0\n"
+            "    ;;\n"
+            "  volume)\n"
+            "    if [ \"$2\" = \"ls\" ]; then\n"
+            "      exit 0\n"
+            "    fi\n"
+            "    exit 0\n"
+            "    ;;\n"
+            "  ps)\n"
+            "    exit 0\n"
+            "    ;;\n"
+            "  image)\n"
+            "    if [ \"$2\" = \"inspect\" ]; then\n"
+            "      exit 1\n"
+            "    fi\n"
+            "    exit 0\n"
+            "    ;;\n"
+            "  *)\n"
+            "    exit 0\n"
+            "    ;;\n"
+            "esac\n"
+        )
+        docker_shim.chmod(0o755)
         (self.dir / "bare").mkdir()
         (self.dir / "repos").mkdir()
         (self.dir / "state").mkdir()
@@ -441,6 +475,8 @@ timeout = 60
         *,
         at: float,
         token: str = TOKEN,
+        pass_conn_flags: bool = True,
+        rune_dirs_root: pathlib.Path | None = None,
         size: str = "1280x840",
         fps: int = 20,
         scale: float | None = 1.0,
@@ -452,12 +488,15 @@ timeout = 60
         script_path = self.dir / f"{prefix}.script.json"
         tree_path = self.dir / f"{prefix}.tree.json"
         script_path.write_text(json.dumps(events, indent=2))
-        cmd = [
-            str(UI_BIN),
-            "--server",
-            f"http://127.0.0.1:{self.port}",
-            "--token",
-            token,
+        cmd = [str(UI_BIN)]
+        if pass_conn_flags:
+            cmd.extend([
+                "--server",
+                f"http://127.0.0.1:{self.port}",
+                "--token",
+                token,
+            ])
+        cmd.extend([
             "--realtime",
             "--fps",
             str(fps),
@@ -470,7 +509,7 @@ timeout = 60
             "--at",
             str(at),
             "--settle",
-        ]
+        ])
         if scale is not None:
             cmd.extend(["--scale", str(scale)])
         if snap is not None:
@@ -481,7 +520,7 @@ timeout = 60
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            env=self.env(),
+            env=self.env(rune_dirs_root=rune_dirs_root),
         )
         output_lines: list[str] = []
         assert proc.stdout is not None
@@ -797,6 +836,16 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
     )
     t_act_raw = sb.run_ui("alpha_act_raw", sc_raw.events, at=sc_raw.t + 0.3)
     assert "hello from act web" in " ".join(subtree_texts(t_act_raw, "log"))
+
+    # Reset persisted log_view_raw back to Steps so later tests sharing default rune-dirs stay isolated.
+    sc_raw_reset = (
+        Script(1.0)
+        .tap("project-alpha", 0.7)
+        .tap(f"run-{latest_alpha_run_id}", 0.7)
+        .tap("step-1", 0.7)
+        .tap("run-log-view/segment0", 0.4)
+    )
+    sb.run_ui("alpha_act_raw_reset", sc_raw_reset.events, at=sc_raw_reset.t + 0.25)
 
     sc = (
         Script(1.0)
@@ -1256,6 +1305,86 @@ def test_web_build(sb: Sandbox, alpha_run_id: str) -> None:
     run_cmd([str(DAEMON_BIN), "check", "-c", str(sb.config_path)], env=sb.env())
 
 
+def test_desktop_persistence(sb: Sandbox, alpha_run_id: str) -> None:
+    print("[e2e] Testing desktop local settings persistence (Connection + theme + log_view_raw + 0600 perms)...")
+    persist_dirs = sb.dir / "rune-dirs-persist"
+    persist_dirs.mkdir()
+    server_url = f"http://127.0.0.1:{sb.port}"
+
+    sc_save = (
+        Script(1.0)
+        .tap("connection", 0.55)
+        .replace("conn-server", server_url, 0.30)
+        .replace("conn-token", TOKEN, 0.30)
+        .tap("conn-connect", 1.1)
+        .tap("settings-nav-Appearance", 0.4)
+        .tap("appearance-theme/choice-oled", 0.35)
+        .tap("nav-Projects", 0.55)
+        .tap("project-alpha", 0.65)
+        .tap(f"run-{alpha_run_id}", 0.65)
+        .tap("step-1", 0.65)
+        .tap("run-log-view/segment1", 0.4)
+    )
+    sb.run_ui(
+        "persist_save",
+        sc_save.events,
+        at=sc_save.t + 0.35,
+        token="wrong-token",
+        pass_conn_flags=True,
+        rune_dirs_root=persist_dirs,
+        size="1180x760",
+    )
+
+    prefs_path = persist_dirs / "config" / "lunacy" / "prefs.json"
+    assert prefs_path.is_file(), f"expected prefs.json at {prefs_path}"
+    if os.name == "posix":
+        dir_mode = prefs_path.parent.stat().st_mode & 0o777
+        assert dir_mode == 0o700, f"expected prefs dir mode 0o700, got {oct(dir_mode)}"
+        mode = prefs_path.stat().st_mode & 0o777
+        assert mode == 0o600, f"expected prefs.json mode 0o600, got {oct(mode)}"
+    prefs_data = json.loads(prefs_path.read_text())
+    assert prefs_data.get("server") == server_url, prefs_data
+    assert prefs_data.get("token") == TOKEN, prefs_data
+    assert prefs_data.get("theme") == "oled", prefs_data
+    assert prefs_data.get("log_view_raw") is True, prefs_data
+
+    # Restart lunacy-ui with the SAME RUNE_DIRS_ROOT and NO --server / --token CLI flags.
+    t_restored = sb.run_ui(
+        "persist_restore",
+        [],
+        at=1.4,
+        pass_conn_flags=False,
+        rune_dirs_root=persist_dirs,
+        size="1180x760",
+    )
+    assert not has_key(t_restored, "link-banner"), "restarted UI should auto-connect with saved prefs"
+    assert "Connected" in " ".join(subtree_texts(t_restored, "connection"))
+    assert has_key(t_restored, "project-alpha"), "expected project-alpha after auto-restoring connection"
+    assert find_el(t_restored, "app-root").get("fill") == "#000000ff", "OLED theme must persist across restart"
+
+    # Also confirm log_view_raw persisted across restart without CLI flags.
+    sc_raw_check = (
+        Script(1.0)
+        .tap("project-alpha", 0.65)
+        .tap(f"run-{alpha_run_id}", 0.65)
+        .tap("step-1", 0.65)
+    )
+    t_raw = sb.run_ui(
+        "persist_restore_raw",
+        sc_raw_check.events,
+        at=sc_raw_check.t + 0.35,
+        pass_conn_flags=False,
+        rune_dirs_root=persist_dirs,
+        size="1180x760",
+    )
+    assert "hello from act web" in " ".join(subtree_texts(t_raw, "log")), (
+        "persisted log_view_raw should open act step directly in Raw log view"
+    )
+    if os.name == "posix":
+        mode_after = prefs_path.stat().st_mode & 0o777
+        assert mode_after == 0o600, f"prefs.json mode drifted to {oct(mode_after)}"
+
+
 def main() -> int:
     sb = Sandbox()
     try:
@@ -1264,6 +1393,7 @@ def main() -> int:
         test_native_flows(sb, alpha_run_id)
         test_responsive_layouts(sb, alpha_run_id)
         test_job_b_features(sb, alpha_run_id)
+        test_desktop_persistence(sb, alpha_run_id)
         test_web_build(sb, alpha_run_id)
         print("[e2e] ALL CHECKS PASSED!")
         return 0

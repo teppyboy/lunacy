@@ -322,16 +322,32 @@ fn parse(call: &Call, reply: Reply) -> std::result::Result<Answer, Failure> {
 /// The body a `Call` sends, if it sends one.
 fn body(call: &Call) -> Option<(String, Value)> {
     match call {
-        Call::Trigger { project: _, force } => Some((
+        Call::Trigger { project: _, force } => {
+            let reason = if *force {
+                "Force run (UI)"
+            } else {
+                "Run now (UI)"
+            };
+            Some((
+                "POST".into(),
+                serde_json::json!({ "sha": Value::Null, "force": force, "reason": reason }),
+            ))
+        }
+        Call::ForceDeployProject { .. } => Some((
             "POST".into(),
-            serde_json::json!({ "sha": Value::Null, "force": force }),
+            serde_json::json!({ "reason": "Force deploy (UI)" }),
         )),
-        Call::CancelRun { .. }
-        | Call::CancelProject { .. }
-        | Call::ForceDeployProject { .. }
-        | Call::ForceDeployRun { .. }
-        | Call::RetryRun { .. }
-        | Call::ClearCache { .. } => Some(("POST".into(), serde_json::json!({}))),
+        Call::ForceDeployRun { id } => Some((
+            "POST".into(),
+            serde_json::json!({ "reason": format!("Force deploy of {id} (UI)") }),
+        )),
+        Call::RetryRun { id } => Some((
+            "POST".into(),
+            serde_json::json!({ "reason": format!("Retry of {id} (UI)") }),
+        )),
+        Call::CancelRun { .. } | Call::CancelProject { .. } | Call::ClearCache { .. } => {
+            Some(("POST".into(), serde_json::json!({})))
+        }
         Call::TestDiscord { project } => {
             Some(("POST".into(), serde_json::json!({ "project": project })))
         }
@@ -478,6 +494,36 @@ mod tests {
         assert_eq!(
             path(
                 b,
+                &Call::Trigger {
+                    project: "alpha".into(),
+                    force: false
+                }
+            ),
+            "http://127.0.0.1:7878/api/projects/alpha/trigger"
+        );
+        assert_eq!(
+            body(&Call::Trigger {
+                project: "alpha".into(),
+                force: false
+            }),
+            Some((
+                "POST".into(),
+                serde_json::json!({ "sha": null, "force": false, "reason": "Run now (UI)" })
+            ))
+        );
+        assert_eq!(
+            body(&Call::Trigger {
+                project: "alpha".into(),
+                force: true
+            }),
+            Some((
+                "POST".into(),
+                serde_json::json!({ "sha": null, "force": true, "reason": "Force run (UI)" })
+            ))
+        );
+        assert_eq!(
+            path(
+                b,
                 &Call::ForceDeployProject {
                     name: "alpha".into()
                 }
@@ -488,7 +534,10 @@ mod tests {
             body(&Call::ForceDeployProject {
                 name: "alpha".into()
             }),
-            Some(("POST".into(), serde_json::json!({})))
+            Some((
+                "POST".into(),
+                serde_json::json!({ "reason": "Force deploy (UI)" })
+            ))
         );
         assert_eq!(
             path(b, &Call::ForceDeployRun { id: "r-1".into() }),
@@ -496,7 +545,10 @@ mod tests {
         );
         assert_eq!(
             body(&Call::ForceDeployRun { id: "r-1".into() }),
-            Some(("POST".into(), serde_json::json!({})))
+            Some((
+                "POST".into(),
+                serde_json::json!({ "reason": "Force deploy of r-1 (UI)" })
+            ))
         );
         assert_eq!(
             path(b, &Call::RetryRun { id: "r-1".into() }),
@@ -504,7 +556,10 @@ mod tests {
         );
         assert_eq!(
             body(&Call::RetryRun { id: "r-1".into() }),
-            Some(("POST".into(), serde_json::json!({})))
+            Some((
+                "POST".into(),
+                serde_json::json!({ "reason": "Retry of r-1 (UI)" })
+            ))
         );
         assert_eq!(
             path(b, &Call::ClearCache { project: None }),

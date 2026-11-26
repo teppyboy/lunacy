@@ -8,6 +8,7 @@ pub mod api;
 pub mod app;
 pub mod config;
 pub mod demo;
+pub mod icons;
 pub mod model;
 pub mod net;
 pub mod paths;

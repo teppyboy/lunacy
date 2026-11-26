@@ -3,13 +3,29 @@
 //! The daemon's config is edited as the JSON it already is (`Editor::draft`), so unknown keys
 //! survive a save and a rejected field is addressed by the daemon's own path.
 
-use rune::{col, el, row, text, Cx, El, ScrollSpec, Spring, TextEdit, Transition, Tx};
+use rune::{col, el, icon, row, text, Cx, El, Icon, ScrollSpec, Spring, TextEdit, Transition, Tx};
 use rune_kit::{Button, ButtonVariant, ControlSize, Field, Kit, TextArea, TextInput};
 
+use crate::icons;
 use crate::state::{SettingsPage, State};
 use crate::theme;
 use crate::views::{deploy, diagnostics, steps};
 use crate::widgets;
+
+fn page_icon(page: SettingsPage) -> &'static Icon {
+    match page {
+        SettingsPage::General => &icons::SLIDERS,
+        SettingsPage::Server => &icons::SERVER,
+        SettingsPage::Github => &icons::GITHUB,
+        SettingsPage::Discord => &icons::MESSAGE_SQUARE,
+        SettingsPage::Act => &icons::TERMINAL,
+        SettingsPage::Projects => &icons::FOLDER_GIT,
+        SettingsPage::Deploy => &icons::ROCKET,
+        SettingsPage::Diagnostics => &icons::ACTIVITY,
+        SettingsPage::Connection => &icons::PLUG,
+        SettingsPage::Appearance => &icons::PALETTE,
+    }
+}
 
 pub fn view(
     s: &State,
@@ -143,13 +159,20 @@ pub fn view(
 
 fn page_chip(k: &Kit, s: &State, page: SettingsPage) -> El {
     let selected = s.editor.page == page;
-    el().key(format!("settings-nav-{}", page.title()))
+    let ink = if selected {
+        k.c.text_base
+    } else {
+        k.c.text_muted
+    };
+    row()
+        .key(format!("settings-nav-{}", page.title()))
         .role("tab")
         .label(page.title())
         .focus_selected(selected)
         .h(44.0)
         .min_w(44.0)
         .px(14.0)
+        .gap(6.0)
         .center()
         .radius(k.radius.md)
         .fill(if selected { k.c.layer_04 } else { k.c.layer_02 })
@@ -163,14 +186,11 @@ fn page_chip(k: &Kit, s: &State, page: SettingsPage) -> El {
         )
         .hover(k.c.hover)
         .press_scale(0.985)
+        .child(icon(page_icon(page), 14.0).color(ink).a11y_hidden())
         .child(
             text(page.title())
                 .font(k.ty.small_medium)
-                .color(if selected {
-                    k.c.text_base
-                } else {
-                    k.c.text_muted
-                })
+                .color(ink)
                 .nowrap(),
         )
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_settings(page, tx))
@@ -179,12 +199,18 @@ fn page_chip(k: &Kit, s: &State, page: SettingsPage) -> El {
 
 fn page_row(k: &Kit, s: &State, page: SettingsPage) -> El {
     let selected = s.editor.page == page;
+    let ink = if selected {
+        k.c.text_base
+    } else {
+        k.c.text_muted
+    };
     row()
         .key(format!("settings-nav-{}", page.title()))
         .w_full()
         .h(30.0)
         .pl(16.0)
         .pr(18.0)
+        .gap(9.0)
         .center_y()
         .fill(if selected {
             k.c.layer_03
@@ -193,11 +219,8 @@ fn page_row(k: &Kit, s: &State, page: SettingsPage) -> El {
         })
         .hover(k.c.hover)
         .press_scale(0.985)
-        .child(text(page.title()).font(k.ty.ui).color(if selected {
-            k.c.text_base
-        } else {
-            k.c.text_muted
-        }))
+        .child(icon(page_icon(page), 14.0).color(ink).a11y_hidden())
+        .child(text(page.title()).font(k.ty.ui).color(ink))
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_settings(page, tx))
         .cursor(rune::Cursor::Pointer)
 }
@@ -211,10 +234,16 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) ->
     let title_row = row()
         .gap(8.0)
         .center_y()
+        .child(
+            icon(page_icon(page), 15.0)
+                .color(k.c.icon_muted)
+                .a11y_hidden(),
+        )
         .child(text(page.title()).font(k.ty.ui_medium).color(k.c.text_base))
         .children(dirty.then(|| widgets::pill(k, "Unsaved", theme::status(k).error)));
 
     let discard_btn = Button::new("Discard")
+        .icon(&icons::UNDO)
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .disabled(!dirty)
@@ -223,6 +252,7 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) ->
         .key("settings-discard");
 
     let mut save_builder = Button::new(if e.saving { "Saving…" } else { "Save" })
+        .icon(&icons::CHECK)
         .variant(ButtonVariant::Submit)
         .control_size(ControlSize::Small)
         .disabled(!dirty || e.saving || !e.loaded)
@@ -398,6 +428,15 @@ fn general(s: &State, k: &Kit, compact: bool) -> El {
         )
         .key("field-general.trigger_mode"),
     );
+    c = c.child(u64_field_placeholder(
+        s,
+        k,
+        "general.max_concurrent_runs",
+        "Max concurrent runs",
+        "1",
+        Some("Maximum CI/deploy pipelines running simultaneously across all projects. Defaults to 1."),
+        false,
+    ));
     c
 }
 
@@ -695,6 +734,7 @@ fn discord(s: &State, k: &Kit, compact: bool) -> El {
             } else {
                 "Send test message"
             })
+            .icon(&icons::SEND)
             .variant(ButtonVariant::Outline)
             .control_size(ControlSize::Small)
             .disabled(!can_test)
@@ -746,6 +786,15 @@ fn act(s: &State, k: &Kit, compact: bool) -> El {
              Defaults to `act.lock` in the state dir; `~/` is expanded.",
         ),
     ));
+    c = c.child(u64_field_placeholder(
+        s,
+        k,
+        "act.max_concurrent",
+        "Max concurrent act jobs",
+        "Inherit",
+        Some("Maximum act jobs running simultaneously. Leave blank to inherit general.max_concurrent_runs."),
+        false,
+    ));
 
     c = c.child(widgets::divider(k));
     c = c.child(widgets::section(
@@ -779,6 +828,7 @@ fn act(s: &State, k: &Kit, compact: bool) -> El {
             } else {
                 "Clear all build caches"
             })
+            .icon(&icons::TRASH)
             .variant(ButtonVariant::Outline)
             .control_size(ControlSize::Small)
             .disabled(s.clearing_cache)
@@ -833,7 +883,7 @@ pub(crate) fn text_field_placeholder(
                 .unwrap_or_default();
             let optional = is_optional(&owner);
             s.editor.set_str_mode(&owner, &text, optional);
-            prune_empty_parents(&mut s.editor.draft, &owner);
+            crate::paths::prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -857,6 +907,19 @@ pub(crate) fn u64_field(
     help: Option<&str>,
     required_zero: bool,
 ) -> El {
+    u64_field_placeholder(s, k, path, label, label, help, required_zero)
+}
+
+/// An unsigned integer field bound to a config path with a custom placeholder.
+pub(crate) fn u64_field_placeholder(
+    s: &State,
+    k: &Kit,
+    path: &str,
+    label: &str,
+    placeholder: &str,
+    help: Option<&str>,
+    required_zero: bool,
+) -> El {
     let seeded = crate::paths::get_str(&s.editor.draft, path);
     let edit = s
         .editor
@@ -870,7 +933,7 @@ pub(crate) fn u64_field(
     let field = path.to_string();
     let input = TextInput::new(&edit)
         .label(label)
-        .placeholder(label)
+        .placeholder(placeholder)
         .width(None)
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
@@ -897,7 +960,7 @@ pub(crate) fn u64_field(
                     serde_json::Value::String(trimmed.to_string()),
                 );
             }
-            prune_empty_parents(&mut s.editor.draft, &owner);
+            crate::paths::prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -948,6 +1011,7 @@ pub(crate) fn argv_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
                 let items = argv.into_iter().map(serde_json::Value::String).collect();
                 crate::paths::set(&mut s.editor.draft, &owner, serde_json::Value::Array(items));
             }
+            crate::paths::prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::config::join_argv(&argv_vec(&s.editor.draft, &owner));
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -1001,6 +1065,7 @@ pub(crate) fn list_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             crate::paths::set_list(&mut s.editor.draft, &owner, &text);
+            crate::paths::prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_list_text(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -1051,7 +1116,7 @@ fn secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>)
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             s.editor.set_str(&owner, &text);
-            prune_empty_parents(&mut s.editor.draft, &owner);
+            crate::paths::prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -1092,7 +1157,7 @@ fn pem_secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&s
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             s.editor.set_str(&owner, &text);
-            prune_empty_parents(&mut s.editor.draft, &owner);
+            crate::paths::prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -1128,23 +1193,6 @@ fn secret_field_wrap(
         f = f.suffix(error);
     }
     f.build(k).key(format!("field-{path}"))
-}
-
-fn prune_empty_parents(draft: &mut serde_json::Value, path: &str) {
-    if path.starts_with("github.app.") {
-        crate::paths::prune_empty_object(draft, "github.app");
-    }
-    if path.starts_with("github.") {
-        crate::paths::prune_empty_object(draft, "github");
-    }
-    if path.starts_with("discord.") {
-        crate::paths::prune_empty_object(draft, "discord");
-    }
-    if let Some((parent, _leaf)) = path.rsplit_once('.') {
-        if parent.ends_with(".contexts") {
-            crate::paths::prune_empty_object(draft, parent);
-        }
-    }
 }
 
 /// A tri-state `Option<bool>` segmented picker: Inherit (`null`), On (`true`), Off (`false`).
@@ -1274,6 +1322,7 @@ fn projects_list(s: &State, k: &Kit, compact: bool) -> El {
     c = c.child(
         row().w_full().gap(8.0).child(
             Button::new("Add project")
+                .icon(&icons::PLUS)
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Regular)
                 .on_press_tx(|s: &mut State, tx: &mut Tx| s.add_project(tx))
@@ -1316,7 +1365,7 @@ fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
                     })
                     .wrap_anywhere(),
                 )
-                .children((!enabled).then(|| widgets::pill(k, "Paused", k.c.text_faint))),
+                .children((!enabled).then(|| widgets::paused_pill(k))),
         )
         .child(
             text(format!("{branch} · {ci} CI · {deploy} deploy"))
@@ -1325,6 +1374,7 @@ fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
                 .wrap_anywhere(),
         );
     let edit_btn = Button::new("Edit")
+        .icon(&icons::EDIT)
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_project_form(Some(i), tx))
@@ -1436,18 +1486,21 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
     }
 
     let all_btn = Button::new("All projects")
+        .icon(&icons::ARROW_LEFT)
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_project_form(None, tx))
         .build(k)
         .key("project-all");
     let dup_btn = Button::new("Duplicate")
+        .icon(&icons::COPY)
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.duplicate_project(i, tx))
         .build(k)
         .key("project-duplicate");
     let del_btn = Button::new("Delete")
+        .icon(&icons::TRASH)
         .variant(ButtonVariant::Danger)
         .control_size(ControlSize::Small)
         .on_press_tx(move |s: &mut State, _tx: &mut Tx| {
@@ -1496,6 +1549,7 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
             .build(k)
             .key("project-delete-cancel");
         let confirm_btn = Button::new("Delete")
+            .icon(&icons::TRASH)
             .variant(ButtonVariant::Danger)
             .control_size(ControlSize::Small)
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.delete_project(i, tx))
@@ -1741,6 +1795,7 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
             } else {
                 "Clear project cache"
             })
+            .icon(&icons::TRASH)
             .variant(ButtonVariant::Outline)
             .control_size(ControlSize::Small)
             .disabled(!can_clear)
@@ -1857,6 +1912,7 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
             } else {
                 "Test Discord webhook"
             })
+            .icon(&icons::SEND)
             .variant(ButtonVariant::Outline)
             .control_size(ControlSize::Small)
             .disabled(!can_test_discord)
@@ -1918,7 +1974,16 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
     c = c.child(widgets::section(
         k,
         "Runner overrides",
-        Some("Override the default shell or act runner settings for steps in this repository."),
+        Some("Override concurrency, default shell, or act runner settings for steps in this repository."),
+    ));
+    c = c.child(u64_field_placeholder(
+        s,
+        k,
+        &format!("{base}.max_concurrent_runs"),
+        "Max concurrent runs",
+        "1",
+        Some("Leave blank for 1; values > 1 require checkout set to worktree or none."),
+        false,
     ));
     c = c.child(argv_field(
         s,
@@ -2023,7 +2088,11 @@ fn connection_page(s: &State, k: &Kit, compact: bool) -> El {
         .pr(if compact { 18.0 } else { 22.0 })
         .py(if compact { 14.0 } else { 18.0 })
         .gap(18.0);
-    c = c.child(widgets::section(k, "Connection", Some("Where this window looks for the daemon. Not written to config.toml; in a browser the token is remembered for this site.")));
+    c = c.child(widgets::section(
+        k,
+        "Connection",
+        Some("Where this window looks for the daemon. Saved locally for this app or browser; not written to config.toml."),
+    ));
     c = c.child(widgets::pair_for(
         compact,
         text_input_bound(
@@ -2031,11 +2100,17 @@ fn connection_page(s: &State, k: &Kit, compact: bool) -> El {
             "conn-server",
             "Server URL",
             &s.ui_server,
+            Some(&icons::GLOBE),
             |s: &mut State| &mut s.ui_server,
         ),
-        text_input_bound(k, "conn-token", "Token", &s.ui_token, |s: &mut State| {
-            &mut s.ui_token
-        }),
+        text_input_bound(
+            k,
+            "conn-token",
+            "Token",
+            &s.ui_token,
+            Some(&icons::KEY),
+            |s: &mut State| &mut s.ui_token,
+        ),
     ));
     c = c.child(
         row()
@@ -2044,6 +2119,7 @@ fn connection_page(s: &State, k: &Kit, compact: bool) -> El {
             .flex_wrap()
             .child(
                 Button::new("Connect")
+                    .icon(&icons::PLUG)
                     .variant(ButtonVariant::Submit)
                     .control_size(ControlSize::Regular)
                     .on_press_tx(|s: &mut State, tx: &mut Tx| s.reconnect(tx))
@@ -2053,6 +2129,7 @@ fn connection_page(s: &State, k: &Kit, compact: bool) -> El {
             .children(
                 (cfg!(target_arch = "wasm32")).then_some(
                     Button::new("Use this page's origin")
+                        .icon(&icons::GLOBE)
                         .variant(ButtonVariant::Outline)
                         .control_size(ControlSize::Regular)
                         .on_press_tx(|s: &mut State, _tx: &mut Tx| {
@@ -2076,13 +2153,20 @@ fn connection_page(s: &State, k: &Kit, compact: bool) -> El {
         compact,
         "State",
         match &s.link {
-            crate::state::Link::Connecting => widgets::pill(k, "Connecting", k.c.text_muted),
-            crate::state::Link::Ok => widgets::pill(k, "Connected", theme::status(k).success),
-            crate::state::Link::Down { failures, .. } => {
-                widgets::pill(k, format!("Offline ({failures})"), theme::status(k).failure)
+            crate::state::Link::Connecting => {
+                widgets::pill_with_icon(k, &icons::PLUG, "Connecting", k.c.text_muted)
             }
+            crate::state::Link::Ok => {
+                widgets::pill_with_icon(k, &icons::WIFI, "Connected", theme::status(k).success)
+            }
+            crate::state::Link::Down { failures, .. } => widgets::pill_with_icon(
+                k,
+                &icons::WIFI_OFF,
+                format!("Offline ({failures})"),
+                theme::status(k).failure,
+            ),
             crate::state::Link::Unauthorized => {
-                widgets::pill(k, "Unauthorized", theme::status(k).error)
+                widgets::pill_with_icon(k, &icons::LOCK, "Unauthorized", theme::status(k).error)
             }
         },
     ));
@@ -2118,13 +2202,19 @@ fn text_input_bound(
     key: &str,
     label: &str,
     edit: &TextEdit,
+    leading: Option<&'static Icon>,
     access: fn(&mut State) -> &mut TextEdit,
 ) -> El {
-    let input = TextInput::new(edit)
+    let mut input = TextInput::new(edit)
         .label(label)
         .placeholder(label)
-        .width(None)
+        .width(None);
+    if let Some(ic) = leading {
+        input = input.leading_icon(ic).leading_icon_size(14.0);
+    }
+    let input = input
         .on_edit(access)
+        .on_submit(|s: &mut State, tx: &mut Tx| s.reconnect(tx))
         .build(k);
     Field::new()
         .label(label)
@@ -2158,9 +2248,17 @@ fn appearance_page(s: &State, k: &Kit, cx: &Cx<State>, compact: bool) -> El {
         Some("Window theme and interface scale. Saved locally for this window or browser."),
     ));
 
-    let theme_options: Vec<(String, String)> = theme::ThemeMode::ALL
+    let theme_options: Vec<(String, String, Option<&'static Icon>)> = theme::ThemeMode::ALL
         .iter()
-        .map(|m| (m.as_str().to_string(), m.label().to_string()))
+        .map(|m| {
+            let ic = match m {
+                theme::ThemeMode::System => &icons::MONITOR,
+                theme::ThemeMode::Light => &icons::SUN,
+                theme::ThemeMode::Dark => &icons::MOON,
+                theme::ThemeMode::Oled => &icons::SPARKLE,
+            };
+            (m.as_str().to_string(), m.label().to_string(), Some(ic))
+        })
         .collect();
     c = c.child(widgets::labelled(
         k,
@@ -2179,7 +2277,7 @@ fn appearance_page(s: &State, k: &Kit, cx: &Cx<State>, compact: bool) -> El {
                 "Pure #000000 black surfaces defined by crisp neutral borders."
             }
         }),
-        widgets::choice_row_for(
+        widgets::choice_row_for_icons(
             k,
             compact,
             &theme_options,
@@ -2244,6 +2342,7 @@ fn appearance_page(s: &State, k: &Kit, cx: &Cx<State>, compact: bool) -> El {
             .flex_wrap()
             .child(
                 Button::new("Reset to default")
+                    .icon(&icons::UNDO)
                     .variant(ButtonVariant::Outline)
                     .control_size(ControlSize::Regular)
                     .disabled(s.user_zoom.is_none())
@@ -2321,6 +2420,7 @@ fn desktop_updates_section(s: &State, k: &Kit, compact: bool) -> El {
     } else {
         "Check now"
     })
+    .icon(&icons::REFRESH_CW)
     .variant(ButtonVariant::Outline)
     .control_size(ControlSize::Small)
     .disabled(busy)
@@ -2340,6 +2440,7 @@ fn desktop_updates_section(s: &State, k: &Kit, compact: bool) -> El {
             if info.asset_url.is_some() {
                 actions = actions.child(
                     Button::new("Install update")
+                        .icon(&icons::DOWNLOAD)
                         .variant(ButtonVariant::Submit)
                         .control_size(ControlSize::Small)
                         .on_press_tx(|s: &mut State, tx: &mut Tx| s.install_update(tx))
@@ -2351,6 +2452,7 @@ fn desktop_updates_section(s: &State, k: &Kit, compact: bool) -> El {
                 let url = info.html_url.clone();
                 actions = actions.child(
                     Button::new("View on GitHub")
+                        .icon(&icons::EXTERNAL_LINK)
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .on_press_tx(move |_: &mut State, tx: &mut Tx| {
@@ -2364,6 +2466,7 @@ fn desktop_updates_section(s: &State, k: &Kit, compact: bool) -> El {
         UpdateStatus::ReadyToRestart(info) => {
             actions = actions.child(
                 Button::new("Restart to apply")
+                    .icon(&icons::ROTATE_CW)
                     .variant(ButtonVariant::Submit)
                     .control_size(ControlSize::Small)
                     .on_press_tx(|s: &mut State, tx: &mut Tx| s.restart_for_update(tx))
@@ -2374,6 +2477,7 @@ fn desktop_updates_section(s: &State, k: &Kit, compact: bool) -> El {
                 let url = info.html_url.clone();
                 actions = actions.child(
                     Button::new("View on GitHub")
+                        .icon(&icons::EXTERNAL_LINK)
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .on_press_tx(move |_: &mut State, tx: &mut Tx| {

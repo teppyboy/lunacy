@@ -1,12 +1,13 @@
 //! The projects list: one row per watched repository, newest state at a glance.
 
-use rune::{col, el, row, text, Cx, El, ScrollSpec, Tx};
+use rune::{col, el, icon, row, text, Cx, El, ScrollSpec, Tx};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
+use crate::icons;
 use crate::model::{Project, ProjectState, Run};
 use crate::state::State;
 use crate::theme;
-use crate::widgets::{self, ago, duration, mono_chip, short_sha};
+use crate::widgets::{self, ago, duration, short_sha};
 
 pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, hair: f32, compact: bool) -> El {
     let mut list = col().w_full().gap(8.0).pb(24.0);
@@ -80,6 +81,7 @@ fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
         .min_h(if compact { 44.0 } else { 0.0 })
         .key("projects-force");
     let settings_btn = Button::new("Settings")
+        .icon(&icons::SETTINGS)
         .variant(ButtonVariant::Outline)
         .control_size(ControlSize::Small)
         .on_press_tx(|s: &mut State, tx: &mut Tx| {
@@ -156,7 +158,10 @@ fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
 fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
     let state = project.state();
     let ink = theme::status(k).for_project(state);
-    let run = project.current_run.as_ref().or(project.last_run.as_ref());
+    let active_runs = project.active_run_list();
+    let active_count = project.active_run_count();
+    let at_limit = project.at_concurrency_limit();
+    let run = active_runs.last().copied().or(project.last_run.as_ref());
     let name = project.name.clone();
     let triggering = s.triggering.as_deref() == Some(project.name.as_str());
     let directly = project.github_repo.clone();
@@ -180,9 +185,7 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
             subj.nowrap().truncate().min_w(0.0).grow(1.0)
         };
         let ref_badge = widgets::run_ref_badge(k, run, Some(&project.branch));
-        let deploy_only_pill = run
-            .deploy_only
-            .then(|| widgets::pill(k, "Deploy only", theme::status(k).running));
+        let deploy_only_pill = run.deploy_only.then(|| widgets::deploy_only_pill(k));
         facts = facts
             .child(widgets::run_pill(k, run.status))
             .children(ref_badge)
@@ -193,7 +196,7 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
                     .center_y()
                     .grow(1.0)
                     .min_w(0.0)
-                    .child(mono_chip(k, &short_sha(&run.sha)))
+                    .child(widgets::sha_chip(k, &run.sha))
                     .child(subj),
             );
     } else {
@@ -201,8 +204,10 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
     }
 
     let cancel_btn = (state == ProjectState::Running).then(|| {
-        let current_run_id = project.current_run.as_ref().map(|cur| cur.id.clone());
-        let cancelling = match current_run_id.as_deref() {
+        let single_run_id = (active_count <= 1)
+            .then(|| active_runs.first().map(|cur| cur.id.clone()))
+            .flatten();
+        let cancelling = match single_run_id.as_deref() {
             Some(id) => {
                 s.cancelling.as_deref() == Some(id)
                     || s.cancelling.as_deref() == Some(project.name.as_str())
@@ -215,11 +220,16 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         } else {
             "Cancel"
         })
+        .icon(&icons::SQUARE)
         .variant(ButtonVariant::Danger)
         .control_size(ControlSize::Small)
         .disabled(cancelling)
-        .help("Stop this running pipeline")
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| match &current_run_id {
+        .help(if active_count > 1 {
+            "Stop all active runs for this project"
+        } else {
+            "Stop this running pipeline"
+        })
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| match &single_run_id {
             Some(run_id) => s.cancel_run(run_id, tx),
             None => s.cancel_project(&project_name, tx),
         })
@@ -228,11 +238,16 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
     });
 
     let run_btn = Button::new(if triggering { "Starting…" } else { "Run now" })
+        .icon(&icons::PLAY)
         .variant(ButtonVariant::Outline)
         .control_size(ControlSize::Small)
-        .disabled(triggering || state == ProjectState::Running)
-        .help(if state == ProjectState::Running {
-            "Already running"
+        .disabled(triggering || at_limit)
+        .help(if at_limit {
+            if project.max_concurrent_runs > 1 {
+                "Concurrency limit reached"
+            } else {
+                "Already running"
+            }
         } else {
             "Queue a run for the current upstream commit"
         })
@@ -242,12 +257,18 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
 
     let mut meta_left = row().gap(8.0).flex_wrap().center_y();
     if project.pending_update() {
-        meta_left = meta_left.child(widgets::pill(k, "Update waiting", theme::status(k).running));
+        meta_left = meta_left.child(widgets::pill_with_icon(
+            k,
+            &icons::ARROW_UP_CIRCLE,
+            "Update waiting",
+            theme::status(k).running,
+        ));
     }
     if !project.open_prs.is_empty() {
         let count = project.open_prs.len();
-        meta_left = meta_left.child(widgets::pill(
+        meta_left = meta_left.child(widgets::pill_with_icon(
             k,
+            &icons::GIT_PULL_REQUEST,
             format!("{count} PR{}", if count == 1 { "" } else { "s" }),
             k.c.text_accent,
         ));
@@ -274,6 +295,20 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         .font(k.ty.small)
         .color(k.c.text_faint)
         .min_w(0.0);
+    let branch_chip = row()
+        .gap(4.0)
+        .center_y()
+        .min_w(0.0)
+        .child(
+            icon(&icons::GIT_BRANCH, 12.0)
+                .color(k.c.icon_faint)
+                .a11y_hidden(),
+        )
+        .child(if compact {
+            branch_el.wrap().shrink()
+        } else {
+            branch_el.nowrap().truncate()
+        });
     let mut title_row = row().w_full().gap(10.0).center_y();
     if compact {
         title_row = title_row.flex_wrap();
@@ -285,11 +320,7 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         } else {
             name_el.nowrap().truncate()
         })
-        .child(if compact {
-            branch_el.wrap().shrink()
-        } else {
-            branch_el.nowrap().truncate()
-        })
+        .child(branch_chip)
         .child(el().grow(1.0));
     if !compact {
         title_row = title_row.children(directly.map(|repo| {
@@ -301,9 +332,21 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         }));
     }
     if !project.enabled {
-        title_row = title_row.child(widgets::pill(k, "Paused", k.c.text_faint));
+        title_row = title_row.child(widgets::paused_pill(k));
     }
-    title_row = title_row.child(widgets::project_pill(k, state));
+    if active_count > 1 {
+        title_row = title_row.child(
+            widgets::pill_with_icon(
+                k,
+                &icons::ACTIVITY,
+                format!("{active_count} running"),
+                theme::status(k).running,
+            )
+            .key(format!("project-active-count-{}", project.name)),
+        );
+    } else {
+        title_row = title_row.child(widgets::project_pill(k, state));
+    }
 
     let mut card = col()
         .key(format!("project-{}", project.name))

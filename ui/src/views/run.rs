@@ -7,10 +7,11 @@
 use rune::{col, el, icon, row, text, Cx, El, Icon, ScrollSpec, Spring, Transition, Tx};
 use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, Kit};
 
-use crate::model::{Phase, ProjectState, Run, RunStatus, Step, StepKind, StepStatus, Substep};
+use crate::icons;
+use crate::model::{Phase, Run, RunStatus, Step, StepKind, StepStatus, Substep};
 use crate::state::{LogMode, LogState, State};
 use crate::theme;
-use crate::widgets::{self, ago, duration, mono_chip, short_sha};
+use crate::widgets::{self, ago, duration};
 
 /// Sliced `act` log text associated with each substep, plus any unmatched setup/teardown lines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -366,9 +367,21 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
     let repo = crate::views::repo_for(s, &run.project);
     let default_branch = s.current_project().map(|p| p.branch.as_str());
     let ref_badge = widgets::run_ref_badge(k, run, default_branch);
-    let deploy_only_pill = run
-        .deploy_only
-        .then(|| widgets::pill(k, "Deploy only", theme::status(k).running));
+    let deploy_only_pill = run.deploy_only.then(|| widgets::deploy_only_pill(k));
+    let trigger_pill = widgets::trigger_pill(k, run, "run-trigger");
+    let trigger_reason = run.trigger_display().map(|reason| {
+        let label = if reason.starts_with("Triggered ") {
+            reason
+        } else {
+            format!("Trigger: {reason}")
+        };
+        text(label)
+            .key("run-trigger-reason")
+            .font(k.ty.small)
+            .color(k.c.text_faint)
+            .wrap()
+            .min_w(0.0)
+    });
     let skipped_notice = run
         .deploy_skipped_reason
         .as_deref()
@@ -384,7 +397,7 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
                 .fill(k.c.layer_02)
                 .border(1.0, k.c.border_muted)
                 .center_y()
-                .child(widgets::dot(k.c.text_faint, 6.0))
+                .child(icon(&icons::INFO, 13.0).color(k.c.icon_faint).a11y_hidden())
                 .child(
                     text(reason.to_string())
                         .font(k.ty.small)
@@ -397,6 +410,7 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
 
     let github_btn = github_link(run, repo.as_deref()).map(|link| {
         Button::new("View on GitHub")
+            .icon(&icons::EXTERNAL_LINK)
             .variant(ButtonVariant::Outline)
             .control_size(ControlSize::Small)
             .on_press_tx(move |_: &mut State, tx: &mut Tx| {
@@ -413,6 +427,7 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
         } else {
             "Cancel"
         })
+        .icon(&icons::SQUARE)
         .variant(ButtonVariant::Danger)
         .control_size(ControlSize::Small)
         .disabled(cancelling)
@@ -422,9 +437,17 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
         .key("run-cancel")
     });
     let has_deploy_step = run.steps.iter().any(|st| st.phase == Phase::Deploy);
-    let project_running = s
+    let project_at_limit = s
         .current_project()
-        .is_some_and(|p| p.state() == ProjectState::Running);
+        .is_some_and(crate::model::Project::at_concurrency_limit);
+    let limit_help = if s
+        .current_project()
+        .is_some_and(|p| p.max_concurrent_runs > 1)
+    {
+        "Concurrency limit reached"
+    } else {
+        "Already running"
+    };
     let retry_btn = (!run.status.is_running()).then(|| {
         let retrying_this = s.retrying.as_deref() == Some(run.id.as_str());
         let failed_like = matches!(
@@ -445,11 +468,12 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
         };
         let retry_id = run.id.clone();
         Button::new(label)
+            .icon(&icons::ROTATE_CW)
             .variant(variant)
             .control_size(ControlSize::Small)
-            .disabled(s.retrying.is_some() || project_running)
-            .help(if project_running {
-                "Already running"
+            .disabled(s.retrying.is_some() || project_at_limit)
+            .help(if project_at_limit {
+                limit_help
             } else if failed_like {
                 "Re-run CI for this commit"
             } else {
@@ -468,11 +492,12 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
             } else {
                 "Force deploy"
             })
+            .icon(&icons::ROCKET)
             .variant(ButtonVariant::Outline)
             .control_size(ControlSize::Small)
-            .disabled(deploying || project_running)
-            .help(if project_running {
-                "Already running"
+            .disabled(deploying || project_at_limit)
+            .help(if project_at_limit {
+                limit_help
             } else {
                 "Queue a deploy-only run for this commit"
             })
@@ -481,6 +506,7 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
             .key("run-force-deploy")
         });
     let back_btn = Button::new("Back")
+        .icon(&icons::ARROW_LEFT)
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .on_press_tx(|s: &mut State, tx: &mut Tx| s.back(tx))
@@ -504,7 +530,8 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
             .child(widgets::run_pill(k, run.status))
             .children(ref_badge)
             .children(deploy_only_pill)
-            .child(mono_chip(k, &short_sha(&run.sha)))
+            .children(trigger_pill)
+            .child(widgets::sha_chip(k, &run.sha))
             .child(
                 text(widgets::timestamp(run.started_at))
                     .font(k.ty.small)
@@ -588,6 +615,7 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
                     .color(k.c.text_muted)
                     .wrap()
             }))
+            .children(trigger_reason)
             .children(skipped_notice)
             .child(actions)
             .children(
@@ -604,7 +632,8 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
         .child(widgets::run_pill(k, run.status))
         .children(ref_badge)
         .children(deploy_only_pill)
-        .child(mono_chip(k, &short_sha(&run.sha)))
+        .children(trigger_pill)
+        .child(widgets::sha_chip(k, &run.sha))
         .children((!run.subject.is_empty()).then(|| {
             text(run.subject.clone())
                 .font(k.ty.small)
@@ -696,6 +725,7 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
                 })),
         )
         .child(meta)
+        .children(trigger_reason)
         .children(skipped_notice)
         .children(
             (run.status == RunStatus::Running)
@@ -737,13 +767,17 @@ fn steps_pane(
     for (index, step) in run.steps.iter().enumerate() {
         if phase != Some(step.phase) {
             phase = Some(step.phase);
+            let phase_icon = match step.phase {
+                Phase::Ci => &icons::TERMINAL,
+                Phase::Deploy => &icons::ROCKET,
+            };
             list = list.child(
                 row()
                     .w_full()
                     .px(14.0)
                     .pt(12.0)
                     .pb(4.0)
-                    .child(widgets::caption(k, step.phase.label())),
+                    .child(widgets::caption_icon(k, phase_icon, step.phase.label())),
             );
         }
         list = list.child(step_row(s, k, run, step, index, host.as_deref(), compact));
@@ -843,7 +877,14 @@ fn step_row(
         label_col = label_col.child(text(format!("exit {code}")).font(k.ty.small).color(ink));
     }
 
-    let mut right = row().gap(4.0).center_y();
+    let kind_icon = match step.kind {
+        StepKind::Act => &icons::BOX,
+        StepKind::Shell | StepKind::Other => &icons::TERMINAL,
+    };
+    let mut right = row()
+        .gap(4.0)
+        .center_y()
+        .child(icon(kind_icon, 12.0).color(k.c.icon_faint).a11y_hidden());
     if has_substeps {
         right = right.child(
             text(format!("{}", step.substeps.len()))
@@ -940,10 +981,11 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f
     let show_steps = has_substeps && !s.log_view_raw;
 
     let mode = state.and_then(|e| e.mode).unwrap_or(LogMode::Tail);
-    let mode_ctrl = widgets::segmented(
+    let mode_ctrl = widgets::segmented_with_icons(
         k,
         compact,
         &["Tail", "Full"],
+        &[Some(&icons::ARROW_DOWN), Some(&icons::ALIGN_LEFT)],
         Some(if matches!(mode, LogMode::Tail) { 0 } else { 1 }),
         {
             let run_id = run.id.clone();
@@ -966,15 +1008,16 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f
     .key("run-log-mode");
 
     let view_ctrl = has_substeps.then(|| {
-        widgets::segmented(
+        widgets::segmented_with_icons(
             k,
             compact,
             &["Steps", "Raw"],
+            &[Some(&icons::LIST_CHECKS), Some(&icons::TERMINAL)],
             Some(if s.log_view_raw { 1 } else { 0 }),
             |s: &mut State, picked: usize, tx: &mut Tx| {
                 let want_raw = picked == 1;
                 if s.log_view_raw != want_raw {
-                    s.log_view_raw = want_raw;
+                    s.set_log_view_raw(want_raw, tx);
                     if want_raw {
                         s.stick_log_pending = true;
                         tx.scroll_to_bottom_instant("run-log-scroll");
@@ -988,7 +1031,12 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f
     });
 
     let wrap_on = s.log_wrap;
-    let wrap_btn = el()
+    let wrap_ink = if wrap_on {
+        k.c.text_accent
+    } else {
+        k.c.text_muted
+    };
+    let wrap_btn = row()
         .key("run-log-wrap")
         .role("button")
         .label("Wrap")
@@ -997,6 +1045,7 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f
         .h(if compact { 44.0 } else { 26.0 })
         .min_w(if compact { 44.0 } else { 0.0 })
         .px(if compact { 14.0 } else { 10.0 })
+        .gap(5.0)
         .center()
         .radius(k.radius.md)
         .fill(if wrap_on {
@@ -1016,16 +1065,49 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f
         .press_scale(0.98)
         .cursor(rune::Cursor::Pointer)
         .on_press_tx(|s: &mut State, tx: &mut Tx| s.toggle_log_wrap(tx))
+        .child(icon(&icons::WRAP_TEXT, 13.0).color(wrap_ink).a11y_hidden())
         .child(
             text("Wrap")
                 .font(k.ty.small_medium)
-                .color(if wrap_on {
-                    k.c.text_accent
-                } else {
-                    k.c.text_muted
-                })
+                .color(wrap_ink)
                 .nowrap(),
         );
+
+    let log_copy_text = state.map(|e| e.text.clone()).unwrap_or_default();
+    let copy_btn = widgets::compact_icon(
+        rune_kit::IconButton::new(&glyphs::COPY)
+            .label("Copy log")
+            .help("Copy step log to clipboard")
+            .control_size(ControlSize::Small)
+            .disabled(log_copy_text.is_empty())
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                tx.copy(log_copy_text.clone());
+                s.toast(
+                    tx,
+                    crate::state::ToastKind::Success,
+                    "Copied",
+                    "Step log copied to clipboard.",
+                );
+            })
+            .build(k)
+            .key("run-log-copy"),
+        compact,
+    );
+
+    let bottom_btn = (!show_steps).then(|| {
+        widgets::compact_icon(
+            rune_kit::IconButton::new(&icons::ARROW_DOWN)
+                .label("Scroll to bottom")
+                .help("Scroll log to bottom")
+                .control_size(ControlSize::Small)
+                .on_press_tx(|_: &mut State, tx: &mut Tx| {
+                    tx.scroll_to_bottom("run-log-scroll");
+                })
+                .build(k)
+                .key("run-log-bottom"),
+            compact,
+        )
+    });
 
     let step_title = text(step.name.clone())
         .font(k.ty.small_medium)
@@ -1059,28 +1141,46 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f
     let narrow_head = compact || layout_w < 1000.0;
     let mut controls = row().gap(6.0).center_y();
     if narrow_head {
-        controls = controls.flex_wrap();
+        controls = controls.w_full().min_w(0.0).flex_wrap();
     }
     if let Some(vc) = view_ctrl {
         controls = controls.child(vc);
     }
-    controls = controls.child(wrap_btn).child(mode_ctrl);
-
-    let mut head = row()
-        .w_full()
-        .px(if compact { 14.0 } else { 16.0 })
-        .py(9.0)
-        .gap(10.0)
-        .center_y()
-        .fill(k.c.layer_02)
-        .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong);
-    if narrow_head {
-        head = head.flex_wrap();
+    controls = controls.child(wrap_btn).child(mode_ctrl).child(copy_btn);
+    if let Some(btn) = bottom_btn {
+        controls = controls.child(btn);
     }
-    head = head
-        .child(widgets::status_glyph(k, step.status, host.as_deref()))
-        .child(title_block)
-        .child(controls);
+
+    let head = if narrow_head {
+        col()
+            .w_full()
+            .px(if compact { 14.0 } else { 16.0 })
+            .py(9.0)
+            .gap(8.0)
+            .fill(k.c.layer_02)
+            .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
+            .child(
+                row()
+                    .w_full()
+                    .gap(10.0)
+                    .center_y()
+                    .child(widgets::status_glyph(k, step.status, host.as_deref()))
+                    .child(title_block),
+            )
+            .child(controls)
+    } else {
+        row()
+            .w_full()
+            .px(16.0)
+            .py(9.0)
+            .gap(10.0)
+            .center_y()
+            .fill(k.c.layer_02)
+            .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
+            .child(widgets::status_glyph(k, step.status, host.as_deref()))
+            .child(title_block)
+            .child(controls)
+    };
 
     let log_scroll = if show_steps {
         let accordion = substeps_accordion(s, k, run, index, step, state, host.as_deref(), compact);
@@ -1178,6 +1278,7 @@ fn substeps_accordion(
     } else {
         "Expand all"
     })
+    .icon(&icons::CHEVRONS_UP_DOWN)
     .variant(ButtonVariant::Ghost)
     .control_size(ControlSize::Small)
     .on_press_tx({

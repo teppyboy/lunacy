@@ -7,6 +7,7 @@ use rune::{
 };
 use rune_kit::{glyphs, Kit};
 
+use crate::icons;
 use crate::model::ProjectState;
 use crate::state::{Link, SettingsPage, State, ToastKind, View};
 use crate::theme;
@@ -200,7 +201,9 @@ fn is_cmd_key(ev: &KeyEvent, ch: char) -> bool {
     let mut buf = [0u8; 4];
     let target = ch.encode_utf8(&mut buf);
     ev.is_command(ch)
-        || ((ev.mods.cmd || ev.mods.ctrl) && matches!(&ev.key, Key::Text(t) if t == target))
+        || ((ev.mods.cmd || ev.mods.ctrl)
+            && !ev.mods.alt
+            && matches!(&ev.key, Key::Text(t) if t.eq_ignore_ascii_case(target)))
 }
 
 /// Global keys the focused control didn't take.
@@ -226,25 +229,33 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.toggle_log_wrap(tx);
         return true;
     }
-    match ev.key {
-        // Ctrl/Cmd+S saves the config, wherever the form is scrolled to.
-        Key::Command('s') => {
-            if matches!(s.view, View::Settings { .. }) && s.editor.loaded {
-                s.save();
-                return true;
+    // Ctrl/Cmd+S saves Connection settings on Connection page, or daemon config on config pages.
+    if is_cmd_key(ev, 's') {
+        return match s.view {
+            View::Settings {
+                page: SettingsPage::Connection,
+            } => {
+                s.reconnect(tx);
+                true
             }
-            false
-        }
-        // Cmd/Ctrl+R re-reads everything.
-        Key::Command('r') => {
-            s.reconnect(tx);
-            true
-        }
-        // Cmd/Ctrl+, opens Settings.
-        Key::Command(',') => {
-            s.open_settings(SettingsPage::General, tx);
-            true
-        }
+            View::Settings { page } if !page.is_local() && s.editor.loaded => {
+                s.save();
+                true
+            }
+            _ => false,
+        };
+    }
+    // Cmd/Ctrl+R re-reads everything using the active connection without clobbering saved prefs.
+    if is_cmd_key(ev, 'r') {
+        s.refresh_connection(tx);
+        return true;
+    }
+    // Cmd/Ctrl+, opens Settings.
+    if is_cmd_key(ev, ',') {
+        s.open_settings(SettingsPage::General, tx);
+        return true;
+    }
+    match ev.key {
         Key::Escape => {
             if s.drawer_open {
                 s.drawer_open = false;
@@ -434,7 +445,7 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
             .center_y()
             .child(connection_chip(s, k, compact))
             .child(widgets::compact_icon(
-                rune_kit::IconButton::new(&glyphs::DASH)
+                rune_kit::IconButton::new(&icons::SETTINGS)
                     .label("Settings")
                     .help("Settings (⌘,)")
                     .on_press_tx(|s: &mut State, tx: &mut Tx| {
@@ -452,20 +463,32 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
     .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
 }
 
-/// The connection chip: dot and label on desktop; compact 44×44 dot pill on phones.
+/// The connection chip: icon and label on desktop; compact 44×44 status pill on phones.
 fn connection_chip(s: &State, k: &Kit, compact: bool) -> El {
     let connecting = matches!(s.link, Link::Connecting);
-    let (ink, label) = match &s.link {
-        Link::Connecting => (k.c.text_muted, "Connecting".to_string()),
-        Link::Ok => (theme::status(k).success, "Connected".to_string()),
-        Link::Down { .. } => (theme::status(k).failure, "Offline".to_string()),
-        Link::Unauthorized => (theme::status(k).error, "Unauthorized".to_string()),
+    let (ink, label, status_icon) = match &s.link {
+        Link::Connecting => (k.c.text_muted, "Connecting".to_string(), &icons::PLUG),
+        Link::Ok => (
+            theme::status(k).success,
+            "Connected".to_string(),
+            &icons::WIFI,
+        ),
+        Link::Down { .. } => (
+            theme::status(k).failure,
+            "Offline".to_string(),
+            &icons::WIFI_OFF,
+        ),
+        Link::Unauthorized => (
+            theme::status(k).error,
+            "Unauthorized".to_string(),
+            &icons::LOCK,
+        ),
     };
-    let indicator = |size| {
+    let indicator = |size: f32| {
         if connecting {
-            widgets::live_dot(ink, size)
+            widgets::live_dot(ink, size * 0.6)
         } else {
-            widgets::dot(ink, size)
+            icon(status_icon, size).color(ink).a11y_hidden()
         }
     };
     if compact {
@@ -483,12 +506,13 @@ fn connection_chip(s: &State, k: &Kit, compact: bool) -> El {
                     .center()
                     .radius(k.radius.md)
                     .fill(k.c.layer_02)
-                    .child(indicator(8.0)),
+                    .child(indicator(14.0)),
             )
             .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_settings(SettingsPage::Connection, tx))
             .cursor(rune::Cursor::Pointer);
     }
-    el().key("connection")
+    row()
+        .key("connection")
         .role("status")
         .label(label.clone())
         .h(24.0)
@@ -497,37 +521,41 @@ fn connection_chip(s: &State, k: &Kit, compact: bool) -> El {
         .center_y()
         .radius(k.radius.md)
         .fill(k.c.layer_02)
-        .child(indicator(7.0))
-        .child(text(label).font(k.ty.small).color(ink))
+        .child(indicator(13.0))
+        .child(text(label).font(k.ty.small).color(ink).nowrap())
         .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_settings(SettingsPage::Connection, tx))
         .cursor(rune::Cursor::Pointer)
 }
 
 /// The banner under the titlebar: only shown when the daemon is not answering.
 fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
-    let (ink, title, body) = match &s.link {
+    let (ink, banner_icon, title, body) = match &s.link {
         Link::Ok | Link::Connecting => return None,
         Link::Down { why, failures } => (
             theme::status(k).failure,
+            &icons::WIFI_OFF,
             "Daemon unreachable".to_string(),
             format!("{why}. Retrying every 2 s ({failures})."),
         ),
         Link::Unauthorized => (
             theme::status(k).error,
+            &icons::LOCK,
             "Unauthorized".to_string(),
             "The token was rejected. Open Connection and check it.".to_string(),
         ),
     };
     let conn_btn = rune_kit::Button::new("Connection")
+        .icon(&icons::PLUG)
         .variant(rune_kit::ButtonVariant::Ghost)
         .control_size(rune_kit::ControlSize::Small)
         .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_settings(SettingsPage::Connection, tx))
         .build(k)
         .key("banner-connection");
     let retry_btn = rune_kit::Button::new("Retry")
+        .icon(&icons::REFRESH_CW)
         .variant(rune_kit::ButtonVariant::Outline)
         .control_size(rune_kit::ControlSize::Small)
-        .on_press_tx(|s: &mut State, tx: &mut Tx| s.reconnect(tx))
+        .on_press_tx(|s: &mut State, tx: &mut Tx| s.refresh_connection(tx))
         .build(k)
         .key("banner-retry");
 
@@ -553,7 +581,7 @@ fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
                         .w_full()
                         .gap(8.0)
                         .items_start()
-                        .child(widgets::dot(ink, 8.0).mt(5.0))
+                        .child(icon(banner_icon, 15.0).color(ink).mt(2.0).a11y_hidden())
                         .child(
                             col()
                                 .grow(1.0)
@@ -592,7 +620,7 @@ fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
             .border_sides([0.0, 0.0, hair, 0.0], ink.alpha(0.35))
             .transition(banner_enter)
             .transition_motion(rune::tok::motion::SNAP, Spring::NONE)
-            .child(widgets::dot(ink, 8.0))
+            .child(icon(banner_icon, 15.0).color(ink).a11y_hidden())
             .child(text(title).font(k.ty.small_medium).color(ink).nowrap())
             .child(
                 text(body)
@@ -622,10 +650,11 @@ fn update_banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
     if s.update_dismissed {
         return None;
     }
-    let (ink, message, primary_btn, view_url) = match &s.update_status {
+    let (ink, banner_icon, message, primary_btn, view_url) = match &s.update_status {
         UpdateStatus::Available(info) => {
             let primary = info.asset_url.is_some().then(|| {
                 rune_kit::Button::new("Update")
+                    .icon(&icons::DOWNLOAD)
                     .variant(rune_kit::ButtonVariant::Outline)
                     .control_size(rune_kit::ControlSize::Small)
                     .on_press_tx(|s: &mut State, tx: &mut Tx| s.install_update(tx))
@@ -634,6 +663,7 @@ fn update_banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
             });
             (
                 theme::status(k).running,
+                &icons::ARROW_UP_CIRCLE,
                 format!("Update available ({})", info.short_sha),
                 primary,
                 (!info.html_url.is_empty()).then(|| info.html_url.clone()),
@@ -642,6 +672,7 @@ fn update_banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
         UpdateStatus::ReadyToRestart(info) => {
             let primary = Some(
                 rune_kit::Button::new("Restart to apply")
+                    .icon(&icons::ROTATE_CW)
                     .variant(rune_kit::ButtonVariant::Submit)
                     .control_size(rune_kit::ControlSize::Small)
                     .on_press_tx(|s: &mut State, tx: &mut Tx| s.restart_for_update(tx))
@@ -650,6 +681,7 @@ fn update_banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
             );
             (
                 theme::status(k).success,
+                &icons::ARROW_UP_CIRCLE,
                 format!("Update {} ready to apply", info.short_sha),
                 primary,
                 (!info.html_url.is_empty()).then(|| info.html_url.clone()),
@@ -660,6 +692,7 @@ fn update_banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
 
     let view_btn = view_url.map(|url| {
         rune_kit::Button::new("View")
+            .icon(&icons::EXTERNAL_LINK)
             .variant(rune_kit::ButtonVariant::Ghost)
             .control_size(rune_kit::ControlSize::Small)
             .on_press_tx(move |_: &mut State, tx: &mut Tx| {
@@ -705,7 +738,7 @@ fn update_banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
                         .w_full()
                         .gap(8.0)
                         .center_y()
-                        .child(widgets::dot(ink, 8.0))
+                        .child(icon(banner_icon, 15.0).color(ink).a11y_hidden())
                         .child(
                             text(message)
                                 .font(k.ty.small_medium)
@@ -730,7 +763,7 @@ fn update_banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
         .border_sides([0.0, 0.0, hair, 0.0], ink.alpha(0.35))
         .transition(banner_enter)
         .transition_motion(rune::tok::motion::SNAP, Spring::NONE)
-        .child(widgets::dot(ink, 8.0))
+        .child(icon(banner_icon, 15.0).color(ink).a11y_hidden())
         .child(
             text(message)
                 .font(k.ty.small_medium)
@@ -763,6 +796,7 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool, layout_w: f32) -> El {
     let mut list = col().w_full().gap(1.0).pt(8.0).pb(8.0);
     list = list.child(nav_row(
         k,
+        &icons::LAYERS,
         "Projects",
         s.view == View::Projects || matches!(s.view, View::Project { .. }),
         row_h,
@@ -770,6 +804,7 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool, layout_w: f32) -> El {
     ));
     list = list.child(nav_row(
         k,
+        &icons::SETTINGS,
         "Settings",
         matches!(s.view, View::Settings { .. }),
         row_h,
@@ -865,14 +900,20 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool, layout_w: f32) -> El {
                 .child(list),
             k,
         ))
-        .child(
+        .child({
+            let (conn_icon, conn_ink) = match &s.link {
+                Link::Ok => (&icons::WIFI, theme::status(k).success),
+                Link::Down { .. } => (&icons::WIFI_OFF, theme::status(k).failure),
+                Link::Unauthorized => (&icons::LOCK, theme::status(k).error),
+                Link::Connecting => (&icons::PLUG, k.c.icon_faint),
+            };
             col()
                 .key("rail-footer")
                 .w_full()
                 .min_w(0.0)
                 .px(14.0)
                 .py(10.0)
-                .gap(2.0)
+                .gap(3.0)
                 .border_sides([theme::SECTION_BORDER, 0.0, 0.0, 0.0], k.c.border_strong)
                 .child(
                     text(version_line)
@@ -882,13 +923,23 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool, layout_w: f32) -> El {
                         .wrap_anywhere(),
                 )
                 .child(
-                    text(s.server_display())
-                        .key("rail-server")
-                        .font(k.ty.small)
-                        .color(k.c.text_faint)
-                        .wrap_anywhere(),
-                ),
-        )
+                    row()
+                        .w_full()
+                        .min_w(0.0)
+                        .gap(6.0)
+                        .items_start()
+                        .child(icon(conn_icon, 12.0).color(conn_ink).mt(2.0).a11y_hidden())
+                        .child(
+                            text(s.server_display())
+                                .key("rail-server")
+                                .font(k.ty.small)
+                                .color(k.c.text_faint)
+                                .wrap_anywhere()
+                                .min_w(0.0)
+                                .grow(1.0),
+                        ),
+                )
+        })
 }
 
 fn drawer_overlays(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4]) -> [El; 2] {
@@ -953,13 +1004,26 @@ fn drawer_overlays(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4])
     [scrim, drawer]
 }
 
-fn nav_row(k: &Kit, label: &str, selected: bool, h: f32, press: fn(&mut State, &mut Tx)) -> El {
+fn nav_row(
+    k: &Kit,
+    ic: &'static rune::Icon,
+    label: &str,
+    selected: bool,
+    h: f32,
+    press: fn(&mut State, &mut Tx),
+) -> El {
+    let ink = if selected {
+        k.c.text_base
+    } else {
+        k.c.text_muted
+    };
     row()
         .key(format!("nav-{label}"))
         .w_full()
         .h(h)
         .pl(14.0)
         .pr(18.0)
+        .gap(9.0)
         .center_y()
         .fill(if selected {
             k.c.layer_03
@@ -968,11 +1032,8 @@ fn nav_row(k: &Kit, label: &str, selected: bool, h: f32, press: fn(&mut State, &
         })
         .hover(k.c.hover)
         .press_scale(0.985)
-        .child(text(label).font(k.ty.ui).color(if selected {
-            k.c.text_base
-        } else {
-            k.c.text_muted
-        }))
+        .child(icon(ic, 15.0).color(ink).a11y_hidden())
+        .child(text(label).font(k.ty.ui).color(ink))
         .on_press_tx(press)
         .cursor(rune::Cursor::Pointer)
 }
@@ -1008,10 +1069,10 @@ fn toast_layer(s: &State, k: &Kit, compact: bool, layout_w: f32, safe: [f32; 4])
         .items_end()
         .animate_layout();
     for toast in &s.toasts {
-        let (_ink, glyph) = match toast.kind {
-            ToastKind::Info => (k.c.text_accent, k.c.text_accent),
-            ToastKind::Success => (theme::status(k).success, theme::status(k).success),
-            ToastKind::Error => (theme::status(k).failure, theme::status(k).failure),
+        let (toast_icon, glyph) = match toast.kind {
+            ToastKind::Info => (&icons::INFO, k.c.text_accent),
+            ToastKind::Success => (&icons::CHECK_CIRCLE, theme::status(k).success),
+            ToastKind::Error => (&icons::ALERT_CIRCLE, theme::status(k).failure),
         };
         let id = toast.id;
         let close_btn = el()
@@ -1047,7 +1108,7 @@ fn toast_layer(s: &State, k: &Kit, compact: bool, layout_w: f32, safe: [f32; 4])
                 .transition(toast_transition)
                 .transition_motion(rune::tok::motion::POP, Spring::new(0.15, 0.0))
                 .on_press(|_: &mut State| {})
-                .child(widgets::dot(glyph, 8.0).mt(5.0))
+                .child(icon(toast_icon, 15.0).color(glyph).mt(1.0).a11y_hidden())
                 .child(
                     col()
                         .grow(1.0)
@@ -1921,6 +1982,7 @@ mod tests {
                 for p in &mut s.projects {
                     p.running = false;
                     p.current_run = None;
+                    p.active_runs.clear();
                 }
             },
             390.0,
@@ -2415,6 +2477,7 @@ mod tests {
         for p in &mut rt_run.state.projects {
             p.running = false;
             p.current_run = None;
+            p.active_runs.clear();
         }
         rt_run.frame(0.016);
         rt_run.settle_all();
@@ -2457,6 +2520,7 @@ mod tests {
                 if let Some(p) = s.projects.iter_mut().find(|p| p.name == "lunarum") {
                     p.running = true;
                     p.current_run = None;
+                    p.active_runs.clear();
                 }
             },
             1180.0,
@@ -3420,6 +3484,7 @@ mod tests {
                 if let Some(p) = s.projects.iter_mut().find(|p| p.name == failed_proj) {
                     p.running = false;
                     p.current_run = None;
+                    p.active_runs.clear();
                 }
             },
             1180.0,
@@ -3469,6 +3534,7 @@ mod tests {
                 if let Some(p) = s.projects.iter_mut().find(|p| p.name == cancelled_proj) {
                     p.running = false;
                     p.current_run = None;
+                    p.active_runs.clear();
                 }
             },
             1180.0,
@@ -3533,6 +3599,7 @@ mod tests {
                 if let Some(p) = s.projects.iter_mut().find(|p| p.name == failed_proj_row) {
                     p.running = false;
                     p.current_run = None;
+                    p.active_runs.clear();
                 }
             },
             1180.0,
@@ -3617,5 +3684,790 @@ mod tests {
                 "rune::set_app_icon should accept {label}"
             );
         }
+    }
+
+    #[test]
+    fn shortcuts_save_connection_or_config_and_refresh_without_clobbering_prefs() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunacy-ui-app-shortcuts-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let prefs_path = dir.join("prefs.json");
+
+        let ctrl_text = |t: &str| KeyEvent {
+            key: Key::Text(t.into()),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+        };
+        let cmd_key = |c: char| KeyEvent {
+            key: Key::Command(c),
+            mods: Mods::default(),
+        };
+
+        // 1) Ctrl+S (Key::Text("s") + ctrl) on SettingsPage::Connection saves and reconnects.
+        let mut s = State::new(Conn::default());
+        s.prefs_path = Some(prefs_path.clone());
+        s.view = View::Settings {
+            page: SettingsPage::Connection,
+        };
+        s.ui_server = rune::TextEdit::new("http://127.0.0.1:19991/");
+        s.ui_token = rune::TextEdit::new("  tok-ctrl-s\n");
+        let mut tx = rune::Tx::default();
+
+        assert!(on_key(&mut s, &ctrl_text("s"), &mut tx));
+        assert_eq!(s.conn.server, "http://127.0.0.1:19991");
+        assert_eq!(s.conn.token, "tok-ctrl-s");
+        assert_eq!(s.live, s.conn);
+        assert_eq!(s.link, Link::Connecting);
+        let saved = rune::prefs::Prefs::at(&prefs_path);
+        assert_eq!(
+            crate::state::load_connection_from(&saved),
+            (
+                Some("http://127.0.0.1:19991".into()),
+                Some("tok-ctrl-s".into())
+            )
+        );
+        s.bus.cancel();
+        s.ws.disconnect();
+
+        // 2) Key::Command('s') on SettingsPage::Connection also saves and reconnects.
+        s.ui_server = rune::TextEdit::new("http://127.0.0.1:19992");
+        s.ui_token = rune::TextEdit::new("tok-cmd-s");
+        assert!(on_key(&mut s, &cmd_key('s'), &mut tx));
+        assert_eq!(s.conn.server, "http://127.0.0.1:19992");
+        assert_eq!(s.conn.token, "tok-cmd-s");
+        let saved2 = rune::prefs::Prefs::at(&prefs_path);
+        assert_eq!(
+            crate::state::load_connection_from(&saved2),
+            (
+                Some("http://127.0.0.1:19992".into()),
+                Some("tok-cmd-s".into())
+            )
+        );
+        s.bus.cancel();
+        s.ws.disconnect();
+
+        // 3) Ctrl+R refreshes using active connection WITHOUT clobbering saved prefs
+        //    and without adopting unsubmitted ui_server/ui_token edits.
+        s.conn = Conn {
+            server: "http://127.0.0.1:19999".into(),
+            token: "ephemeral-cli-token".into(),
+        };
+        s.live = s.conn.clone();
+        s.ui_server = rune::TextEdit::new("http://127.0.0.1:18888");
+        s.ui_token = rune::TextEdit::new("unsubmitted-token");
+        s.link = Link::Ok;
+        assert!(on_key(&mut s, &ctrl_text("r"), &mut tx));
+        assert_eq!(s.link, Link::Connecting);
+        assert_eq!(s.live.server, "http://127.0.0.1:19999");
+        assert_eq!(s.live.token, "ephemeral-cli-token");
+        let after_refresh = rune::prefs::Prefs::at(&prefs_path);
+        assert_eq!(
+            crate::state::load_connection_from(&after_refresh),
+            (
+                Some("http://127.0.0.1:19992".into()),
+                Some("tok-cmd-s".into())
+            ),
+            "Ctrl+R must not overwrite saved connection preferences"
+        );
+        s.bus.cancel();
+        s.ws.disconnect();
+
+        // 4) Ctrl+S and Key::Command('s') on daemon config pages trigger State::save().
+        let mut cfg_state = State::new(Conn::default());
+        crate::demo::load(
+            &mut cfg_state,
+            View::Settings {
+                page: SettingsPage::General,
+            },
+        );
+        assert!(cfg_state.editor.loaded);
+        assert!(!cfg_state.editor.saving);
+        assert!(on_key(&mut cfg_state, &ctrl_text("s"), &mut tx));
+        assert!(cfg_state.editor.saving);
+
+        cfg_state.editor.saving = false;
+        cfg_state.view = View::Settings {
+            page: SettingsPage::Server,
+        };
+        assert!(on_key(&mut cfg_state, &cmd_key('s'), &mut tx));
+        assert!(cfg_state.editor.saving);
+
+        // Local non-Connection settings pages (e.g. Appearance) do not trigger daemon save.
+        cfg_state.editor.saving = false;
+        cfg_state.view = View::Settings {
+            page: SettingsPage::Appearance,
+        };
+        assert!(!on_key(&mut cfg_state, &ctrl_text("s"), &mut tx));
+        assert!(!cfg_state.editor.saving);
+
+        // 5) Ctrl+, opens Settings::General.
+        cfg_state.view = View::Projects;
+        assert!(on_key(&mut cfg_state, &ctrl_text(","), &mut tx));
+        assert_eq!(
+            cfg_state.view,
+            View::Settings {
+                page: SettingsPage::General
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connection_inputs_submit_on_enter_saves_and_reconnects() {
+        let dir =
+            std::env::temp_dir().join(format!("lunacy-ui-conn-submit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let prefs_path = dir.join("prefs.json");
+        let prefs_path_setup = prefs_path.clone();
+
+        let mut rt = setup_runtime(
+            move |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Connection,
+                    },
+                );
+                s.prefs_path = Some(prefs_path_setup);
+                s.ui_server = rune::TextEdit::new("http://127.0.0.1:19995");
+                s.ui_token = rune::TextEdit::new("enter-token");
+            },
+            1180.0,
+            760.0,
+        );
+
+        let (tx_x, tx_y) = rt.find("conn-token/control").expect("conn-token control");
+        rt.pointer_down(tx_x, tx_y);
+        rt.pointer_up(tx_x, tx_y);
+        rt.frame(0.016);
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        for _ in 0..3 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+
+        assert_eq!(rt.state.conn.server, "http://127.0.0.1:19995");
+        assert_eq!(rt.state.conn.token, "enter-token");
+        let saved = rune::prefs::Prefs::at(&prefs_path);
+        assert_eq!(
+            crate::state::load_connection_from(&saved),
+            (
+                Some("http://127.0.0.1:19995".into()),
+                Some("enter-token".into())
+            )
+        );
+        rt.state.bus.cancel();
+        rt.state.ws.disconnect();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trigger_source_and_reason_render_in_project_and_run_views() {
+        let text_of = |rt: &Runtime<State>, key: &str| -> Option<String> {
+            let els = rt.elements();
+            let idx = els
+                .iter()
+                .position(|e| e.key.as_deref() == Some(key) && !e.exiting)?;
+            if let Some(t) = &els[idx].text {
+                return Some(t.clone());
+            }
+            els.iter()
+                .enumerate()
+                .find(|(i, e)| !e.exiting && e.text.is_some() && ancestors_have_key(&els, *i, key))
+                .and_then(|(_, e)| e.text.clone())
+        };
+
+        // 1) Project view (desktop + compact): current run + history rows show trigger pill & reason.
+        for (w, h) in [(1180.0, 760.0), (360.0, 780.0), (390.0, 844.0)] {
+            let rt = setup_runtime(
+                |s| {
+                    crate::demo::load(
+                        s,
+                        View::Project {
+                            name: "lunarum".into(),
+                        },
+                    );
+                    // Also test joining trigger_reason with deploy_skipped_reason on a history row,
+                    // and deduplicating trigger pill when deploy_only + force_deploy.
+                    if let Some(r) = s
+                        .runs
+                        .iter_mut()
+                        .find(|r| r.id == "lunarum-1764064800-9a8b7c6")
+                    {
+                        r.deploy_skipped_reason = Some("Skipped deploy on PR branch".into());
+                    }
+                    s.runs.push(crate::model::Run {
+                        id: "lunarum-force-deploy".into(),
+                        project: "lunarum".into(),
+                        sha: "abcdef1234567890".into(),
+                        subject: "chore: redeploy edge".into(),
+                        status: crate::model::RunStatus::Success,
+                        started_at: crate::model::now_unix().saturating_sub(600),
+                        finished_at: Some(crate::model::now_unix().saturating_sub(580)),
+                        trigger: Some("force_deploy".into()),
+                        trigger_reason: Some("Force deploy (UI)".into()),
+                        deploy_only: true,
+                        ..crate::model::Run::default()
+                    });
+                },
+                w,
+                h,
+            );
+            assert_eq!(
+                text_of(&rt, "current-run-trigger").as_deref(),
+                Some("Webhook"),
+                "project current-run trigger pill at {w}x{h}"
+            );
+            assert_eq!(
+                text_of(&rt, "current-run-trigger-reason").as_deref(),
+                Some("GitHub push webhook (master by teppyboy)"),
+                "project current-run trigger reason at {w}x{h}"
+            );
+            assert_eq!(
+                text_of(&rt, "run-trigger-lunarum-1764067434-4f1c2b9").as_deref(),
+                Some("Webhook")
+            );
+            assert_eq!(
+                text_of(&rt, "run-subtitle-lunarum-1764067434-4f1c2b9").as_deref(),
+                Some("GitHub push webhook (master by teppyboy)")
+            );
+            assert_eq!(
+                text_of(&rt, "run-trigger-lunarum-1764064800-9a8b7c6").as_deref(),
+                Some("Poll")
+            );
+            assert_eq!(
+                text_of(&rt, "run-subtitle-lunarum-1764064800-9a8b7c6").as_deref(),
+                Some("Poll detected new commit on master · Skipped deploy on PR branch")
+            );
+            assert_eq!(
+                text_of(&rt, "run-trigger-lunarum-1764057600-3c4d5e6").as_deref(),
+                Some("Manual")
+            );
+            assert_eq!(
+                text_of(&rt, "run-subtitle-lunarum-1764057600-3c4d5e6").as_deref(),
+                Some("Retry of lunarum-1764051200-2b3c4d5 (UI)")
+            );
+            assert!(
+                rt.find("run-trigger-lunarum-force-deploy").is_none(),
+                "deploy_only + force_deploy should skip duplicate trigger pill at {w}x{h}"
+            );
+            assert_eq!(
+                text_of(&rt, "run-subtitle-lunarum-force-deploy").as_deref(),
+                Some("Force deploy (UI)")
+            );
+        }
+
+        // 2) Run detail view (desktop + compact): explicit trigger_reason, historical fallback,
+        //    and deploy_only + force_deploy pill deduplication.
+        for (w, h) in [(1180.0, 760.0), (360.0, 780.0), (390.0, 844.0)] {
+            let rt_explicit = setup_runtime(
+                |s| {
+                    crate::demo::load(
+                        s,
+                        View::Run {
+                            id: "lunarum-1764067434-4f1c2b9".into(),
+                        },
+                    );
+                },
+                w,
+                h,
+            );
+            assert_eq!(
+                text_of(&rt_explicit, "run-trigger").as_deref(),
+                Some("Webhook"),
+                "run detail trigger pill at {w}x{h}"
+            );
+            assert_eq!(
+                text_of(&rt_explicit, "run-trigger-reason").as_deref(),
+                Some("Trigger: GitHub push webhook (master by teppyboy)"),
+                "run detail trigger reason at {w}x{h}"
+            );
+
+            // Historical run with trigger = Some("poll") and no trigger_reason falls back cleanly.
+            let rt_fallback = setup_runtime(
+                |s| {
+                    crate::demo::load(
+                        s,
+                        View::Run {
+                            id: "lunarum-1764064800-9a8b7c6".into(),
+                        },
+                    );
+                    if let Some(run) = &mut s.run {
+                        run.trigger_reason = None;
+                    }
+                },
+                w,
+                h,
+            );
+            assert_eq!(
+                text_of(&rt_fallback, "run-trigger").as_deref(),
+                Some("Poll")
+            );
+            assert_eq!(
+                text_of(&rt_fallback, "run-trigger-reason").as_deref(),
+                Some("Triggered by poll")
+            );
+
+            // deploy_only + force_deploy omits duplicate pill while still showing reason.
+            let rt_force = setup_runtime(
+                |s| {
+                    crate::demo::load(
+                        s,
+                        View::Run {
+                            id: "lunarum-1764064800-9a8b7c6".into(),
+                        },
+                    );
+                    if let Some(run) = &mut s.run {
+                        run.deploy_only = true;
+                        run.trigger = Some("force_deploy".into());
+                        run.trigger_reason = Some("Force deploy of r-1 (UI)".into());
+                    }
+                },
+                w,
+                h,
+            );
+            assert!(
+                rt_force.find("run-trigger").is_none(),
+                "deploy_only + force_deploy should skip duplicate run-trigger pill at {w}x{h}"
+            );
+            assert_eq!(
+                text_of(&rt_force, "run-trigger-reason").as_deref(),
+                Some("Trigger: Force deploy of r-1 (UI)")
+            );
+        }
+    }
+
+    #[test]
+    fn pr_badge_deduplicates_pull_request_trigger_pill_and_keeps_reason() {
+        let text_of = |rt: &Runtime<State>, key: &str| -> Option<String> {
+            let els = rt.elements();
+            let idx = els
+                .iter()
+                .position(|e| e.key.as_deref() == Some(key) && !e.exiting)?;
+            if let Some(t) = &els[idx].text {
+                return Some(t.clone());
+            }
+            els.iter()
+                .enumerate()
+                .find(|(i, e)| !e.exiting && e.text.is_some() && ancestors_have_key(&els, *i, key))
+                .and_then(|(_, e)| e.text.clone())
+        };
+
+        let rt = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Run {
+                        id: "lunarum-1764064800-9a8b7c6".into(),
+                    },
+                );
+                if let Some(run) = &mut s.run {
+                    run.pr_number = Some(42);
+                    run.trigger = Some("pull_request".into());
+                    run.trigger_reason = Some("PR #42 opened by teppyboy".into());
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(
+            rt.find("run-trigger").is_none(),
+            "PR run with trigger == pull_request must skip redundant PR trigger pill"
+        );
+        let texts: Vec<String> = rt
+            .elements()
+            .into_iter()
+            .filter(|e| !e.exiting)
+            .filter_map(|e| e.text)
+            .collect();
+        assert!(texts.iter().any(|t| t == "PR #42"));
+        assert_eq!(
+            text_of(&rt, "run-trigger-reason").as_deref(),
+            Some("Trigger: PR #42 opened by teppyboy")
+        );
+    }
+
+    #[test]
+    fn multi_active_runs_concurrency_limits_and_settings_controls_render() {
+        use crate::model::{Run, RunStatus};
+
+        let second_run = || Run {
+            id: "lunarum-1764067500-beef123".into(),
+            project: "lunarum".into(),
+            sha: "beef1234567890abcdef".into(),
+            subject: "feat(ci): concurrent PR run".into(),
+            status: RunStatus::Running,
+            started_at: crate::model::now_unix().saturating_sub(30),
+            pr_number: Some(42),
+            trigger: Some("pull_request".into()),
+            trigger_reason: Some("PR #42 synchronized".into()),
+            ..Run::default()
+        };
+
+        // 1) Projects list: > 1 active runs shows "2 running" badge; Run now stays enabled below limit,
+        //    and disables once at limit.
+        let rt_list_below = setup_runtime(
+            |s| {
+                crate::demo::load(s, View::Projects);
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == "lunarum") {
+                    p.max_concurrent_runs = 3;
+                    p.active_runs.push(second_run());
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_list_below.find("project-active-count-lunarum").is_some());
+        let run_now_below = rt_list_below
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("run-now-lunarum") && !e.exiting)
+            .expect("run-now-lunarum");
+        assert!(
+            run_now_below.focusable,
+            "Run now should stay enabled when active_runs (2) < max_concurrent_runs (3)"
+        );
+
+        let rt_list_at = setup_runtime(
+            |s| {
+                crate::demo::load(s, View::Projects);
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == "lunarum") {
+                    p.max_concurrent_runs = 2;
+                    p.active_runs.push(second_run());
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        let run_now_at = rt_list_at
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("run-now-lunarum") && !e.exiting)
+            .expect("run-now-lunarum");
+        assert!(
+            !run_now_at.focusable,
+            "Run now should disable when active_runs (2) == max_concurrent_runs (2)"
+        );
+
+        // 2) Project detail: renders a card + per-run Cancel for EVERY active run, and respects limit.
+        for (w, h) in [(1180.0, 760.0), (360.0, 780.0)] {
+            let mut rt_proj = setup_runtime(
+                |s| {
+                    crate::demo::load(
+                        s,
+                        View::Project {
+                            name: "lunarum".into(),
+                        },
+                    );
+                    if let Some(p) = s.projects.iter_mut().find(|p| p.name == "lunarum") {
+                        p.max_concurrent_runs = 3;
+                        p.active_runs.push(second_run());
+                    }
+                },
+                w,
+                h,
+            );
+            assert!(rt_proj.find("project-active-count").is_some());
+            assert!(rt_proj
+                .find("current-run-lunarum-1764067434-4f1c2b9")
+                .is_some());
+            assert!(rt_proj
+                .find("current-run-lunarum-1764067500-beef123")
+                .is_some());
+            assert!(rt_proj
+                .find("current-run-cancel-lunarum-1764067434-4f1c2b9")
+                .is_some());
+            assert!(rt_proj
+                .find("current-run-cancel-lunarum-1764067500-beef123")
+                .is_some());
+            let run_now = rt_proj
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("project-run-now") && !e.exiting)
+                .expect("project-run-now");
+            assert!(
+                run_now.focusable,
+                "project-run-now should be enabled below concurrency limit at {w}x{h}"
+            );
+            // Click individual Cancel on the second run.
+            let (cx, cy) = rt_proj
+                .find("current-run-cancel-lunarum-1764067500-beef123")
+                .expect("per-run cancel");
+            rt_proj.pointer_down(cx, cy);
+            rt_proj.pointer_up(cx, cy);
+            rt_proj.frame(0.016);
+            assert_eq!(
+                rt_proj.state.cancelling.as_deref(),
+                Some("lunarum-1764067500-beef123")
+            );
+        }
+
+        // 3) Run detail: Retry & Force deploy stay enabled while active_runs < max_concurrent_runs.
+        let rt_run = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Run {
+                        id: "lunarum-1764064800-9a8b7c6".into(),
+                    },
+                );
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == "lunarum") {
+                    p.max_concurrent_runs = 2;
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        let retry_el = rt_run
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("run-retry") && !e.exiting)
+            .expect("run-retry");
+        assert!(
+            retry_el.focusable,
+            "run-retry should be enabled when active_runs (1) < max_concurrent_runs (2)"
+        );
+
+        // 4) Settings concurrency fields & Diagnostics concurrency rows render cleanly.
+        let rt_gen = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::General,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_gen.find("field-general.max_concurrent_runs").is_some());
+
+        let rt_act = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Act,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_act.find("field-act.max_concurrent").is_some());
+
+        let rt_proj_cfg = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Projects,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_proj_cfg
+            .find("field-project[0].max_concurrent_runs")
+            .is_some());
+
+        let rt_diag = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Diagnostics,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_diag.find("diagnostics-max-concurrent-runs").is_some());
+        assert!(rt_diag.find("diagnostics-act-max-concurrent").is_some());
+    }
+
+    #[test]
+    fn projects_card_uses_newest_active_run_and_compact_current_run_open_meets_touch_target() {
+        use crate::model::{Run, RunStatus};
+
+        let older_run = Run {
+            id: "lunarum-older-111".into(),
+            project: "lunarum".into(),
+            sha: "11111112222222".into(),
+            subject: "older active subject".into(),
+            status: RunStatus::Running,
+            started_at: crate::model::now_unix().saturating_sub(90),
+            ..Run::default()
+        };
+        let newest_run = Run {
+            id: "lunarum-newest-222".into(),
+            project: "lunarum".into(),
+            sha: "22222223333333".into(),
+            subject: "newest active subject".into(),
+            status: RunStatus::Running,
+            started_at: crate::model::now_unix().saturating_sub(10),
+            ..Run::default()
+        };
+
+        // [NB3] Projects card summary picks active_run_list().last() (newest / current_run).
+        let rt_list = setup_runtime(
+            |s| {
+                crate::demo::load(s, View::Projects);
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == "lunarum") {
+                    p.max_concurrent_runs = 3;
+                    p.current_run = Some(newest_run.clone());
+                    p.active_runs = vec![older_run.clone(), newest_run.clone()];
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        let card_texts: Vec<String> = rt_list
+            .elements()
+            .into_iter()
+            .filter(|e| {
+                !e.exiting
+                    && (e.path.contains("/project-lunarum/")
+                        || e.path.ends_with("/project-lunarum"))
+            })
+            .filter_map(|e| e.text)
+            .collect();
+        assert!(
+            card_texts
+                .iter()
+                .any(|t| t.contains("newest active subject")),
+            "expected Projects card to display newest active run, got {card_texts:?}"
+        );
+        assert!(
+            !card_texts.iter().any(|t| t.contains("older active subject")),
+            "Projects card should not display older active run when a newer one is active, got {card_texts:?}"
+        );
+
+        // [NB4] Compact current-run-open-{id} has role=button and height >= 44pt even with empty
+        // subject and no trigger/trigger_reason.
+        let bare_run = Run {
+            id: "lunarum-bare-333".into(),
+            project: "lunarum".into(),
+            sha: "33333334444444".into(),
+            subject: String::new(),
+            status: RunStatus::Running,
+            started_at: crate::model::now_unix().saturating_sub(5),
+            trigger: None,
+            trigger_reason: None,
+            ..Run::default()
+        };
+        let rt_compact = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Project {
+                        name: "lunarum".into(),
+                    },
+                );
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == "lunarum") {
+                    p.current_run = Some(bare_run.clone());
+                    p.active_runs = vec![bare_run.clone()];
+                }
+            },
+            360.0,
+            780.0,
+        );
+        let open_el = rt_compact
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("current-run-open-lunarum-bare-333") && !e.exiting)
+            .expect("current-run-open-lunarum-bare-333");
+        assert_eq!(open_el.role, "button");
+        assert!(
+            open_el.rect[3] >= 44.0,
+            "expected compact current-run-open height >= 44.0 with empty subject/trigger, got {}",
+            open_el.rect[3]
+        );
+    }
+
+    #[test]
+    fn act_max_concurrent_clear_prunes_empty_act_and_restores_clean_editor() {
+        let mut rt = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Act,
+                    },
+                );
+                if let Some(obj) = s.editor.base.as_object_mut() {
+                    obj.remove("act");
+                }
+                s.editor.draft = s.editor.base.clone();
+                s.editor.reseed();
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(!rt.state.editor.dirty());
+        assert!(rt.state.editor.draft.get("act").is_none());
+
+        let click = |rt: &mut Runtime<State>, key: &str| {
+            let (x, y) = rt.find(key).unwrap_or_else(|| panic!("missing {key}"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            for _ in 0..3 {
+                rt.frame(0.016);
+                rt.settle_all();
+            }
+        };
+        let set_field = |rt: &mut Runtime<State>, key: &str, value: &str| {
+            let ctrl = format!("{key}/control");
+            click(rt, &ctrl);
+            rt.key(KeyEvent {
+                key: Key::Command('a'),
+                mods: Mods {
+                    cmd: true,
+                    ..Mods::default()
+                },
+            });
+            rt.key(KeyEvent {
+                key: Key::Backspace,
+                mods: Mods::default(),
+            });
+            if !value.is_empty() {
+                rt.paste(value);
+            }
+            for _ in 0..4 {
+                rt.frame(0.016);
+                rt.settle_all();
+            }
+        };
+
+        set_field(&mut rt, "field-act.max_concurrent", "2");
+        assert!(rt.state.editor.dirty());
+        assert_eq!(
+            crate::paths::get_u64(&rt.state.editor.draft, "act.max_concurrent"),
+            Some(2)
+        );
+
+        set_field(&mut rt, "field-act.max_concurrent", "");
+        assert!(
+            rt.state.editor.draft.get("act").is_none(),
+            "clearing act.max_concurrent should prune empty act object, got {:?}",
+            rt.state.editor.draft.get("act")
+        );
+        assert!(
+            !rt.state.editor.dirty(),
+            "clearing act.max_concurrent on a draft without act must restore editor.dirty() == false"
+        );
     }
 }

@@ -156,11 +156,15 @@ await waitFor(
 
 // 2) Seed token in localStorage and reload `/` -> WS /api/ws connects + receives snapshot + GET /api/system 200,
 //    and does NOT spam periodic GET /api/projects while WS is connected.
-resetNetwork();
+//    Navigate through about:blank before resetNetwork() so any in-flight unauthed request from
+//    step 1 cannot land in step 2's response log.
 await send('Runtime.evaluate', {
   expression: `localStorage.setItem('lunacy.token', ${JSON.stringify(token)})`,
 });
-await send('Page.reload');
+await send('Page.navigate', { url: 'about:blank' });
+await sleep(100);
+resetNetwork();
+await send('Page.navigate', { url: `${base}/` });
 await waitFor(
   () =>
     wsSockets.some((s) => s.url.includes('/api/ws')) &&

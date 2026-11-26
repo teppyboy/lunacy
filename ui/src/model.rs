@@ -156,9 +156,12 @@ pub struct Run {
     pub github_url: Option<String>,
     #[serde(default)]
     pub steps: Vec<Step>,
-    /// Not in the v1 contract (`poll` / `manual` / `webhook`).
+    /// Trigger source (`poll` / `manual` / `webhook` / `pull_request` / `force_deploy` / `tag`).
     #[serde(default)]
     pub trigger: Option<String>,
+    /// Human-readable reason explaining how and why this run was triggered.
+    #[serde(default)]
+    pub trigger_reason: Option<String>,
     #[serde(default)]
     pub git_ref: Option<String>,
     #[serde(default)]
@@ -179,6 +182,38 @@ impl Run {
     pub fn duration_ms(&self, now: u64) -> u64 {
         let end = self.finished_at.unwrap_or(now);
         end.saturating_sub(self.started_at) * 1000
+    }
+
+    /// Short pill label for the trigger source.
+    pub fn trigger_label(&self) -> Option<&'static str> {
+        match self.trigger.as_deref() {
+            Some("webhook") => Some("Webhook"),
+            Some("manual") => Some("Manual"),
+            Some("poll") => Some("Poll"),
+            Some("pull_request") => Some("PR"),
+            Some("force_deploy") => Some("Force deploy"),
+            Some("tag") => Some("Tag"),
+            _ => None,
+        }
+    }
+
+    /// Trimmed non-empty `trigger_reason` if present, otherwise a readable fallback derived from
+    /// `trigger` so historical runs from older daemon state files still explain how they started.
+    pub fn trigger_display(&self) -> Option<String> {
+        if let Some(reason) = self.trigger_reason.as_deref().map(str::trim) {
+            if !reason.is_empty() {
+                return Some(reason.to_string());
+            }
+        }
+        match self.trigger.as_deref() {
+            Some("webhook") => Some("Triggered by webhook".to_string()),
+            Some("manual") => Some("Triggered manually".to_string()),
+            Some("poll") => Some("Triggered by poll".to_string()),
+            Some("pull_request") => Some("Triggered by pull request".to_string()),
+            Some("force_deploy") => Some("Force deploy".to_string()),
+            Some("tag") => Some("Triggered by tag".to_string()),
+            _ => None,
+        }
     }
 }
 
@@ -204,6 +239,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_one() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default)]
@@ -223,6 +262,10 @@ pub struct Project {
     #[serde(default)]
     pub current_run: Option<Run>,
     #[serde(default)]
+    pub active_runs: Vec<Run>,
+    #[serde(default = "default_one")]
+    pub max_concurrent_runs: usize,
+    #[serde(default)]
     pub last_run: Option<Run>,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -241,6 +284,8 @@ impl Default for Project {
             last_sha: None,
             running: false,
             current_run: None,
+            active_runs: Vec::new(),
+            max_concurrent_runs: default_one(),
             last_run: None,
             last_error: None,
             open_prs: Vec::new(),
@@ -256,6 +301,34 @@ impl Project {
             (Some(_), None) => true,
             _ => false,
         }
+    }
+
+    /// All currently active runs for this project, falling back to `current_run` when connected
+    /// to an older daemon that does not populate `active_runs`.
+    pub fn active_run_list(&self) -> Vec<&Run> {
+        if !self.active_runs.is_empty() {
+            self.active_runs.iter().collect()
+        } else {
+            self.current_run.iter().collect()
+        }
+    }
+
+    /// Number of runs currently active on this project.
+    pub fn active_run_count(&self) -> usize {
+        let listed = self.active_run_list().len();
+        if listed > 0 {
+            listed
+        } else if self.running {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Whether this project has reached its per-project concurrency cap.
+    pub fn at_concurrency_limit(&self) -> bool {
+        let limit = self.max_concurrent_runs.max(1);
+        self.active_run_count() >= limit
     }
 }
 
@@ -273,6 +346,7 @@ pub enum ProjectState {
 impl Project {
     pub fn state(&self) -> ProjectState {
         if self.running
+            || !self.active_runs.is_empty()
             || self
                 .current_run
                 .as_ref()
@@ -340,6 +414,10 @@ pub struct SystemInfo {
     pub git: ToolInfo,
     #[serde(default)]
     pub webhook: Option<WebhookInfo>,
+    #[serde(default)]
+    pub max_concurrent_runs: Option<usize>,
+    #[serde(default)]
+    pub act_max_concurrent: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -660,5 +738,137 @@ pub fn now_unix() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
         (js_sys::Date::now() / 1000.0) as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_label_maps_known_sources() {
+        for (raw, expected) in [
+            (Some("webhook"), Some("Webhook")),
+            (Some("manual"), Some("Manual")),
+            (Some("poll"), Some("Poll")),
+            (Some("pull_request"), Some("PR")),
+            (Some("force_deploy"), Some("Force deploy")),
+            (Some("tag"), Some("Tag")),
+            (Some("other"), None),
+            (None, None),
+        ] {
+            let run = Run {
+                trigger: raw.map(str::to_string),
+                ..Run::default()
+            };
+            assert_eq!(run.trigger_label(), expected, "trigger={raw:?}");
+        }
+    }
+
+    #[test]
+    fn trigger_display_prefers_trimmed_reason_and_falls_back_for_historical_runs() {
+        let explicit = Run {
+            trigger: Some("webhook".into()),
+            trigger_reason: Some("  GitHub push webhook (master by teppyboy)  ".into()),
+            ..Run::default()
+        };
+        assert_eq!(
+            explicit.trigger_display().as_deref(),
+            Some("GitHub push webhook (master by teppyboy)")
+        );
+
+        let blank_reason = Run {
+            trigger: Some("manual".into()),
+            trigger_reason: Some("   ".into()),
+            ..Run::default()
+        };
+        assert_eq!(
+            blank_reason.trigger_display().as_deref(),
+            Some("Triggered manually")
+        );
+
+        for (raw, expected) in [
+            (Some("webhook"), Some("Triggered by webhook")),
+            (Some("manual"), Some("Triggered manually")),
+            (Some("poll"), Some("Triggered by poll")),
+            (Some("pull_request"), Some("Triggered by pull request")),
+            (Some("force_deploy"), Some("Force deploy")),
+            (Some("tag"), Some("Triggered by tag")),
+            (Some("unknown"), None),
+            (None, None),
+        ] {
+            let run = Run {
+                trigger: raw.map(str::to_string),
+                trigger_reason: None,
+                ..Run::default()
+            };
+            assert_eq!(
+                run.trigger_display().as_deref(),
+                expected,
+                "fallback trigger={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_serde_tolerates_missing_or_present_trigger_reason() {
+        let old: Run = serde_json::from_str(r#"{"id":"r-1","trigger":"poll"}"#).unwrap();
+        assert_eq!(old.trigger.as_deref(), Some("poll"));
+        assert_eq!(old.trigger_reason, None);
+        assert_eq!(old.trigger_display().as_deref(), Some("Triggered by poll"));
+
+        let new: Run = serde_json::from_str(
+            r#"{"id":"r-2","trigger":"manual","trigger_reason":"Retry of r-1 (UI)"}"#,
+        )
+        .unwrap();
+        assert_eq!(new.trigger_reason.as_deref(), Some("Retry of r-1 (UI)"));
+        assert_eq!(new.trigger_display().as_deref(), Some("Retry of r-1 (UI)"));
+    }
+
+    #[test]
+    fn project_active_runs_fallback_and_concurrency_limit() {
+        // Older daemon omits active_runs & max_concurrent_runs -> defaults to 1 and falls back to current_run.
+        let legacy: Project = serde_json::from_str(
+            r#"{"name":"alpha","running":true,"current_run":{"id":"r-1","status":"running"}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.max_concurrent_runs, 1);
+        assert_eq!(legacy.active_run_list().len(), 1);
+        assert_eq!(legacy.active_run_list()[0].id, "r-1");
+        assert_eq!(legacy.active_run_count(), 1);
+        assert!(legacy.at_concurrency_limit());
+        assert_eq!(legacy.state(), ProjectState::Running);
+
+        // Multi-run project below limit stays open for another run.
+        let mut multi = Project {
+            name: "alpha".into(),
+            running: true,
+            max_concurrent_runs: 2,
+            active_runs: vec![Run {
+                id: "r-1".into(),
+                status: RunStatus::Running,
+                ..Run::default()
+            }],
+            ..Project::default()
+        };
+        assert_eq!(multi.active_run_count(), 1);
+        assert!(!multi.at_concurrency_limit());
+
+        // Reaching limit disables further triggers.
+        multi.active_runs.push(Run {
+            id: "r-2".into(),
+            status: RunStatus::Running,
+            ..Run::default()
+        });
+        assert_eq!(multi.active_run_count(), 2);
+        assert!(multi.at_concurrency_limit());
+
+        // SystemInfo deserializes optional concurrency limits cleanly.
+        let sys: SystemInfo = serde_json::from_str(
+            r#"{"os":"linux","max_concurrent_runs":4,"act_max_concurrent":2}"#,
+        )
+        .unwrap();
+        assert_eq!(sys.max_concurrent_runs, Some(4));
+        assert_eq!(sys.act_max_concurrent, Some(2));
     }
 }

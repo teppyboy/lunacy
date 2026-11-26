@@ -7,6 +7,7 @@
 use rune::{col, el, icon, row, text, El, Spring, TextEdit, Transition, Tx};
 use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, Field, Kit, TextArea};
 
+use crate::icons;
 use crate::state::{phase_key, step_path, State};
 use crate::theme;
 use crate::views::settings::{argv_field, list_field, table_field, text_field, u64_field};
@@ -24,8 +25,13 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool, compact: bool) ->
     let e = &s.editor;
     let array = format!("project[{project}].{}", phase_key(deploy));
     let count = e.count(&array);
-    let mut c = col().w_full().gap(10.0).child(widgets::section(
+    let mut c = col().w_full().gap(10.0).child(widgets::section_icon(
         k,
+        if deploy {
+            &icons::ROCKET
+        } else {
+            &icons::TERMINAL
+        },
         if deploy { "Deploy steps" } else { "CI steps" },
         Some(if deploy {
             "Run after CI succeeds. A failing deploy step fails the run."
@@ -55,6 +61,7 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool, compact: bool) ->
             .flex_wrap()
             .child(
                 Button::new("Add shell step")
+                    .icon(&icons::PLUS)
                     .variant(ButtonVariant::Outline)
                     .control_size(ControlSize::Small)
                     .on_press_tx(move |s: &mut State, tx: &mut Tx| {
@@ -65,6 +72,7 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool, compact: bool) ->
             )
             .child(
                 Button::new("Add act step")
+                    .icon(&icons::PLUS)
                     .variant(ButtonVariant::Outline)
                     .control_size(ControlSize::Small)
                     .on_press_tx(move |s: &mut State, tx: &mut Tx| {
@@ -109,18 +117,18 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact:
 
     let phase_name = crate::state::phase_key(deploy);
     let badge = el()
-        .size(20.0, 20.0)
+        .size(22.0, 22.0)
         .center()
         .radius(k.radius.xs)
         .fill(k.c.layer_04)
         .child(
             icon(
                 if is_act {
-                    &glyphs::TRIANGLE_DOWN
+                    &icons::BOX
                 } else {
-                    &glyphs::CARET_RIGHT
+                    &icons::TERMINAL
                 },
-                12.0,
+                13.0,
             )
             .color(k.c.icon_muted),
         );
@@ -275,14 +283,20 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact
             .center_y()
             .flex_wrap()
             .child(text("Step").font(k.ty.ui_medium).color(k.c.text_base))
-            .child(widgets::pill(
+            .child(widgets::pill_with_icon(
                 k,
+                if is_act {
+                    &icons::BOX
+                } else {
+                    &icons::TERMINAL
+                },
                 if is_act { "act" } else { "shell" },
                 k.c.text_muted,
             ))
             .child(el().grow(1.0))
             .child(
                 Button::new("Done")
+                    .icon(&icons::CHECK)
                     .variant(ButtonVariant::Ghost)
                     .control_size(ControlSize::Small)
                     .on_press_tx(|s: &mut State, _tx: &mut Tx| {
@@ -307,10 +321,11 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact
         k,
         "Kind",
         Some("A shell step runs a command on this machine. An act step runs a GitHub Actions job in Docker."),
-        widgets::segmented(
+        widgets::segmented_with_icons(
             k,
             compact,
             &["Shell", "act (GitHub Actions)"],
+            &[Some(&icons::TERMINAL), Some(&icons::BOX)],
             Some(if is_act { 1 } else { 0 }),
             move |s: &mut State, picked: usize, tx: &mut Tx| {
                 let want = if picked == 1 { "act" } else { "shell" };
@@ -516,6 +531,7 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str, compact: bool) -> 
                 } else {
                     "Refresh"
                 })
+                .icon(&icons::REFRESH_CW)
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
                 .disabled(e.workflows_loading)

@@ -171,6 +171,28 @@ pub fn prune_empty_object(v: &mut Value, path: &str) {
     }
 }
 
+/// Removes optional parent objects that became empty after clearing a nested field, so clearing
+/// an edit on an initially absent section restores `editor.dirty() == false`.
+pub fn prune_empty_parents(draft: &mut Value, path: &str) {
+    if path.starts_with("github.app.") {
+        prune_empty_object(draft, "github.app");
+    }
+    if path.starts_with("github.") {
+        prune_empty_object(draft, "github");
+    }
+    if path.starts_with("discord.") {
+        prune_empty_object(draft, "discord");
+    }
+    if path.starts_with("act.") {
+        prune_empty_object(draft, "act");
+    }
+    if let Some((parent, _leaf)) = path.rsplit_once('.') {
+        if parent.ends_with(".contexts") {
+            prune_empty_object(draft, parent);
+        }
+    }
+}
+
 pub fn set_bool(v: &mut Value, path: &str, b: bool) {
     set(v, path, Value::Bool(b));
 }
@@ -356,5 +378,28 @@ mod tests {
         // Required strings keep empty string instead of deleting key.
         set_str(&mut v, "project[0].name", "", false);
         assert_eq!(v["project"][0]["name"], "");
+    }
+
+    #[test]
+    fn prune_empty_parents_clears_act_table_only_when_empty() {
+        let base = json!({"general": {"poll_interval": 300}});
+        let mut draft = base.clone();
+
+        set_u64(&mut draft, "act.max_concurrent", Some(2));
+        assert_eq!(draft["act"]["max_concurrent"], 2);
+        assert_ne!(draft, base);
+
+        set_u64(&mut draft, "act.max_concurrent", None);
+        assert_eq!(draft["act"], json!({}));
+        prune_empty_parents(&mut draft, "act.max_concurrent");
+        assert!(draft.get("act").is_none());
+        assert_eq!(draft, base);
+
+        // Preserve `act` when a sibling field remains populated.
+        set_str(&mut draft, "act.lock_file", "/tmp/act.lock", true);
+        set_u64(&mut draft, "act.max_concurrent", Some(3));
+        set_u64(&mut draft, "act.max_concurrent", None);
+        prune_empty_parents(&mut draft, "act.max_concurrent");
+        assert_eq!(draft["act"], json!({"lock_file": "/tmp/act.lock"}));
     }
 }

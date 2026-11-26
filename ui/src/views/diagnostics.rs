@@ -3,9 +3,10 @@
 //! `os` is the daemon's host OS, not this window's, so it leads the page: it is the one fact
 //! that explains why a step with `only_on` was skipped here but ran (or didn't) elsewhere.
 
-use rune::{col, el, row, text, Cx, El, Tx};
+use rune::{col, el, icon, row, text, Cx, El, Icon, Tx};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
+use crate::icons;
 use crate::state::State;
 use crate::theme;
 use crate::widgets;
@@ -49,6 +50,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
         .child(el().grow(1.0))
         .child(
             Button::new("Refresh")
+                .icon(&icons::REFRESH_CW)
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
                 .on_press_tx(|s: &mut State, tx: &mut Tx| {
@@ -67,7 +69,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
             .radius(k.radius.lg)
             .fill(k.c.layer_02)
             .border(1.0, k.c.border_base)
-            .child(widgets::caption(k, "DAEMON HOST"))
+            .child(widgets::caption_icon(k, &icons::CPU, "DAEMON HOST"))
             .child(host_row)
             .child(
                 text("Steps limited with `only_on` run only when this host is in their list; elsewhere they are recorded as skipped.".to_string())
@@ -77,7 +79,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
             ),
     );
 
-    c = c.child(widgets::section(k, "Daemon", None));
+    c = c.child(widgets::section_icon(k, &icons::SERVER, "Daemon", None));
     let mut daemon = col().w_full().gap(0.0);
     daemon = daemon.child(widgets::kv_for(
         k,
@@ -108,6 +110,30 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
         "Server URL",
         widgets::value_for(k, compact, &s.server_display()),
     ));
+    if let Some(max_runs) = info.max_concurrent_runs {
+        daemon = daemon.child(widgets::divider(k));
+        daemon = daemon.child(
+            widgets::kv_for(
+                k,
+                compact,
+                "Max concurrent runs",
+                widgets::value_for(k, compact, &max_runs.to_string()),
+            )
+            .key("diagnostics-max-concurrent-runs"),
+        );
+    }
+    if let Some(act_max) = info.act_max_concurrent {
+        daemon = daemon.child(widgets::divider(k));
+        daemon = daemon.child(
+            widgets::kv_for(
+                k,
+                compact,
+                "act concurrency",
+                widgets::value_for(k, compact, &act_max.to_string()),
+            )
+            .key("diagnostics-act-max-concurrent"),
+        );
+    }
     daemon = daemon.child(widgets::divider(k));
     daemon = daemon.child(
         widgets::kv_for(
@@ -115,9 +141,14 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
             compact,
             "Transport",
             if s.ws_connected {
-                widgets::pill(k, "WebSocket (live)", theme::status(k).success)
+                widgets::pill_with_icon(
+                    k,
+                    &icons::WIFI,
+                    "WebSocket (live)",
+                    theme::status(k).success,
+                )
             } else {
-                widgets::pill(k, "HTTP fallback", k.c.text_muted)
+                widgets::pill_with_icon(k, &icons::CLOCK, "HTTP fallback", k.c.text_muted)
             },
         )
         .key("diagnostics-transport"),
@@ -126,7 +157,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     let webhook_val = match info.webhook.as_ref() {
         Some(wh) => {
             let pill = if wh.configured {
-                widgets::pill(k, "Configured", theme::status(k).success)
+                widgets::pill_with_icon(k, &icons::ZAP, "Configured", theme::status(k).success)
             } else {
                 widgets::pill(k, "Not configured", k.c.text_faint)
             };
@@ -170,8 +201,9 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     );
     c = c.child(daemon);
 
-    c = c.child(widgets::section(
+    c = c.child(widgets::section_icon(
         k,
+        &icons::TERMINAL,
         "Tools",
         Some("What the daemon needs to run CI and deploy steps."),
     ));
@@ -179,6 +211,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     tools = tools.child(tool_row(
         k,
         compact,
+        &icons::BOX,
         "act",
         info.act.path.as_deref(),
         info.act.version.as_deref(),
@@ -187,6 +220,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     tools = tools.child(tool_row(
         k,
         compact,
+        &icons::GIT_BRANCH,
         "git",
         None,
         info.git.version.as_deref(),
@@ -197,17 +231,29 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
         compact,
         "docker",
         match (info.docker.ok, info.docker.error.as_deref()) {
-            (true, _) => widgets::pill(k, "Available", theme::status(k).success),
+            (true, _) => widgets::pill_with_icon(
+                k,
+                &icons::CHECK_CIRCLE,
+                "Available",
+                theme::status(k).success,
+            ),
             (false, Some(error)) => {
                 let ink = theme::status(k).failure;
                 let mut notice = row()
                     .px(8.0)
                     .py(4.0)
+                    .gap(6.0)
                     .radius(k.radius.sm)
                     .fill(theme::status(k).tint(ink))
                     .items_start()
                     .min_w(0.0)
                     .shrink()
+                    .child(
+                        icon(&icons::ALERT_CIRCLE, 13.0)
+                            .color(ink)
+                            .mt(2.0)
+                            .a11y_hidden(),
+                    )
                     .child(
                         text(error.to_string())
                             .font(k.ty.small_medium)
@@ -221,7 +267,12 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
                 }
                 notice
             }
-            (false, None) => widgets::pill(k, "Not available", theme::status(k).failure),
+            (false, None) => widgets::pill_with_icon(
+                k,
+                &icons::X_CIRCLE,
+                "Not available",
+                theme::status(k).failure,
+            ),
         },
     ));
     c = c.child(tools);
@@ -229,7 +280,14 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     c
 }
 
-fn tool_row(k: &Kit, compact: bool, name: &str, path: Option<&str>, version: Option<&str>) -> El {
+fn tool_row(
+    k: &Kit,
+    compact: bool,
+    ic: &'static Icon,
+    name: &str,
+    path: Option<&str>,
+    version: Option<&str>,
+) -> El {
     let found = path.is_some() || version.is_some();
     let detail = match (path, version) {
         (Some(path), Some(version)) => format!("{version} · {path}"),
@@ -238,9 +296,9 @@ fn tool_row(k: &Kit, compact: bool, name: &str, path: Option<&str>, version: Opt
         (None, None) => "not found".to_string(),
     };
     let status_pill = if found {
-        widgets::pill(k, "Found", theme::status(k).success)
+        widgets::pill_with_icon(k, &icons::CHECK_CIRCLE, "Found", theme::status(k).success)
     } else {
-        widgets::pill(k, "Missing", theme::status(k).failure)
+        widgets::pill_with_icon(k, &icons::X_CIRCLE, "Missing", theme::status(k).failure)
     };
     if compact {
         return col()
@@ -253,6 +311,7 @@ fn tool_row(k: &Kit, compact: bool, name: &str, path: Option<&str>, version: Opt
                     .w_full()
                     .gap(8.0)
                     .center_y()
+                    .child(icon(ic, 13.0).color(k.c.icon_muted).a11y_hidden())
                     .child(
                         text(name.to_string())
                             .font(k.ty.small_medium)
@@ -274,10 +333,16 @@ fn tool_row(k: &Kit, compact: bool, name: &str, path: Option<&str>, version: Opt
         .gap(12.0)
         .center_y()
         .child(
-            text(name.to_string())
-                .font(k.ty.small)
-                .color(k.c.text_muted)
-                .w(90.0),
+            row()
+                .w(90.0)
+                .gap(6.0)
+                .center_y()
+                .child(icon(ic, 13.0).color(k.c.icon_muted).a11y_hidden())
+                .child(
+                    text(name.to_string())
+                        .font(k.ty.small)
+                        .color(k.c.text_muted),
+                ),
         )
         .child(
             text(detail)

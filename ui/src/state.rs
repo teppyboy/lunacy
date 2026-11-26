@@ -102,56 +102,106 @@ pub fn conn_from_fields(server: &str, token: &str) -> Conn {
     }
 }
 
-/// Launch settings: `--server URL --token T`, then `LUNACY_SERVER` / `LUNACY_TOKEN`.
-pub fn conn_from_env() -> Conn {
-    let mut conn = Conn {
-        server: default_server(),
-        token: String::new(),
-    };
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
+/// Resolves startup connection settings with strict precedence:
+/// 1. Environment variables (`LUNACY_SERVER`, `LUNACY_TOKEN`, when non-empty after trim)
+/// 2. Explicit CLI flags (`--server`, `--token`, `--server=...`, `--token=...`)
+/// 3. Saved local preferences (`stored_server()`, `stored_token()`)
+/// 4. Built-in defaults (`default_server()`, `""`)
+pub(crate) fn conn_from_sources<I, S>(
+    args: I,
+    env_server: Option<String>,
+    env_token: Option<String>,
+    saved_server: Option<String>,
+    saved_token: Option<String>,
+    default_server: String,
+) -> Conn
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut cli_server: Option<String> = None;
+    let mut cli_token: Option<String> = None;
+    let mut server_explicit = false;
+    let mut token_explicit = false;
+
+    let mut iter = args.into_iter();
+    while let Some(a) = iter.next() {
+        let a = a.as_ref();
+        match a {
             "--server" => {
-                if let Some(v) = args.next() {
-                    conn.server = normalize_server(&v);
+                if let Some(v) = iter.next() {
+                    cli_server = Some(normalize_server(v.as_ref()));
+                    server_explicit = true;
                 }
             }
             "--token" => {
-                if let Some(v) = args.next() {
-                    conn.token = v;
+                if let Some(v) = iter.next() {
+                    cli_token = Some(v.as_ref().trim().to_string());
+                    token_explicit = true;
                 }
             }
             _ => {
                 if let Some(v) = a.strip_prefix("--server=") {
-                    conn.server = normalize_server(v);
+                    cli_server = Some(normalize_server(v));
+                    server_explicit = true;
                 } else if let Some(v) = a.strip_prefix("--token=") {
-                    conn.token = v.to_string();
+                    cli_token = Some(v.trim().to_string());
+                    token_explicit = true;
                 }
             }
         }
     }
-    // The environment wins over the command line: it is what a service manager sets.
-    for (var, field) in [("LUNACY_SERVER", 0), ("LUNACY_TOKEN", 1)] {
-        if let Ok(v) = std::env::var(var) {
-            if v.trim().is_empty() {
-                continue;
-            }
-            if field == 0 {
-                conn.server = normalize_server(&v);
-            } else {
-                conn.token = v;
-            }
-        }
-    }
-    // Web: the token this browser saved last time (the page has no command line).
-    if conn.token.is_empty() {
-        if let Some(t) = stored_token() {
-            conn.token = t;
-        }
-    }
-    conn
+
+    let env_server = env_server
+        .map(|v| normalize_server(&v))
+        .filter(|v| !v.is_empty());
+    let env_token = env_token
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let saved_server = saved_server
+        .map(|v| normalize_server(&v))
+        .filter(|v| !v.is_empty());
+    let saved_token = saved_token
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let server = if let Some(v) = env_server {
+        v
+    } else if server_explicit {
+        cli_server
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| normalize_server(&default_server))
+    } else if let Some(v) = saved_server {
+        v
+    } else {
+        normalize_server(&default_server)
+    };
+
+    let token = if let Some(v) = env_token {
+        v
+    } else if token_explicit {
+        cli_token.unwrap_or_default()
+    } else {
+        saved_token.unwrap_or_default()
+    };
+
+    Conn { server, token }
 }
 
+/// Launch settings: `LUNACY_SERVER` / `LUNACY_TOKEN` > `--server URL --token T` > saved prefs > defaults.
+pub fn conn_from_env() -> Conn {
+    conn_from_sources(
+        std::env::args().skip(1),
+        std::env::var("LUNACY_SERVER").ok(),
+        std::env::var("LUNACY_TOKEN").ok(),
+        stored_server(),
+        stored_token(),
+        default_server(),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+const SERVER_STORAGE_KEY: &str = "lunacy.server";
 #[cfg(target_arch = "wasm32")]
 const TOKEN_KEY: &str = "lunacy.token";
 #[cfg(target_arch = "wasm32")]
@@ -160,14 +210,22 @@ const THEME_STORAGE_KEY: &str = "lunacy.theme";
 const ZOOM_STORAGE_KEY: &str = "lunacy.zoom";
 #[cfg(target_arch = "wasm32")]
 const LOG_WRAP_STORAGE_KEY: &str = "lunacy.log_wrap";
+#[cfg(target_arch = "wasm32")]
+const LOG_VIEW_RAW_STORAGE_KEY: &str = "lunacy.log_view_raw";
 #[cfg(not(target_arch = "wasm32"))]
 const PREFS_APP_ID: &str = "lunacy";
+#[cfg(not(target_arch = "wasm32"))]
+const PREF_SERVER_KEY: &str = "server";
+#[cfg(not(target_arch = "wasm32"))]
+const PREF_TOKEN_KEY: &str = "token";
 #[cfg(not(target_arch = "wasm32"))]
 const PREF_THEME_KEY: &str = "theme";
 #[cfg(not(target_arch = "wasm32"))]
 const PREF_ZOOM_KEY: &str = "zoom";
 #[cfg(not(target_arch = "wasm32"))]
 const PREF_LOG_WRAP_KEY: &str = "log_wrap";
+#[cfg(not(target_arch = "wasm32"))]
+const PREF_LOG_VIEW_RAW_KEY: &str = "log_view_raw";
 #[cfg(not(target_arch = "wasm32"))]
 const PREF_AUTO_UPDATE_KEY: &str = "auto_update_check";
 
@@ -178,72 +236,247 @@ fn sanitize_zoom(z: f32) -> Option<f32> {
     (z.is_finite() && (0.5..=2.5).contains(&z)).then_some(z)
 }
 
+/// Persisted window preferences loaded at startup.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct WindowPrefs {
+    pub theme: Option<crate::theme::ThemeMode>,
+    pub zoom: Option<f32>,
+    pub log_wrap: Option<bool>,
+    pub log_view_raw: Option<bool>,
+}
+
 #[cfg(target_arch = "wasm32")]
 fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
 }
 
 #[cfg(target_arch = "wasm32")]
+fn save_storage_item(key: &str, value: &str) -> Result<(), String> {
+    let Some(s) = local_storage() else {
+        return Err("browser localStorage is unavailable".into());
+    };
+    s.set_item(key, value)
+        .map_err(|e| format!("could not write {key}: {}", crate::net::js_message(&e)))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn remove_storage_item(key: &str) -> Result<(), String> {
+    let Some(s) = local_storage() else {
+        return Err("browser localStorage is unavailable".into());
+    };
+    s.remove_item(key)
+        .map_err(|e| format!("could not remove {key}: {}", crate::net::js_message(&e)))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_prefs_dir_permissions(prefs: &rune::prefs::Prefs) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = prefs.path().and_then(|p| p.parent()) {
+            if parent.file_name() == Some(std::ffi::OsStr::new(PREFS_APP_ID)) {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "failed to create preferences directory {}: {e}",
+                        parent.display()
+                    )
+                })?;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |e| format!("failed to set permissions on {}: {e}", parent.display()),
+                )?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = prefs;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn restrict_prefs_permissions(prefs: &rune::prefs::Prefs) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(path) = prefs.path() {
+            if path.is_file() {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("failed to set permissions on {}: {e}", path.display()))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = prefs;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_prefs(path: Option<&std::path::Path>) -> rune::prefs::Prefs {
+    match path {
+        Some(p) => rune::prefs::Prefs::at(p),
+        None => rune::prefs::Prefs::open(PREFS_APP_ID),
+    }
+}
+
+/// Performs a native `Prefs` write, enforces `0o700` on the app config directory and `0o600`
+/// permissions on `prefs.json` on Unix (since `Prefs::save` rewrites via temp-file + rename),
+/// and logs any error to stderr.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_prefs_with(
+    prefs: &mut rune::prefs::Prefs,
+    f: impl FnOnce(&mut rune::prefs::Prefs) -> Result<(), rune::prefs::PrefsError>,
+) -> Result<(), String> {
+    let dir_res = ensure_prefs_dir_permissions(prefs);
+    let write_res = f(prefs).map_err(|e| e.to_string());
+    let perm_res = restrict_prefs_permissions(prefs);
+    if let Err(err) = write_res {
+        eprintln!("lunacy-ui: failed to save preferences: {err}");
+        return Err(err);
+    }
+    if let Err(err) = dir_res {
+        eprintln!("lunacy-ui: {err}");
+        return Err(err);
+    }
+    if let Err(err) = perm_res {
+        eprintln!("lunacy-ui: {err}");
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stored_server() -> Option<String> {
+    local_storage()?
+        .get_item(SERVER_STORAGE_KEY)
+        .ok()??
+        .pipe_normalize_server()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stored_server() -> Option<String> {
+    let prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+    load_connection_from(&prefs).0
+}
+
+#[cfg(target_arch = "wasm32")]
 fn stored_token() -> Option<String> {
     local_storage()?
         .get_item(TOKEN_KEY)
-        .ok()?
-        .filter(|t| !t.is_empty())
+        .ok()??
+        .pipe_trimmed_non_empty()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn stored_token() -> Option<String> {
-    None
+    let prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+    load_connection_from(&prefs).1
 }
 
-/// Web: remember the token in this browser so a reload or a GitHub link stays signed in.
 #[cfg(target_arch = "wasm32")]
-fn store_token(token: &str) {
-    if let Some(s) = local_storage() {
-        let _ = if token.is_empty() {
-            s.remove_item(TOKEN_KEY)
-        } else {
-            s.set_item(TOKEN_KEY, token)
-        };
+trait StorageStringExt {
+    fn pipe_normalize_server(self) -> Option<String>;
+    fn pipe_trimmed_non_empty(self) -> Option<String>;
+}
+
+#[cfg(target_arch = "wasm32")]
+impl StorageStringExt for String {
+    fn pipe_normalize_server(self) -> Option<String> {
+        let s = normalize_server(&self);
+        (!s.is_empty()).then_some(s)
+    }
+
+    fn pipe_trimmed_non_empty(self) -> Option<String> {
+        let t = self.trim().to_string();
+        (!t.is_empty()).then_some(t)
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn store_token(_: &str) {}
+pub(crate) fn load_connection_from(prefs: &rune::prefs::Prefs) -> (Option<String>, Option<String>) {
+    let server = prefs
+        .get::<String>(PREF_SERVER_KEY)
+        .map(|s| normalize_server(&s))
+        .filter(|s| !s.is_empty());
+    let token = prefs
+        .get::<String>(PREF_TOKEN_KEY)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    (server, token)
+}
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn load_prefs_from(
-    prefs: &rune::prefs::Prefs,
-) -> (Option<crate::theme::ThemeMode>, Option<f32>, Option<bool>) {
+pub(crate) fn save_connection_to(
+    prefs: &mut rune::prefs::Prefs,
+    server: &str,
+    token: &str,
+) -> Result<(), String> {
+    let server = normalize_server(server);
+    let token = token.trim();
+    write_prefs_with(prefs, |p| {
+        if server.is_empty() {
+            p.remove(PREF_SERVER_KEY)?;
+        } else {
+            p.set(PREF_SERVER_KEY, &server)?;
+        }
+        if token.is_empty() {
+            p.remove(PREF_TOKEN_KEY)?;
+        } else {
+            p.set(PREF_TOKEN_KEY, token)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn load_prefs_from(prefs: &rune::prefs::Prefs) -> WindowPrefs {
     let theme = prefs
         .get::<String>(PREF_THEME_KEY)
         .as_deref()
         .and_then(crate::theme::ThemeMode::parse);
     let zoom = prefs.get::<f32>(PREF_ZOOM_KEY).and_then(sanitize_zoom);
     let log_wrap = prefs.get::<bool>(PREF_LOG_WRAP_KEY);
-    (theme, zoom, log_wrap)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn save_theme_to(prefs: &mut rune::prefs::Prefs, mode: crate::theme::ThemeMode) {
-    let _ = prefs.set(PREF_THEME_KEY, mode.as_str());
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn save_zoom_to(prefs: &mut rune::prefs::Prefs, zoom: Option<f32>) {
-    match zoom.and_then(sanitize_zoom) {
-        Some(z) => {
-            let _ = prefs.set(PREF_ZOOM_KEY, &z);
-        }
-        None => {
-            let _ = prefs.remove(PREF_ZOOM_KEY);
-        }
+    let log_view_raw = prefs.get::<bool>(PREF_LOG_VIEW_RAW_KEY);
+    WindowPrefs {
+        theme,
+        zoom,
+        log_wrap,
+        log_view_raw,
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn save_log_wrap_to(prefs: &mut rune::prefs::Prefs, wrap: bool) {
-    let _ = prefs.set(PREF_LOG_WRAP_KEY, &wrap);
+pub(crate) fn save_theme_to(
+    prefs: &mut rune::prefs::Prefs,
+    mode: crate::theme::ThemeMode,
+) -> Result<(), String> {
+    write_prefs_with(prefs, |p| p.set(PREF_THEME_KEY, mode.as_str()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_zoom_to(
+    prefs: &mut rune::prefs::Prefs,
+    zoom: Option<f32>,
+) -> Result<(), String> {
+    write_prefs_with(prefs, |p| match zoom.and_then(sanitize_zoom) {
+        Some(z) => p.set(PREF_ZOOM_KEY, &z),
+        None => p.remove(PREF_ZOOM_KEY),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_log_wrap_to(prefs: &mut rune::prefs::Prefs, wrap: bool) -> Result<(), String> {
+    write_prefs_with(prefs, |p| p.set(PREF_LOG_WRAP_KEY, &wrap))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_log_view_raw_to(
+    prefs: &mut rune::prefs::Prefs,
+    raw: bool,
+) -> Result<(), String> {
+    write_prefs_with(prefs, |p| p.set(PREF_LOG_VIEW_RAW_KEY, &raw))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -252,14 +485,19 @@ pub(crate) fn load_auto_update_from(prefs: &rune::prefs::Prefs) -> Option<bool> 
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn save_auto_update_to(prefs: &mut rune::prefs::Prefs, enabled: bool) {
-    let _ = prefs.set(PREF_AUTO_UPDATE_KEY, &enabled);
+pub(crate) fn save_auto_update_to(
+    prefs: &mut rune::prefs::Prefs,
+    enabled: bool,
+) -> Result<(), String> {
+    write_prefs_with(prefs, |p| p.set(PREF_AUTO_UPDATE_KEY, &enabled))
 }
 
-fn load_auto_update_pref() -> Option<bool> {
+fn load_auto_update_pref(
+    #[cfg(not(target_arch = "wasm32"))] path: Option<&std::path::Path>,
+) -> Option<bool> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+        let prefs = open_prefs(path);
         load_auto_update_from(&prefs)
     }
     #[cfg(target_arch = "wasm32")]
@@ -268,23 +506,29 @@ fn load_auto_update_pref() -> Option<bool> {
     }
 }
 
-fn save_auto_update_pref(enabled: bool) {
+fn save_auto_update_pref(
+    #[cfg(not(target_arch = "wasm32"))] path: Option<&std::path::Path>,
+    enabled: bool,
+) -> Result<(), String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
-        save_auto_update_to(&mut prefs, enabled);
+        let mut prefs = open_prefs(path);
+        save_auto_update_to(&mut prefs, enabled)
     }
     #[cfg(target_arch = "wasm32")]
     {
         let _ = enabled;
+        Ok(())
     }
 }
 
-fn load_window_prefs() -> (Option<crate::theme::ThemeMode>, Option<f32>, Option<bool>) {
+fn load_window_prefs(
+    #[cfg(not(target_arch = "wasm32"))] path: Option<&std::path::Path>,
+) -> WindowPrefs {
     #[cfg(target_arch = "wasm32")]
     {
         let Some(s) = local_storage() else {
-            return (None, None, None);
+            return WindowPrefs::default();
         };
         let theme = s
             .get_item(THEME_STORAGE_KEY)
@@ -298,60 +542,116 @@ fn load_window_prefs() -> (Option<crate::theme::ThemeMode>, Option<f32>, Option<
             .flatten()
             .and_then(|v| v.parse::<f32>().ok())
             .and_then(sanitize_zoom);
-        let log_wrap = s
-            .get_item(LOG_WRAP_STORAGE_KEY)
-            .ok()
-            .flatten()
-            .and_then(|v| match v.trim() {
+        let parse_bool = |key: &str| {
+            s.get_item(key).ok().flatten().and_then(|v| match v.trim() {
                 "true" => Some(true),
                 "false" => Some(false),
                 _ => None,
-            });
-        (theme, zoom, log_wrap)
+            })
+        };
+        WindowPrefs {
+            theme,
+            zoom,
+            log_wrap: parse_bool(LOG_WRAP_STORAGE_KEY),
+            log_view_raw: parse_bool(LOG_VIEW_RAW_STORAGE_KEY),
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+        let prefs = open_prefs(path);
         load_prefs_from(&prefs)
     }
 }
 
-fn save_theme_pref(mode: crate::theme::ThemeMode) {
+fn save_connection_pref(
+    #[cfg(not(target_arch = "wasm32"))] path: Option<&std::path::Path>,
+    server: &str,
+    token: &str,
+) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
-    if let Some(s) = local_storage() {
-        let _ = s.set_item(THEME_STORAGE_KEY, mode.as_str());
+    {
+        let server = normalize_server(server);
+        let token = token.trim();
+        let default = normalize_server(&default_server());
+        if server.is_empty() || server == default {
+            remove_storage_item(SERVER_STORAGE_KEY)?;
+        } else {
+            save_storage_item(SERVER_STORAGE_KEY, &server)?;
+        }
+        if token.is_empty() {
+            remove_storage_item(TOKEN_KEY)?;
+        } else {
+            save_storage_item(TOKEN_KEY, token)?;
+        }
+        Ok(())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
-        save_theme_to(&mut prefs, mode);
+        let mut prefs = open_prefs(path);
+        save_connection_to(&mut prefs, server, token)
     }
 }
 
-fn save_zoom_pref(zoom: Option<f32>) {
+fn save_theme_pref(
+    #[cfg(not(target_arch = "wasm32"))] path: Option<&std::path::Path>,
+    mode: crate::theme::ThemeMode,
+) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
-    if let Some(s) = local_storage() {
-        let _ = match zoom.and_then(sanitize_zoom) {
-            Some(z) => s.set_item(ZOOM_STORAGE_KEY, &format!("{z}")),
-            None => s.remove_item(ZOOM_STORAGE_KEY),
-        };
+    {
+        save_storage_item(THEME_STORAGE_KEY, mode.as_str())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
-        save_zoom_to(&mut prefs, zoom);
+        let mut prefs = open_prefs(path);
+        save_theme_to(&mut prefs, mode)
     }
 }
 
-fn save_log_wrap_pref(wrap: bool) {
+fn save_zoom_pref(
+    #[cfg(not(target_arch = "wasm32"))] path: Option<&std::path::Path>,
+    zoom: Option<f32>,
+) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
-    if let Some(s) = local_storage() {
-        let _ = s.set_item(LOG_WRAP_STORAGE_KEY, if wrap { "true" } else { "false" });
+    {
+        match zoom.and_then(sanitize_zoom) {
+            Some(z) => save_storage_item(ZOOM_STORAGE_KEY, &format!("{z}")),
+            None => remove_storage_item(ZOOM_STORAGE_KEY),
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
-        save_log_wrap_to(&mut prefs, wrap);
+        let mut prefs = open_prefs(path);
+        save_zoom_to(&mut prefs, zoom)
+    }
+}
+
+fn save_log_wrap_pref(
+    #[cfg(not(target_arch = "wasm32"))] path: Option<&std::path::Path>,
+    wrap: bool,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        save_storage_item(LOG_WRAP_STORAGE_KEY, if wrap { "true" } else { "false" })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut prefs = open_prefs(path);
+        save_log_wrap_to(&mut prefs, wrap)
+    }
+}
+
+fn save_log_view_raw_pref(
+    #[cfg(not(target_arch = "wasm32"))] path: Option<&std::path::Path>,
+    raw: bool,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        save_storage_item(LOG_VIEW_RAW_STORAGE_KEY, if raw { "true" } else { "false" })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut prefs = open_prefs(path);
+        save_log_view_raw_to(&mut prefs, raw)
     }
 }
 
@@ -366,6 +666,7 @@ pub enum Slot {
     Run,
     Log,
     Config,
+    SaveConfig,
     System,
     Workflows,
     Trigger,
@@ -377,7 +678,7 @@ pub enum Slot {
     TestDiscord,
 }
 
-const SLOTS: usize = 14;
+const SLOTS: usize = 15;
 
 fn slot_of(slot: Slot) -> usize {
     match slot {
@@ -386,15 +687,16 @@ fn slot_of(slot: Slot) -> usize {
         Slot::Run => 2,
         Slot::Log => 3,
         Slot::Config => 4,
-        Slot::System => 5,
-        Slot::Workflows => 6,
-        Slot::Trigger => 7,
-        Slot::Cancel => 8,
-        Slot::DeployChecks => 9,
-        Slot::ForceDeploy => 10,
-        Slot::Retry => 11,
-        Slot::ClearCache => 12,
-        Slot::TestDiscord => 13,
+        Slot::SaveConfig => 5,
+        Slot::System => 6,
+        Slot::Workflows => 7,
+        Slot::Trigger => 8,
+        Slot::Cancel => 9,
+        Slot::DeployChecks => 10,
+        Slot::ForceDeploy => 11,
+        Slot::Retry => 12,
+        Slot::ClearCache => 13,
+        Slot::TestDiscord => 14,
     }
 }
 
@@ -939,6 +1241,9 @@ pub struct State {
     pub(crate) zoom_track: std::cell::Cell<(u64, f32)>,
     /// Re-scroll run log to bottom once the next active `Answer::Log` arrives (run open / Tail<->Full).
     pub(crate) stick_log_pending: bool,
+    /// Optional preferences file override (used by unit tests for isolated persistence checks).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) prefs_path: Option<std::path::PathBuf>,
 }
 
 impl State {
@@ -1017,6 +1322,8 @@ impl State {
             shell_log_collapsed: false,
             zoom_track: std::cell::Cell::new((0, 1.0)),
             stick_log_pending: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            prefs_path: None,
         };
         state.ui_server = TextEdit::new(state.conn.server.clone());
         state.ui_token = TextEdit::new(state.conn.token.clone());
@@ -1027,27 +1334,42 @@ impl State {
         state
     }
 
-    /// Loads persisted window appearance, zoom, log-wrap, and update preferences (`localStorage` on web, `Prefs` natively).
+    /// Loads persisted window appearance, zoom, log, and update preferences (`localStorage` on web, `Prefs` natively).
     pub fn load_prefs(&mut self) {
-        let (theme, zoom, log_wrap) = load_window_prefs();
-        if let Some(mode) = theme {
+        #[cfg(not(target_arch = "wasm32"))]
+        let wp = load_window_prefs(self.prefs_path.as_deref());
+        #[cfg(target_arch = "wasm32")]
+        let wp = load_window_prefs();
+        if let Some(mode) = wp.theme {
             self.theme_mode = mode;
         }
-        if let Some(z) = zoom {
+        if let Some(z) = wp.zoom {
             self.user_zoom = Some(z);
         }
-        if let Some(wrap) = log_wrap {
+        if let Some(wrap) = wp.log_wrap {
             self.log_wrap = wrap;
         }
-        if let Some(auto_update) = load_auto_update_pref() {
+        if let Some(raw) = wp.log_view_raw {
+            self.log_view_raw = raw;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let auto_update = load_auto_update_pref(self.prefs_path.as_deref());
+        #[cfg(target_arch = "wasm32")]
+        let auto_update = load_auto_update_pref();
+        if let Some(auto_update) = auto_update {
             self.auto_update_check = auto_update;
         }
     }
 
     pub fn set_auto_update_check(&mut self, enabled: bool, tx: &mut Tx) {
         self.auto_update_check = enabled;
-        save_auto_update_pref(enabled);
-        let _ = tx;
+        #[cfg(not(target_arch = "wasm32"))]
+        let res = save_auto_update_pref(self.prefs_path.as_deref(), enabled);
+        #[cfg(target_arch = "wasm32")]
+        let res = save_auto_update_pref(enabled);
+        if let Err(err) = res {
+            self.toast(tx, ToastKind::Error, "Could not save settings", &err);
+        }
     }
 
     pub fn toggle_auto_update_check(&mut self, tx: &mut Tx) {
@@ -1104,15 +1426,26 @@ impl State {
     /// Updates window theme mode and persists it immediately, smoothly crossfading colors.
     pub fn set_theme_mode(&mut self, mode: crate::theme::ThemeMode, tx: &mut Tx) {
         self.theme_mode = mode;
-        save_theme_pref(mode);
         tx.color_motion(rune::tok::motion::SETTLE);
+        #[cfg(not(target_arch = "wasm32"))]
+        let res = save_theme_pref(self.prefs_path.as_deref(), mode);
+        #[cfg(target_arch = "wasm32")]
+        let res = save_theme_pref(mode);
+        if let Err(err) = res {
+            self.toast(tx, ToastKind::Error, "Could not save settings", &err);
+        }
     }
 
     /// Updates log word wrapping and persists it immediately.
     pub fn set_log_wrap(&mut self, wrap: bool, tx: &mut Tx) {
         self.log_wrap = wrap;
-        save_log_wrap_pref(wrap);
-        let _ = tx;
+        #[cfg(not(target_arch = "wasm32"))]
+        let res = save_log_wrap_pref(self.prefs_path.as_deref(), wrap);
+        #[cfg(target_arch = "wasm32")]
+        let res = save_log_wrap_pref(wrap);
+        if let Err(err) = res {
+            self.toast(tx, ToastKind::Error, "Could not save settings", &err);
+        }
     }
 
     /// Toggles log word wrapping and persists it immediately.
@@ -1120,12 +1453,30 @@ impl State {
         self.set_log_wrap(!self.log_wrap, tx);
     }
 
+    /// Updates the `Steps` | `Raw` log view preference and persists it immediately.
+    pub fn set_log_view_raw(&mut self, raw: bool, tx: &mut Tx) {
+        self.log_view_raw = raw;
+        #[cfg(not(target_arch = "wasm32"))]
+        let res = save_log_view_raw_pref(self.prefs_path.as_deref(), raw);
+        #[cfg(target_arch = "wasm32")]
+        let res = save_log_view_raw_pref(raw);
+        if let Err(err) = res {
+            self.toast(tx, ToastKind::Error, "Could not save settings", &err);
+        }
+    }
+
     /// Updates explicit UI zoom (`None` resets to the responsive default) and persists it.
     pub fn set_user_zoom(&mut self, zoom: Option<f32>, tx: &mut Tx) {
         let cleaned = zoom.and_then(sanitize_zoom);
         self.user_zoom = cleaned;
-        save_zoom_pref(cleaned);
         tx.instant();
+        #[cfg(not(target_arch = "wasm32"))]
+        let res = save_zoom_pref(self.prefs_path.as_deref(), cleaned);
+        #[cfg(target_arch = "wasm32")]
+        let res = save_zoom_pref(cleaned);
+        if let Err(err) = res {
+            self.toast(tx, ToastKind::Error, "Could not save settings", &err);
+        }
     }
 
     /// Effective zoom currently shown in the UI.
@@ -1155,14 +1506,43 @@ impl State {
 
     // -- connection ------------------------------------------------------------------------
 
-    /// Adopts the settings fields' URL and token and refreshes everything.
+    /// Adopts the Connection fields' URL and token, persists them locally, and reconnects.
     pub fn reconnect(&mut self, tx: &mut Tx) {
         // The Connection fields edit `ui_*`; take what the user typed.
         let prev_server = self.live.server.clone();
-        self.conn = conn_from_fields(&self.ui_server.text, &self.ui_token.text);
+        let raw = conn_from_fields(&self.ui_server.text, &self.ui_token.text);
+        // Persist the raw normalized server ("" clears a saved override back to default).
+        #[cfg(not(target_arch = "wasm32"))]
+        let save_res = save_connection_pref(self.prefs_path.as_deref(), &raw.server, &raw.token);
+        #[cfg(target_arch = "wasm32")]
+        let save_res = save_connection_pref(&raw.server, &raw.token);
+        if let Err(err) = save_res {
+            self.toast(tx, ToastKind::Error, "Could not save settings", &err);
+        }
+        let effective_server = if raw.server.is_empty() {
+            normalize_server(&default_server())
+        } else {
+            raw.server
+        };
+        self.conn = Conn {
+            server: effective_server.clone(),
+            token: raw.token,
+        };
         self.live = self.conn.clone();
-        self.live.server = normalize_server(&self.live.server);
-        store_token(&self.live.token);
+        if self.ui_server.text.trim().is_empty() {
+            self.ui_server = TextEdit::new(effective_server);
+        }
+        self.reset_and_connect(prev_server, tx);
+    }
+
+    /// Re-reads and reconnects using the active connection without overwriting saved preferences.
+    pub fn refresh_connection(&mut self, tx: &mut Tx) {
+        let prev_server = self.live.server.clone();
+        self.live.server = self.server();
+        self.reset_and_connect(prev_server, tx);
+    }
+
+    fn reset_and_connect(&mut self, prev_server: String, tx: &mut Tx) {
         self.link = Link::Connecting;
         self.demo = false;
         self.loaded = false;
@@ -1440,11 +1820,16 @@ impl State {
                         let next = projects.iter().find(|p| &p.name == name);
                         match (prev, next) {
                             (Some(a), Some(b)) => {
+                                let a_active = a.active_run_list();
+                                let b_active = b.active_run_list();
                                 a.running != b.running
                                     || a.last_run.as_ref().map(|r| (&r.id, r.status))
                                         != b.last_run.as_ref().map(|r| (&r.id, r.status))
-                                    || a.current_run.as_ref().map(|r| (&r.id, r.status))
-                                        != b.current_run.as_ref().map(|r| (&r.id, r.status))
+                                    || a_active.len() != b_active.len()
+                                    || a_active
+                                        .iter()
+                                        .zip(b_active.iter())
+                                        .any(|(ra, rb)| (&ra.id, ra.status) != (&rb.id, rb.status))
                             }
                             (None, Some(_)) => true,
                             _ => false,
@@ -1547,7 +1932,7 @@ impl State {
                     true
                 }
                 ServerMsg::ConfigUpdated => {
-                    if self.editor.loaded && !self.editor.dirty() {
+                    if self.editor.loaded && !self.editor.dirty() && !self.editor.saving {
                         self.request_config();
                     }
                     false
@@ -1907,13 +2292,18 @@ impl State {
         if self.editor.saving || !self.editor.loaded {
             return;
         }
+        if !self.demo && self.server().is_empty() {
+            return;
+        }
         self.editor.saving = true;
         self.editor.error = None;
         self.editor.field = None;
-        self.send(
-            Slot::Config,
-            Call::SaveConfig(self.editor.draft.to_string()),
-        );
+        if !self.demo {
+            self.send(
+                Slot::SaveConfig,
+                Call::SaveConfig(self.editor.draft.to_string()),
+            );
+        }
     }
 
     // -- answers ---------------------------------------------------------------------------
@@ -2005,7 +2395,16 @@ impl State {
                     entry.error = Some(failure.message());
                 }
             }
-            Call::Config | Call::SaveConfig(_) => {
+            Call::Config => {
+                if let Failure::Api { .. } = &failure {
+                    toast = Some((
+                        ToastKind::Error,
+                        "Config load failed".into(),
+                        failure.message(),
+                    ));
+                }
+            }
+            Call::SaveConfig(_) => {
                 self.editor.saving = false;
                 match failure.field_path() {
                     Some(field) => {
@@ -2185,18 +2584,29 @@ impl State {
                 }
             }
         }
+        let was_active_run = self.cancelling.as_deref().is_some_and(|cid| {
+            self.projects.iter().any(|p| {
+                p.active_run_list()
+                    .into_iter()
+                    .any(|r| r.id == cid && r.status.is_running())
+            })
+        });
         self.projects = projects;
         if let Some(cid) = self.cancelling.as_deref() {
             let still_running = self.projects.iter().any(|p| {
-                p.running
-                    && (p.name == cid
-                        || p.current_run
-                            .as_ref()
-                            .is_some_and(|r| r.id == cid && r.status.is_running()))
+                ((p.running || !p.active_runs.is_empty()) && p.name == cid)
+                    || p.active_run_list()
+                        .into_iter()
+                        .any(|r| r.id == cid && r.status.is_running())
             });
-            let finished_seen = self.projects.iter().any(|p| {
-                (!p.running && p.name == cid) || p.last_run.as_ref().is_some_and(|r| r.id == cid)
-            });
+            let finished_seen = was_active_run
+                || self.projects.iter().any(|p| {
+                    (!p.running && p.active_runs.is_empty() && p.name == cid)
+                        || p.last_run.as_ref().is_some_and(|r| r.id == cid)
+                        || p.active_run_list()
+                            .into_iter()
+                            .any(|r| r.id == cid && !r.status.is_running())
+                });
             if !still_running && finished_seen {
                 self.cancelling = None;
             }
@@ -2456,14 +2866,14 @@ impl State {
                 true
             }
             Answer::Config(cfg) => {
+                let was_dirty = self.editor.dirty();
                 self.editor.base = serde_json::to_value(&*cfg).unwrap_or(Value::Null);
-                // A reload never clobbers an edit in progress.
-                if !self.editor.dirty() {
+                // A reload never clobbers an edit in progress or an in-flight save.
+                if !was_dirty && !self.editor.saving {
                     self.editor.draft = self.editor.base.clone();
                     self.editor.reseed();
                 }
                 self.editor.loaded = true;
-                self.editor.saving = false;
                 self.after_draft_change();
                 true
             }
@@ -2698,8 +3108,11 @@ impl State {
             self.request_system();
         }
 
+        let has_server = !self.server().is_empty();
+
         // Start or retry the WebSocket transport when disconnected and allowed.
-        if !self.ws_connected
+        if has_server
+            && !self.ws_connected
             && !self.ws_connecting
             && !self.ws_disabled_until_reconnect
             && self.link != Link::Unauthorized
@@ -2724,7 +3137,7 @@ impl State {
                     self.request_runs(&name);
                 }
             }
-        } else if http_fallback && self.link != Link::Unauthorized {
+        } else if has_server && http_fallback && self.link != Link::Unauthorized {
             if self.clock >= self.next_projects {
                 self.next_projects = self.clock + PROJECTS_EVERY;
                 self.request_projects();
@@ -2762,8 +3175,20 @@ impl State {
         }
 
         // One wake for the nearest deadline, so an idle window draws nothing.
+        let due = self.next_poll_due();
+        if due.is_finite() {
+            tx.wake_at(if due > self.clock {
+                due
+            } else {
+                self.clock + 0.02
+            });
+        }
+        changed
+    }
+
+    pub(crate) fn next_poll_due(&self) -> f64 {
         let mut due = f64::INFINITY;
-        if !self.ws_connected && self.link != Link::Unauthorized {
+        if !self.server().is_empty() && !self.ws_connected && self.link != Link::Unauthorized {
             if self.ws_connecting {
                 due = due.min(self.ws_grace_until);
             } else {
@@ -2786,14 +3211,7 @@ impl State {
         if let Some(toast_due) = self.toasts.iter().map(|t| t.until).reduce(f64::min) {
             due = due.min(toast_due);
         }
-        if due.is_finite() {
-            tx.wake_at(if due > self.clock {
-                due
-            } else {
-                self.clock + 0.02
-            });
-        }
-        changed
+        due
     }
 
     /// Wakes `poll` right away without suppressing UI transitions.
@@ -2891,7 +3309,9 @@ impl State {
             self.request_config();
         }
         if page == SettingsPage::Diagnostics {
-            self.request_system();
+            if !self.bus.wants_any(Slot::System) {
+                self.request_system();
+            }
             self.next_system = self.clock + 30.0;
         }
         if page == SettingsPage::Deploy {
@@ -3363,7 +3783,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_zoom_and_log_wrap_prefs_round_trip() {
+    fn all_prefs_round_trip_and_preserve_unix_permissions() {
         let dir = std::env::temp_dir().join(format!("lunacy-ui-prefs-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -3371,44 +3791,345 @@ mod tests {
 
         {
             let mut prefs = rune::prefs::Prefs::at(&path);
-            save_theme_to(&mut prefs, crate::theme::ThemeMode::Oled);
-            save_zoom_to(&mut prefs, Some(1.25));
-            save_log_wrap_to(&mut prefs, false);
+            save_connection_to(&mut prefs, "127.0.0.1:9090/", "  secret-token\n")
+                .expect("save connection");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)
+                    .expect("metadata after conn save")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "prefs.json must be 0o600 after conn save");
+            }
+            save_theme_to(&mut prefs, crate::theme::ThemeMode::Oled).expect("save theme");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)
+                    .expect("metadata after theme save")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode, 0o600,
+                    "prefs.json must remain 0o600 after non-connection pref write"
+                );
+            }
+            save_zoom_to(&mut prefs, Some(1.25)).expect("save zoom");
+            save_log_wrap_to(&mut prefs, false).expect("save log_wrap");
+            save_log_view_raw_to(&mut prefs, true).expect("save log_view_raw");
+            save_auto_update_to(&mut prefs, false).expect("save auto_update");
         }
 
         let reopened = rune::prefs::Prefs::at(&path);
         assert_eq!(
-            load_prefs_from(&reopened),
-            (Some(crate::theme::ThemeMode::Oled), Some(1.25), Some(false))
+            load_connection_from(&reopened),
+            (
+                Some("http://127.0.0.1:9090".into()),
+                Some("secret-token".into())
+            )
         );
+        assert_eq!(
+            load_prefs_from(&reopened),
+            WindowPrefs {
+                theme: Some(crate::theme::ThemeMode::Oled),
+                zoom: Some(1.25),
+                log_wrap: Some(false),
+                log_view_raw: Some(true),
+            }
+        );
+        assert_eq!(load_auto_update_from(&reopened), Some(false));
 
+        // Clearing server/token, resetting zoom, and flipping bools persist cleanly.
         {
             let mut prefs = rune::prefs::Prefs::at(&path);
-            save_zoom_to(&mut prefs, None);
-            save_log_wrap_to(&mut prefs, true);
+            save_connection_to(&mut prefs, "  ", "").expect("clear connection");
+            save_zoom_to(&mut prefs, None).expect("clear zoom");
+            save_log_wrap_to(&mut prefs, true).expect("save log_wrap true");
+            save_log_view_raw_to(&mut prefs, false).expect("save log_view_raw false");
+            save_auto_update_to(&mut prefs, true).expect("save auto_update true");
         }
         let reset = rune::prefs::Prefs::at(&path);
+        assert_eq!(load_connection_from(&reset), (None, None));
+        assert!(!reset.contains(PREF_SERVER_KEY));
+        assert!(!reset.contains(PREF_TOKEN_KEY));
         assert_eq!(
             load_prefs_from(&reset),
-            (Some(crate::theme::ThemeMode::Oled), None, Some(true))
+            WindowPrefs {
+                theme: Some(crate::theme::ThemeMode::Oled),
+                zoom: None,
+                log_wrap: Some(true),
+                log_view_raw: Some(false),
+            }
         );
+        assert_eq!(load_auto_update_from(&reset), Some(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn log_wrap_defaults_true_and_toggles() {
+    fn conn_from_sources_strict_precedence() {
+        let def = DEFAULT_SERVER.to_string();
+
+        // 4. Built-in defaults when nothing else is set.
+        assert_eq!(
+            conn_from_sources(Vec::<&str>::new(), None, None, None, None, def.clone()),
+            Conn {
+                server: DEFAULT_SERVER.into(),
+                token: String::new(),
+            }
+        );
+
+        // 3. Saved preferences win over built-in defaults.
+        assert_eq!(
+            conn_from_sources(
+                Vec::<&str>::new(),
+                None,
+                None,
+                Some("http://saved:8181/".into()),
+                Some("saved-tok".into()),
+                def.clone(),
+            ),
+            Conn {
+                server: "http://saved:8181".into(),
+                token: "saved-tok".into(),
+            }
+        );
+
+        // 2. CLI flags win over saved preferences, including explicit empty `--token ""`
+        //    and `--token wrong-token` (used by E2E T1).
+        assert_eq!(
+            conn_from_sources(
+                ["--server", "127.0.0.1:9000/", "--token", "wrong-token"],
+                None,
+                None,
+                Some("http://saved:8181".into()),
+                Some("saved-tok".into()),
+                def.clone(),
+            ),
+            Conn {
+                server: "http://127.0.0.1:9000".into(),
+                token: "wrong-token".into(),
+            }
+        );
+        assert_eq!(
+            conn_from_sources(
+                ["--token", ""],
+                None,
+                None,
+                Some("http://saved:8181".into()),
+                Some("saved-tok".into()),
+                def.clone(),
+            ),
+            Conn {
+                server: "http://saved:8181".into(),
+                token: String::new(),
+            }
+        );
+        assert_eq!(
+            conn_from_sources(
+                ["--server=https://cli.example:443/", "--token="],
+                None,
+                None,
+                Some("http://saved:8181".into()),
+                Some("saved-tok".into()),
+                def.clone(),
+            ),
+            Conn {
+                server: "https://cli.example:443".into(),
+                token: String::new(),
+            }
+        );
+
+        // 1. Environment variables win over CLI flags and saved preferences.
+        assert_eq!(
+            conn_from_sources(
+                ["--server", "http://cli:1", "--token", "cli-tok"],
+                Some("https://env.example:8443/".into()),
+                Some("  env-tok  ".into()),
+                Some("http://saved:8181".into()),
+                Some("saved-tok".into()),
+                def.clone(),
+            ),
+            Conn {
+                server: "https://env.example:8443".into(),
+                token: "env-tok".into(),
+            }
+        );
+
+        // Whitespace-only env vars are ignored and fall through to CLI / saved prefs.
+        assert_eq!(
+            conn_from_sources(
+                ["--server", "http://cli:1"],
+                Some("   ".into()),
+                Some(" \n ".into()),
+                Some("http://saved:8181".into()),
+                Some("saved-tok".into()),
+                def.clone(),
+            ),
+            Conn {
+                server: "http://cli:1".into(),
+                token: "saved-tok".into(),
+            }
+        );
+
+        // Explicit empty `--server ""` ignores saved server and falls back to default_server
+        // instead of leaving the live window with an empty server URL.
+        assert_eq!(
+            conn_from_sources(
+                ["--server", "   "],
+                None,
+                None,
+                Some("http://saved:8181".into()),
+                Some("saved-tok".into()),
+                def,
+            ),
+            Conn {
+                server: DEFAULT_SERVER.into(),
+                token: "saved-tok".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn clearing_server_on_reconnect_restores_default_and_clears_saved_override() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunacy-ui-clear-server-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app_dir = dir.join(PREFS_APP_ID);
+        let path = app_dir.join("prefs.json");
+
+        let mut s = State::new(Conn {
+            server: "http://custom:9090".into(),
+            token: "tok-1".into(),
+        });
+        s.prefs_path = Some(path.clone());
+        s.ui_server = TextEdit::new("http://custom:9090");
+        s.ui_token = TextEdit::new("tok-1");
+        let mut tx = Tx::default();
+        s.reconnect(&mut tx);
+        s.bus.cancel();
+        s.ws.disconnect();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&app_dir)
+                .expect("app dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            let file_mode = std::fs::metadata(&path)
+                .expect("prefs metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600);
+        }
+
+        // Clearing Server URL removes the persisted override and falls back to default_server().
+        s.ui_server = TextEdit::new("   ");
+        s.ui_token = TextEdit::new("");
+        s.reconnect(&mut tx);
+        s.bus.cancel();
+        s.ws.disconnect();
+
+        assert_eq!(s.conn.server, normalize_server(&default_server()));
+        assert_eq!(s.live.server, normalize_server(&default_server()));
+        assert_eq!(s.ui_server.text, normalize_server(&default_server()));
+        assert!(s.conn.token.is_empty());
+
+        let reopened = rune::prefs::Prefs::at(&path);
+        assert_eq!(load_connection_from(&reopened), (None, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poll_with_empty_server_does_not_schedule_spin_wake() {
         let mut s = State::new(Conn::default());
+        s.ready = true;
+        s.auto_update_check = false;
+        let mut tx = Tx::default();
+        let _ = s.poll(10.0, &mut tx);
+        assert!(!s.ws_connecting);
+        assert!(
+            !s.next_poll_due().is_finite(),
+            "expected no wake deadline when server is empty"
+        );
+    }
+
+    #[test]
+    fn log_wrap_defaults_true_and_toggles() {
+        let dir = std::env::temp_dir().join(format!("lunacy-ui-wrap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = State::new(Conn::default());
+        s.prefs_path = Some(dir.join("prefs.json"));
         assert!(s.log_wrap);
         let mut tx = Tx::default();
         s.toggle_log_wrap(&mut tx);
         assert!(!s.log_wrap);
         s.set_log_wrap(true, &mut tx);
         assert!(s.log_wrap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_view_raw_persists_and_surfaces_save_error_toast() {
+        let dir = std::env::temp_dir().join(format!("lunacy-ui-raw-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("prefs.json");
+
+        let mut s = State::new(Conn::default());
+        s.prefs_path = Some(path.clone());
+        assert!(!s.log_view_raw);
+        let mut tx = Tx::default();
+        s.set_log_view_raw(true, &mut tx);
+        assert!(s.log_view_raw);
+        assert!(s.toasts.is_empty());
+
+        let mut reloaded = State::new(Conn::default());
+        reloaded.prefs_path = Some(path);
+        reloaded.load_prefs();
+        assert!(reloaded.log_view_raw);
+
+        // Pointing prefs_path at a directory forces an I/O write error and shows an error toast,
+        // without stripping +x bits on the directory via chmod 0600.
+        let bad_dir = dir.join("is-a-dir");
+        std::fs::create_dir_all(&bad_dir).expect("bad dir");
+        let mut failing = State::new(Conn::default());
+        failing.prefs_path = Some(bad_dir.clone());
+        failing.set_log_view_raw(true, &mut tx);
+        let toast = failing.toasts.last().expect("error toast on save failure");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(toast.title, "Could not save settings");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bad_dir)
+                .expect("bad dir metadata")
+                .permissions()
+                .mode();
+            assert_ne!(
+                mode & 0o100,
+                0,
+                "directory execute bit must not be stripped"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn step_zoom_advances_clamps_and_resets() {
+        let dir = std::env::temp_dir().join(format!("lunacy-ui-zoom-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let mut s = State::new(Conn::default());
+        s.prefs_path = Some(dir.join("prefs.json"));
         let mut tx = Tx::default();
         s.zoom_track.set((1, 1.1));
         assert_eq!(s.user_zoom, None);
@@ -3434,6 +4155,7 @@ mod tests {
 
         s.set_user_zoom(None, &mut tx);
         assert_eq!(s.user_zoom, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3834,11 +4556,49 @@ mod tests {
         let path = dir.join("prefs.json");
         {
             let mut prefs = rune::prefs::Prefs::at(&path);
-            save_auto_update_to(&mut prefs, false);
+            save_auto_update_to(&mut prefs, false).expect("save auto_update");
         }
         let reopened = rune::prefs::Prefs::at(&path);
         assert_eq!(load_auto_update_from(&reopened), Some(false));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_reload_when_clean_updates_draft_and_preserves_in_flight_save() {
+        let mut s = State::new(Conn::default());
+        let mut tx = Tx::default();
+
+        let mut cfg_v1 = crate::demo::config();
+        cfg_v1.general.poll_interval = 30;
+        s.apply(Call::Config, Answer::Config(Box::new(cfg_v1)), &mut tx);
+        assert!(s.editor.loaded);
+        assert!(!s.editor.dirty());
+        assert_eq!(
+            paths::get_u64(&s.editor.draft, "general.poll_interval"),
+            Some(30)
+        );
+
+        // External reload while clean must update draft to the new base without becoming dirty.
+        let mut cfg_v2 = crate::demo::config();
+        cfg_v2.general.poll_interval = 90;
+        s.apply(Call::Config, Answer::Config(Box::new(cfg_v2)), &mut tx);
+        assert!(!s.editor.dirty());
+        assert_eq!(
+            paths::get_u64(&s.editor.draft, "general.poll_interval"),
+            Some(90)
+        );
+
+        // While a save is in flight, a stray Answer::Config must not clear `saving` or clobber draft.
+        paths::set_u64(&mut s.editor.draft, "general.poll_interval", Some(120));
+        s.editor.saving = true;
+        let mut cfg_v3 = crate::demo::config();
+        cfg_v3.general.poll_interval = 45;
+        s.apply(Call::Config, Answer::Config(Box::new(cfg_v3)), &mut tx);
+        assert!(s.editor.saving);
+        assert_eq!(
+            paths::get_u64(&s.editor.draft, "general.poll_interval"),
+            Some(120)
+        );
     }
 
     #[test]
@@ -4035,6 +4795,184 @@ mod tests {
         assert_eq!(err_toast.kind, ToastKind::Error);
         assert_eq!(err_toast.title, "Could not retry run");
         assert_eq!(err_toast.body, "unknown run");
+    }
+
+    #[test]
+    fn projects_updated_tracks_all_active_runs_and_cancelling_cleanup() {
+        use crate::model::{Project as ProjectModel, Run, RunStatus};
+        use crate::ws::{ServerMsg, WsEvent};
+
+        let make_run = |id: &str, status: RunStatus| Run {
+            id: id.into(),
+            project: "lunarum".into(),
+            status,
+            ..Run::default()
+        };
+
+        let mut s = State::new(Conn::default());
+        let mut tx = Tx::default();
+        let gen = s.ws.generation();
+
+        let r1 = make_run("r-1", RunStatus::Running);
+        let r2 = make_run("r-2", RunStatus::Running);
+        let p_two = ProjectModel {
+            name: "lunarum".into(),
+            running: true,
+            current_run: Some(r2.clone()),
+            active_runs: vec![r1.clone(), r2.clone()],
+            max_concurrent_runs: 3,
+            ..ProjectModel::default()
+        };
+
+        s.view = View::Project {
+            name: "lunarum".into(),
+        };
+        s.apply_projects(vec![p_two.clone()], &mut tx);
+        s.runs_loading = false;
+
+        // Identical active_runs should NOT trigger a history refresh.
+        s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::ProjectsUpdated {
+                projects: vec![p_two.clone()],
+            }),
+            &mut tx,
+        );
+        assert!(!s.runs_loading);
+
+        // Changing a secondary slot in active_runs (while running, current_run, and last_run
+        // stay identical) MUST trigger a history refresh.
+        let r1_replaced = make_run("r-1b", RunStatus::Running);
+        let mut p_secondary_changed = p_two.clone();
+        p_secondary_changed.active_runs = vec![r1_replaced, r2.clone()];
+        s.handle_ws_event(
+            gen,
+            WsEvent::Message(ServerMsg::ProjectsUpdated {
+                projects: vec![p_secondary_changed],
+            }),
+            &mut tx,
+        );
+        assert!(
+            s.runs_loading,
+            "expected ProjectsUpdated to refresh history when secondary active_runs slot changes"
+        );
+
+        // Reset to [r1, r2] and test `cancelling` preservation & clearing across active_runs.
+        s.apply_projects(vec![p_two.clone()], &mut tx);
+        s.cancelling = Some("r-1".into());
+
+        // While r-1 is still running in active_runs (even though current_run is r-2), keep cancelling.
+        s.apply_projects(vec![p_two.clone()], &mut tx);
+        assert_eq!(
+            s.cancelling.as_deref(),
+            Some("r-1"),
+            "cancelling must be preserved while r-1 is still running in active_runs"
+        );
+
+        // Once r-1 leaves active_runs (r-2 still running, r-1 in last_run), clear cancelling.
+        let mut p_r1_done = p_two.clone();
+        p_r1_done.active_runs = vec![r2.clone()];
+        p_r1_done.current_run = Some(r2.clone());
+        p_r1_done.last_run = Some(make_run("r-1", RunStatus::Cancelled));
+        s.apply_projects(vec![p_r1_done], &mut tx);
+        assert_eq!(
+            s.cancelling, None,
+            "cancelling must clear once r-1 finishes even while r-2 remains active"
+        );
+
+        // Even if another run overwrites last_run simultaneously, r-1 vanishing from active_runs clears cancelling.
+        s.apply_projects(vec![p_two.clone()], &mut tx);
+        s.cancelling = Some("r-1".into());
+        let mut p_both_done = p_two.clone();
+        p_both_done.running = false;
+        p_both_done.active_runs.clear();
+        p_both_done.current_run = None;
+        p_both_done.last_run = Some(make_run("r-2", RunStatus::Success));
+        s.apply_projects(vec![p_both_done.clone()], &mut tx);
+        assert_eq!(s.cancelling, None);
+
+        // Project-wide cancel stays set while any active_run remains, and clears once all finish.
+        s.apply_projects(vec![p_two], &mut tx);
+        s.cancelling = Some("lunarum".into());
+        let mut p_one_left = p_both_done.clone();
+        p_one_left.running = true;
+        p_one_left.active_runs = vec![r2.clone()];
+        p_one_left.current_run = Some(r2);
+        s.apply_projects(vec![p_one_left], &mut tx);
+        assert_eq!(s.cancelling.as_deref(), Some("lunarum"));
+        s.apply_projects(vec![p_both_done], &mut tx);
+        assert_eq!(s.cancelling, None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn open_diagnostics_keeps_in_flight_startup_system_request() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_srv = Arc::clone(&requests);
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(false);
+            if let Ok((mut stream, _)) = listener.accept() {
+                requests_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 512];
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.read(&mut buf);
+                let _ = accepted_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        let mut s = State::new(Conn {
+            server: format!("http://{addr}"),
+            token: String::new(),
+        });
+        let mut tx = Tx::default();
+
+        s.request_system();
+        accepted_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("startup /api/system request should reach server");
+        assert!(s.bus.wants_any(Slot::System));
+
+        // Opening Diagnostics while startup /api/system is in flight must not cancel/restart it.
+        s.open_settings(SettingsPage::Diagnostics, &mut tx);
+        assert!(s.bus.wants_any(Slot::System));
+        let _ = release_tx.send(());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while s.system.is_none() && Instant::now() < deadline {
+            for (call, out) in s.bus.drain() {
+                if let Ok(ans) = out {
+                    s.apply(call, ans, &mut tx);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let _ = server.join();
+        assert!(
+            s.system.is_some(),
+            "in-flight startup /api/system response should populate state.system"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "open_settings(Diagnostics) must not issue a second /api/system request while one is in flight"
+        );
     }
 }
 

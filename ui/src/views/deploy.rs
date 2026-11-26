@@ -4,10 +4,11 @@
 use rune::{col, el, icon, row, text, Cx, El, Tx};
 use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, Kit};
 
-use crate::model::{CheckItem, CheckLevel, DeployProjectCheck, DeployStepCheck, ProjectState};
+use crate::icons;
+use crate::model::{CheckItem, CheckLevel, DeployProjectCheck, DeployStepCheck};
 use crate::state::State;
 use crate::theme;
-use crate::widgets::{self, duration, mono_chip, short_sha};
+use crate::widgets::{self, duration};
 
 pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     let mut c = col()
@@ -23,6 +24,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     } else {
         "Re-check"
     })
+    .icon(&icons::REFRESH_CW)
     .variant(ButtonVariant::Outline)
     .control_size(ControlSize::Small)
     .disabled(s.deploy_checks_loading)
@@ -122,7 +124,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
         .radius(k.radius.lg)
         .fill(k.c.layer_02)
         .border(1.0, k.c.border_base)
-        .child(widgets::caption(k, "HOST & DEFAULTS"))
+        .child(widgets::caption_icon(k, &icons::SERVER, "HOST & DEFAULTS"))
         .child(widgets::kv_for(
             k,
             compact,
@@ -175,13 +177,14 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
 
 fn overall_pill(k: &Kit, level: CheckLevel) -> El {
     let st = theme::status(k);
-    let (label, ink) = match level {
-        CheckLevel::Ok => ("Ready", st.success),
-        CheckLevel::Warn => ("Warnings", st.error),
-        CheckLevel::Error => ("Issues", st.failure),
-        CheckLevel::Other => ("Unknown", st.pending),
-    };
-    widgets::pill(k, label, ink)
+    match level {
+        CheckLevel::Ok => widgets::pill_with_icon(k, &icons::CHECK_CIRCLE, "Ready", st.success),
+        CheckLevel::Warn => {
+            widgets::pill_with_icon(k, &icons::ALERT_TRIANGLE, "Warnings", st.error)
+        }
+        CheckLevel::Error => widgets::pill_with_icon(k, &icons::X_CIRCLE, "Issues", st.failure),
+        CheckLevel::Other => widgets::pill(k, "Unknown", st.pending),
+    }
 }
 
 fn check_ink(k: &Kit, level: CheckLevel) -> rune::Color {
@@ -198,7 +201,7 @@ fn check_row(k: &Kit, item: &CheckItem, compact: bool) -> El {
     let ink = check_ink(k, item.level);
     let marker = match item.level {
         CheckLevel::Ok => icon(&glyphs::CHECK_SMALL, 13.0).color(ink).mt(2.0),
-        CheckLevel::Warn => widgets::dot(ink, 7.0).mt(5.0),
+        CheckLevel::Warn => icon(&icons::ALERT_TRIANGLE, 13.0).color(ink).mt(2.0),
         CheckLevel::Error => icon(&glyphs::CIRCLE_X, 13.0).color(ink).mt(2.0),
         CheckLevel::Other => widgets::dot(ink, 7.0).mt(5.0),
     };
@@ -252,6 +255,7 @@ fn project_card(
     let config_idx = project_config_index(&s.editor, &proj.name, idx);
 
     let edit_btn = Button::new("Edit")
+        .icon(&icons::EDIT)
         .variant(ButtonVariant::Outline)
         .control_size(ControlSize::Small)
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_project_form(config_idx, tx))
@@ -261,6 +265,7 @@ fn project_card(
     let last_run_btn = proj.last_deploy.as_ref().map(|last| {
         let run_id = last.run_id.clone();
         Button::new("Open last run")
+            .icon(&icons::HISTORY)
             .variant(ButtonVariant::Ghost)
             .control_size(ControlSize::Small)
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_run(&run_id, tx))
@@ -271,7 +276,7 @@ fn project_card(
     let busy = s
         .projects
         .iter()
-        .any(|p| p.name == proj.name && p.state() == ProjectState::Running);
+        .any(|p| p.name == proj.name && p.at_concurrency_limit());
     let deploying = s.force_deploying.as_deref() == Some(proj.name.as_str());
     let force_deploy_btn = (proj.deploy_total_steps > 0).then(|| {
         let deploy_name = proj.name.clone();
@@ -280,11 +285,12 @@ fn project_card(
         } else {
             "Force deploy"
         })
+        .icon(&icons::ROCKET)
         .variant(ButtonVariant::Outline)
         .control_size(ControlSize::Small)
         .disabled(deploying || busy)
         .help(if busy {
-            "Already running"
+            "Concurrency limit reached"
         } else {
             "Queue a deploy-only run for the current commit"
         })
@@ -306,7 +312,7 @@ fn project_card(
                 .min_w(0.0),
         )
         .child(overall_pill(k, proj.overall))
-        .children((!proj.enabled).then(|| widgets::pill(k, "Paused", k.c.text_faint)));
+        .children((!proj.enabled).then(|| widgets::paused_pill(k)));
     if !compact {
         header = header.child(el().grow(1.0));
     }
@@ -500,20 +506,22 @@ fn project_card(
         );
 
     if !proj.checks.is_empty() {
-        let mut checks_col = col()
-            .w_full()
-            .gap(6.0)
-            .child(widgets::caption(k, "PRE-FLIGHT CHECKS"));
+        let mut checks_col = col().w_full().gap(6.0).child(widgets::caption_icon(
+            k,
+            &icons::LIST_CHECKS,
+            "PRE-FLIGHT CHECKS",
+        ));
         for item in &proj.checks {
             checks_col = checks_col.child(check_row(k, item, compact));
         }
         card = card.child(widgets::divider(k)).child(checks_col);
     }
 
-    let mut steps_col = col()
-        .w_full()
-        .gap(8.0)
-        .child(widgets::caption(k, "DEPLOY STEPS"));
+    let mut steps_col =
+        col()
+            .w_full()
+            .gap(8.0)
+            .child(widgets::caption_icon(k, &icons::ROCKET, "DEPLOY STEPS"));
     if proj.deploy_steps.is_empty() {
         steps_col = steps_col.child(
             text("No deploy steps configured for this project.")
@@ -529,16 +537,17 @@ fn project_card(
     card = card.child(widgets::divider(k)).child(steps_col);
 
     if let Some(last) = &proj.last_deploy {
-        let mut last_col = col()
-            .w_full()
-            .gap(8.0)
-            .child(widgets::caption(k, "LAST DEPLOY"));
+        let mut last_col =
+            col()
+                .w_full()
+                .gap(8.0)
+                .child(widgets::caption_icon(k, &icons::HISTORY, "LAST DEPLOY"));
         let mut meta = row()
             .w_full()
             .gap(8.0)
             .flex_wrap()
             .center_y()
-            .child(mono_chip(k, &short_sha(&last.sha)))
+            .child(widgets::sha_chip(k, &last.sha))
             .child(widgets::run_pill(k, last.status));
         if let Some(ts) = last.finished_at {
             meta = meta.child(
@@ -609,7 +618,16 @@ fn deploy_step_card(
                 .wrap()
                 .min_w(0.0),
         )
-        .child(widgets::pill(k, step.kind.clone(), k.c.text_muted))
+        .child(widgets::pill_with_icon(
+            k,
+            if step.kind == "act" {
+                &icons::BOX
+            } else {
+                &icons::TERMINAL
+            },
+            step.kind.clone(),
+            k.c.text_muted,
+        ))
         .child(host_pill)
         .child(
             text(format!("{}s", step.effective_timeout))

@@ -20,6 +20,10 @@ fn default_poll() -> u64 {
     300
 }
 
+fn default_max_concurrent_runs() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
@@ -50,6 +54,8 @@ pub struct General {
     pub shell: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_mode: Option<String>,
+    #[serde(default = "default_max_concurrent_runs")]
+    pub max_concurrent_runs: usize,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -62,6 +68,7 @@ impl Default for General {
             step_timeout: None,
             shell: None,
             trigger_mode: None,
+            max_concurrent_runs: default_max_concurrent_runs(),
             extra: extra(),
         }
     }
@@ -154,6 +161,8 @@ pub struct Act {
     pub cache: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -225,6 +234,8 @@ pub struct Project {
     pub platforms: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub act_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_runs: Option<usize>,
     #[serde(default)]
     pub ci: Vec<Step>,
     #[serde(default)]
@@ -633,6 +644,46 @@ mod tests {
             v["project"][0]["act_args"],
             serde_json::json!(["--pull=false"])
         );
+        let parsed: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn concurrency_fields_round_trip_and_default_cleanly() {
+        let defaults: Config = serde_json::from_value(serde_json::json!({
+            "general": {},
+            "project": [{"name": "alpha", "repo_path": "/srv/alpha"}]
+        }))
+        .unwrap();
+        assert_eq!(defaults.general.max_concurrent_runs, 1);
+        assert_eq!(defaults.act, None);
+        assert_eq!(defaults.projects[0].max_concurrent_runs, None);
+        let default_json = serde_json::to_value(&defaults).unwrap();
+        assert_eq!(default_json["general"]["max_concurrent_runs"], 1);
+        assert!(default_json["project"][0]
+            .get("max_concurrent_runs")
+            .is_none());
+
+        let cfg = Config {
+            general: General {
+                max_concurrent_runs: 4,
+                ..General::default()
+            },
+            act: Some(Act {
+                max_concurrent: Some(2),
+                ..Act::default()
+            }),
+            projects: vec![Project {
+                checkout: "worktree".into(),
+                max_concurrent_runs: Some(3),
+                ..Project::new("alpha")
+            }],
+            ..Config::default()
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["general"]["max_concurrent_runs"], 4);
+        assert_eq!(v["act"]["max_concurrent"], 2);
+        assert_eq!(v["project"][0]["max_concurrent_runs"], 3);
         let parsed: Config = serde_json::from_value(v).unwrap();
         assert_eq!(parsed, cfg);
     }

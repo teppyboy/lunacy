@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,7 @@ pub enum Outcome {
     Success,
     Failed(i32),
     Timeout,
+    Cancelled,
     Spawn,
 }
 
@@ -37,7 +39,15 @@ pub struct ExecResult {
     pub outcome: Outcome,
 }
 
-pub fn exec(spec: &ExecSpec, sink: Option<LineSink>) -> Result<ExecResult> {
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+pub fn exec(
+    spec: &ExecSpec,
+    sink: Option<LineSink>,
+    cancel: Option<&AtomicBool>,
+) -> Result<ExecResult> {
     if let Some(parent) = spec.log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating log dir {}", parent.display()))?;
@@ -45,6 +55,13 @@ pub fn exec(spec: &ExecSpec, sink: Option<LineSink>) -> Result<ExecResult> {
     let file = std::fs::File::create(&spec.log_path)
         .with_context(|| format!("creating log {}", spec.log_path.display()))?;
     let log = Arc::new(Mutex::new(file));
+
+    if is_cancelled(cancel) {
+        note(&log, sink.as_ref(), "[lunacy] cancelled before starting");
+        return Ok(ExecResult {
+            outcome: Outcome::Cancelled,
+        });
+    }
 
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
@@ -81,9 +98,16 @@ pub fn exec(spec: &ExecSpec, sink: Option<LineSink>) -> Result<ExecResult> {
     let pump_err = spawn_pump(err, log.clone(), sink.clone());
 
     let mut timed_out = false;
+    let mut cancelled = false;
     loop {
         match child.try_wait()? {
             Some(_) => break,
+            None if is_cancelled(cancel) => {
+                cancelled = true;
+                guard.kill(&mut child);
+                let _ = child.wait();
+                break;
+            }
             None if started.elapsed() >= spec.timeout => {
                 timed_out = true;
                 guard.kill(&mut child);
@@ -104,7 +128,14 @@ pub fn exec(spec: &ExecSpec, sink: Option<LineSink>) -> Result<ExecResult> {
     }
 
     let status = child.wait().ok();
-    let outcome = if timed_out {
+    let outcome = if cancelled {
+        note(
+            &log,
+            sink.as_ref(),
+            "[lunacy] cancelled; killed the process tree",
+        );
+        Outcome::Cancelled
+    } else if timed_out {
         note(
             &log,
             sink.as_ref(),
@@ -355,6 +386,7 @@ mod tests {
                 Duration::from_secs(10),
             ),
             Some(sink),
+            None,
         )
         .unwrap();
         assert_eq!(r.outcome, Outcome::Failed(1));
@@ -367,11 +399,13 @@ mod tests {
         let ok = exec(
             &spec(dir.path(), "true", &[], Duration::from_secs(10)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(ok.outcome, Outcome::Success);
         let bad = exec(
             &spec(dir.path(), "false", &[], Duration::from_secs(10)),
+            None,
             None,
         )
         .unwrap();
@@ -394,6 +428,7 @@ mod tests {
                 Duration::from_secs(10),
             ),
             Some(sink),
+            None,
         )
         .unwrap();
         assert_eq!(out.outcome, Outcome::Success);
@@ -420,6 +455,7 @@ mod tests {
                 Duration::from_millis(800),
             ),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(out.outcome, Outcome::Timeout);
@@ -434,6 +470,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancel_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let script = format!(
+            "( sleep 8; echo alive > {} ) & echo started; sleep 30",
+            marker.display()
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_trigger = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            cancel_trigger.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let out = exec(
+            &spec(dir.path(), "sh", &["-c", &script], Duration::from_secs(30)),
+            None,
+            Some(&cancel),
+        )
+        .unwrap();
+        assert_eq!(out.outcome, Outcome::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel took too long"
+        );
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert!(
+            log.contains("[lunacy] cancelled; killed the process tree"),
+            "{log}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "grandchild survived cancel kill");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_before_spawn_returns_cancelled_without_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let cancel = AtomicBool::new(true);
+        let out = exec(
+            &spec(
+                dir.path(),
+                "sh",
+                &["-c", &format!("touch {}", marker.display())],
+                Duration::from_secs(10),
+            ),
+            None,
+            Some(&cancel),
+        )
+        .unwrap();
+        assert_eq!(out.outcome, Outcome::Cancelled);
+        assert!(!marker.exists(), "process should not have spawned");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn missing_program_is_a_spawn_failure() {
         let dir = tempfile::tempdir().unwrap();
         let out = exec(
@@ -443,6 +536,7 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
             ),
+            None,
             None,
         )
         .unwrap();

@@ -8,6 +8,7 @@ pub mod api;
 pub mod config;
 pub mod configfile;
 pub mod daemon;
+pub mod deploy_check;
 pub mod discord;
 pub mod exec;
 pub mod git;

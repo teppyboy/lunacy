@@ -56,6 +56,8 @@ fn act_step_runs_the_workflow_and_records_substeps() {
         },
         args: Vec::new(),
         lock_file: None,
+        cache: true,
+        cache_dir: None,
     });
 
     let project = ProjectCfg {
@@ -66,12 +68,18 @@ fn act_step_runs_the_workflow_and_records_substeps() {
         github_repo: None,
         checkout: Checkout::None,
         poll_interval: None,
+        step_timeout: None,
+        timeout: None,
         env: Default::default(),
         contexts: Default::default(),
         discord_webhook_url: None,
         notify_on_start: None,
         shell: None,
         platforms: Default::default(),
+        watch_prs: false,
+        deploy_refs: Vec::new(),
+        watch_tags: false,
+        cache: None,
         ci: vec![StepCfg {
             name: "Workflow".into(),
             kind: StepKind::Act,
@@ -101,6 +109,7 @@ fn act_step_runs_the_workflow_and_records_substeps() {
         github: None,
         on_update: &on_update,
         act_lock: &act_lock,
+        cancel: None,
     };
     let run = pipeline::run_pipeline(&ctx, &project, &sha, Trigger::Manual);
 

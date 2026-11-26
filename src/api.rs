@@ -1,8 +1,10 @@
 //! HTTP API for the Rune UI (see `docs/api.md`) plus the GitHub App webhook.
 
-use crate::config::{Config, MASK};
+use crate::config::{self, Config, MASK};
 use crate::daemon::{Command, Shared};
+use crate::git;
 use crate::model::{self, Run, Trigger};
+use crate::pipeline::PrContext;
 
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
@@ -83,7 +85,7 @@ fn split_path(url: &str) -> (String, BTreeMap<String, String>) {
     (path.to_string(), params)
 }
 
-fn percent_decode(s: &str) -> String {
+fn percent_decode_impl(s: &str, plus_as_space: bool) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -102,7 +104,7 @@ fn percent_decode(s: &str) -> String {
                     }
                 }
             }
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -113,6 +115,14 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+fn percent_decode(s: &str) -> String {
+    percent_decode_impl(s, true)
+}
+
+fn percent_decode_path_segment(s: &str) -> String {
+    percent_decode_impl(s, false)
 }
 
 fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -194,7 +204,23 @@ fn handle(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
             .map_err(Into::into);
     }
 
-    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let segments_owned: Vec<String> = path
+        .trim_matches('/')
+        .split('/')
+        .map(percent_decode_path_segment)
+        .collect();
+    if segments_owned.iter().any(|s| {
+        s == "."
+            || s.contains("..")
+            || s.contains('/')
+            || s.contains('\\')
+            || s.chars().any(|c| c.is_ascii_control())
+    }) {
+        return request
+            .respond(error_response(400, "invalid path segment"))
+            .map_err(Into::into);
+    }
+    let segments: Vec<&str> = segments_owned.iter().map(String::as_str).collect();
     match (method, segments.as_slice()) {
         (Method::Get, ["api", "projects"]) => {
             let body = projects_json(state);
@@ -233,6 +259,15 @@ fn handle(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
         (Method::Post, ["api", "projects", name, "trigger"]) => {
             handle_trigger(state, request, name)
         }
+        (Method::Post, ["api", "projects", name, "deploy"]) => {
+            handle_deploy_project(state, request, name)
+        }
+        (Method::Post, ["api", "projects", name, "cancel"]) => {
+            handle_cancel_project(state, request, name)
+        }
+        (Method::Post, ["api", "projects", name, "cache", "clear"]) => {
+            handle_clear_project_cache(state, request, name)
+        }
         (Method::Get, ["api", "runs", id]) => {
             let state_dir = state.shared.lock().expect("shared").state_dir.clone();
             match lookup_run(&state_dir, id) {
@@ -244,9 +279,13 @@ fn handle(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
                     .map_err(Into::into),
             }
         }
+        (Method::Post, ["api", "runs", id, "deploy"]) => handle_deploy_run(state, request, id),
+        (Method::Post, ["api", "runs", id, "cancel"]) => handle_cancel_run(state, request, id),
         (Method::Get, ["api", "runs", id, "steps", index, "log"]) => {
             handle_step_log(state, request, id, index, &params)
         }
+        (Method::Post, ["api", "cache", "clear"]) => handle_clear_cache(state, request),
+        (Method::Get, ["api", "deploy", "checks"]) => handle_deploy_checks(state, request),
         (Method::Get, ["api", "config"]) => {
             let cfg = state.shared.lock().expect("shared").config.clone();
             let body = serde_json::to_value(cfg.masked())?;
@@ -321,6 +360,7 @@ fn projects_json(state: &Arc<ApiState>) -> Value {
         .projects
         .iter()
         .map(|p| {
+            let cfg_p = shared.config.project(&p.name);
             let mut value = json!({
                 "name": p.name,
                 "branch": p.branch,
@@ -338,6 +378,10 @@ fn projects_json(state: &Arc<ApiState>) -> Value {
                             .first()
                             .map(run_json)
                     }),
+                "open_prs": p.open_prs,
+                "watch_prs": cfg_p.map(|c| c.watch_prs).unwrap_or(false),
+                "watch_tags": cfg_p.map(|c| c.watch_tags).unwrap_or(false),
+                "deploy_refs": cfg_p.map(|c| c.deploy_refs.clone()).unwrap_or_default(),
             });
             if let Some(err) = &p.last_error {
                 value["last_error"] = json!(err);
@@ -349,7 +393,7 @@ fn projects_json(state: &Arc<ApiState>) -> Value {
 }
 
 pub fn run_json(run: &Run) -> Value {
-    json!({
+    let mut v = json!({
         "id": run.id,
         "project": run.project,
         "sha": run.sha,
@@ -360,6 +404,7 @@ pub fn run_json(run: &Run) -> Value {
         "failed_step": run.failed_step,
         "github_url": run.github_url,
         "trigger": run.trigger,
+        "deploy_only": run.deploy_only,
         "steps": run.steps.iter().map(|s| json!({
             "phase": s.phase,
             "name": s.name,
@@ -375,12 +420,30 @@ pub fn run_json(run: &Run) -> Value {
                 "duration_ms": sub.duration_ms,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(git_ref) = &run.git_ref {
+        v["git_ref"] = json!(git_ref);
+    }
+    if let Some(pr_number) = run.pr_number {
+        v["pr_number"] = json!(pr_number);
+    }
+    if let Some(pr_title) = &run.pr_title {
+        v["pr_title"] = json!(pr_title);
+    }
+    if let Some(pr_head_ref) = &run.pr_head_ref {
+        v["pr_head_ref"] = json!(pr_head_ref);
+    }
+    if let Some(pr_base_ref) = &run.pr_base_ref {
+        v["pr_base_ref"] = json!(pr_base_ref);
+    }
+    if let Some(reason) = &run.deploy_skipped_reason {
+        v["deploy_skipped_reason"] = json!(reason);
+    }
+    v
 }
 
 fn lookup_run(state_dir: &Path, id: &str) -> Option<Run> {
-    let project = model::find_run_project(state_dir, id)?;
-    model::find_run(state_dir, &project, id)
+    model::read_run(state_dir, id)
 }
 
 fn handle_step_log(
@@ -428,6 +491,14 @@ struct TriggerBody {
     sha: Option<String>,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    deploy_only: bool,
+    #[serde(default)]
+    force_deploy: bool,
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+    #[serde(default)]
+    pr_number: Option<u64>,
 }
 
 fn handle_trigger(
@@ -449,11 +520,36 @@ fn handle_trigger(
         }
     };
 
-    let (running, known, upstream) = {
+    let req_sha = parsed.sha.filter(|s| !s.is_empty());
+    if let Some(ref s) = req_sha {
+        if !git::is_valid_sha(s) {
+            return request
+                .respond(error_response(400, "invalid commit sha"))
+                .map_err(Into::into);
+        }
+    }
+    let req_git_ref = parsed.git_ref.filter(|r| !r.is_empty());
+    if let Some(ref r) = req_git_ref {
+        if !git::is_valid_git_ref(r) {
+            return request
+                .respond(error_response(400, "invalid git ref"))
+                .map_err(Into::into);
+        }
+    }
+
+    let (running, known, upstream, branch, pr_summary) = {
         let shared = state.shared.lock().expect("shared");
         match shared.projects.iter().find(|p| p.name == name) {
-            Some(p) => (p.running, true, p.upstream_sha.clone()),
-            None => (false, false, None),
+            Some(p) => (
+                p.running,
+                true,
+                p.upstream_sha.clone(),
+                p.branch.clone(),
+                parsed
+                    .pr_number
+                    .and_then(|num| p.open_prs.iter().find(|pr| pr.number == num).cloned()),
+            ),
+            None => (false, false, None, String::new(), None),
         }
     };
     if !known {
@@ -472,7 +568,37 @@ fn handle_trigger(
             .respond(error_response(409, "project is already running"))
             .map_err(Into::into);
     }
-    if parsed.sha.is_none() && upstream.is_none() {
+
+    let pr_ctx = parsed.pr_number.map(|num| match &pr_summary {
+        Some(pr) => PrContext {
+            number: pr.number,
+            title: pr.title.clone(),
+            head_ref: pr.head_ref.clone(),
+            base_ref: pr.base_ref.clone(),
+            base_sha: String::new(),
+        },
+        None => PrContext {
+            number: num,
+            title: String::new(),
+            head_ref: req_git_ref.clone().unwrap_or_else(|| format!("pull/{num}")),
+            base_ref: branch.clone(),
+            base_sha: String::new(),
+        },
+    });
+    let resolved_sha = req_sha.or_else(|| pr_summary.as_ref().map(|pr| pr.head_sha.clone()));
+    if let Some(ref s) = resolved_sha {
+        if !git::is_valid_sha(s) {
+            return request
+                .respond(error_response(400, "invalid commit sha"))
+                .map_err(Into::into);
+        }
+    }
+
+    if resolved_sha.is_none()
+        && upstream.is_none()
+        && parsed.pr_number.is_none()
+        && req_git_ref.is_none()
+    {
         return request
             .respond(error_response(
                 409,
@@ -480,13 +606,460 @@ fn handle_trigger(
             ))
             .map_err(Into::into);
     }
+
+    let trigger = if parsed.pr_number.is_some() {
+        Trigger::PullRequest
+    } else if parsed.deploy_only || parsed.force_deploy {
+        Trigger::ForceDeploy
+    } else {
+        Trigger::Manual
+    };
+    let git_ref = req_git_ref.or_else(|| {
+        pr_ctx.as_ref().map(|p| {
+            if p.head_ref.is_empty() {
+                format!("pull/{}", p.number)
+            } else {
+                p.head_ref.clone()
+            }
+        })
+    });
+    if let Some(ref r) = git_ref {
+        if !git::is_valid_git_ref(r) {
+            return request
+                .respond(error_response(400, "invalid git ref"))
+                .map_err(Into::into);
+        }
+    }
+
     let _ = tx.send(Command::Trigger {
-        sha: parsed.sha,
-        force: parsed.force,
-        trigger: Trigger::Manual,
+        sha: resolved_sha,
+        force: parsed.force || parsed.deploy_only || parsed.force_deploy,
+        trigger,
+        git_ref,
+        pr: pr_ctx,
+        deploy_only: parsed.deploy_only,
+        force_deploy: parsed.force_deploy,
     });
     request
         .respond(json_response(202, &json!({"queued": true})))
+        .map_err(Into::into)
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DeployBody {
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
+    skip_ci: Option<bool>,
+}
+
+fn handle_deploy_project(
+    state: &Arc<ApiState>,
+    mut request: tiny_http::Request,
+    name: &str,
+) -> Result<()> {
+    let body = read_body(&mut request).unwrap_or_default();
+    let parsed: DeployBody = if body.trim().is_empty() {
+        DeployBody::default()
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(b) => b,
+            Err(e) => {
+                return request
+                    .respond(error_response(400, &format!("invalid JSON: {e}")))
+                    .map_err(Into::into)
+            }
+        }
+    };
+
+    let req_sha = parsed.sha.filter(|s| !s.trim().is_empty());
+    if let Some(ref s) = req_sha {
+        if !git::is_valid_sha(s) {
+            return request
+                .respond(error_response(400, "invalid commit sha"))
+                .map_err(Into::into);
+        }
+    }
+
+    let (project_cfg, running, upstream, last_sha) = {
+        let shared = state.shared.lock().expect("shared");
+        let cfg_p = shared.config.project(name).cloned();
+        let state_p = shared.projects.iter().find(|p| p.name == name);
+        match (cfg_p, state_p) {
+            (Some(c), Some(s)) => (c, s.running, s.upstream_sha.clone(), s.last_sha.clone()),
+            (Some(c), None) => (c, false, None, None),
+            (None, _) => {
+                return request
+                    .respond(error_response(404, "unknown project"))
+                    .map_err(Into::into);
+            }
+        }
+    };
+
+    if project_cfg.deploy.is_empty() {
+        return request
+            .respond(error_response(400, "project has no deploy steps"))
+            .map_err(Into::into);
+    }
+    if running {
+        return request
+            .respond(error_response(409, "project is already running"))
+            .map_err(Into::into);
+    }
+    let tx = state.commands.lock().expect("commands").get(name).cloned();
+    let Some(tx) = tx else {
+        return request
+            .respond(error_response(503, "project worker is not running"))
+            .map_err(Into::into);
+    };
+
+    let target_sha = req_sha
+        .or(upstream)
+        .or(last_sha)
+        .or_else(|| git::rev_parse(&project_cfg.repo_path, "HEAD").ok());
+    let Some(target_sha) = target_sha else {
+        return request
+            .respond(error_response(
+                409,
+                "no resolvable sha yet; pass sha explicitly or wait for the first poll",
+            ))
+            .map_err(Into::into);
+    };
+    if !git::is_valid_sha(&target_sha) {
+        return request
+            .respond(error_response(400, "invalid commit sha"))
+            .map_err(Into::into);
+    }
+
+    let deploy_only = parsed.skip_ci.unwrap_or(true);
+    let _ = tx.send(Command::Trigger {
+        sha: Some(target_sha.clone()),
+        force: true,
+        trigger: Trigger::ForceDeploy,
+        git_ref: Some(project_cfg.branch.clone()),
+        pr: None,
+        deploy_only,
+        force_deploy: true,
+    });
+    request
+        .respond(json_response(
+            202,
+            &json!({
+                "queued": true,
+                "sha": target_sha,
+                "deploy_only": deploy_only,
+            }),
+        ))
+        .map_err(Into::into)
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RunDeployBody {
+    #[serde(default)]
+    skip_ci: Option<bool>,
+    #[serde(default)]
+    allow_pr: bool,
+}
+
+fn handle_deploy_run(
+    state: &Arc<ApiState>,
+    mut request: tiny_http::Request,
+    id: &str,
+) -> Result<()> {
+    let body = read_body(&mut request).unwrap_or_default();
+    let parsed: RunDeployBody = if body.trim().is_empty() {
+        RunDeployBody::default()
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(b) => b,
+            Err(e) => {
+                return request
+                    .respond(error_response(400, &format!("invalid JSON: {e}")))
+                    .map_err(Into::into)
+            }
+        }
+    };
+
+    let state_dir = state.shared.lock().expect("shared").state_dir.clone();
+    let Some(run) = model::read_run(&state_dir, id) else {
+        return request
+            .respond(error_response(404, "unknown run"))
+            .map_err(Into::into);
+    };
+
+    if run.pr_number.is_some() && !parsed.allow_pr {
+        return request
+            .respond(error_response(400, "cannot deploy a pull request build"))
+            .map_err(Into::into);
+    }
+
+    let (project_cfg, running) = {
+        let shared = state.shared.lock().expect("shared");
+        let cfg_p = shared.config.project(&run.project).cloned();
+        let is_running = shared
+            .projects
+            .iter()
+            .find(|p| p.name == run.project)
+            .is_some_and(|p| p.running);
+        match cfg_p {
+            Some(c) => (c, is_running),
+            None => {
+                return request
+                    .respond(error_response(404, "unknown project"))
+                    .map_err(Into::into);
+            }
+        }
+    };
+
+    if project_cfg.deploy.is_empty() {
+        return request
+            .respond(error_response(400, "project has no deploy steps"))
+            .map_err(Into::into);
+    }
+    if running {
+        return request
+            .respond(error_response(409, "project is already running"))
+            .map_err(Into::into);
+    }
+    let tx = state
+        .commands
+        .lock()
+        .expect("commands")
+        .get(&run.project)
+        .cloned();
+    let Some(tx) = tx else {
+        return request
+            .respond(error_response(503, "project worker is not running"))
+            .map_err(Into::into);
+    };
+
+    let deploy_only = parsed.skip_ci.unwrap_or(true);
+    let git_ref = run
+        .git_ref
+        .clone()
+        .unwrap_or_else(|| project_cfg.branch.clone());
+    let pr = run.pr_number.map(|number| PrContext {
+        number,
+        title: run.pr_title.clone().unwrap_or_default(),
+        head_ref: run.pr_head_ref.clone().unwrap_or_default(),
+        base_ref: run
+            .pr_base_ref
+            .clone()
+            .unwrap_or_else(|| project_cfg.branch.clone()),
+        base_sha: String::new(),
+    });
+
+    let _ = tx.send(Command::Trigger {
+        sha: Some(run.sha.clone()),
+        force: true,
+        trigger: Trigger::ForceDeploy,
+        git_ref: Some(git_ref),
+        pr,
+        deploy_only,
+        force_deploy: true,
+    });
+    request
+        .respond(json_response(
+            202,
+            &json!({
+                "queued": true,
+                "sha": run.sha,
+                "deploy_only": deploy_only,
+                "run_id": run.id,
+                "project": run.project,
+            }),
+        ))
+        .map_err(Into::into)
+}
+
+fn remove_docker_volumes_with_prefix(prefix: &str, wsl: bool) -> Vec<String> {
+    let mut removed = Vec::new();
+    let mut ls = if wsl {
+        let mut c = std::process::Command::new("wsl.exe");
+        c.args(["-e", "docker"]);
+        c
+    } else {
+        std::process::Command::new("docker")
+    };
+    let Ok(out) = ls
+        .args(["volume", "ls", "-q", "--filter", &format!("name=^{prefix}")])
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return removed;
+    };
+    if !out.status.success() {
+        return removed;
+    }
+    let vols: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|v| v.starts_with(prefix))
+        .map(String::from)
+        .collect();
+    for vol in vols {
+        let mut rm = if wsl {
+            let mut c = std::process::Command::new("wsl.exe");
+            c.args(["-e", "docker"]);
+            c
+        } else {
+            std::process::Command::new("docker")
+        };
+        if let Ok(res) = rm
+            .args(["volume", "rm", "-f", &vol])
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            if res.status.success() {
+                removed.push(format!("docker-volume:{vol}"));
+            }
+        }
+    }
+    removed
+}
+
+fn handle_clear_cache(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
+    const MANAGED_CACHE_SUBDIRS: &[&str] = &["act-actions", "act-cache-server", "projects"];
+    let (cache_dir, wsl) = {
+        let shared = state.shared.lock().expect("shared");
+        let act = shared.config.act();
+        (act.effective_cache_dir(&shared.state_dir), act.is_wsl())
+    };
+    let mut removed = Vec::new();
+    if cache_dir.is_dir() {
+        for sub in MANAGED_CACHE_SUBDIRS {
+            let path = cache_dir.join(sub);
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                let res = if meta.file_type().is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                if res.is_ok() {
+                    removed.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    removed.extend(remove_docker_volumes_with_prefix("lunacy-cache-", wsl));
+    request
+        .respond(json_response(
+            200,
+            &json!({"cleared": true, "removed": removed}),
+        ))
+        .map_err(Into::into)
+}
+
+fn handle_clear_project_cache(
+    state: &Arc<ApiState>,
+    request: tiny_http::Request,
+    name: &str,
+) -> Result<()> {
+    let (known, cache_dir, wsl) = {
+        let shared = state.shared.lock().expect("shared");
+        let known = shared.config.project(name).is_some();
+        let act = shared.config.act();
+        (
+            known,
+            act.effective_cache_dir(&shared.state_dir),
+            act.is_wsl(),
+        )
+    };
+    if !known {
+        return request
+            .respond(error_response(404, "unknown project"))
+            .map_err(Into::into);
+    }
+    let slug = config::project_cache_slug(name);
+    let mut removed = Vec::new();
+    let project_cache = cache_dir.join("projects").join(&slug);
+    if project_cache.exists() && std::fs::remove_dir_all(&project_cache).is_ok() {
+        removed.push(project_cache.to_string_lossy().to_string());
+    }
+    removed.extend(remove_docker_volumes_with_prefix(
+        &format!("lunacy-cache-{slug}-"),
+        wsl,
+    ));
+    request
+        .respond(json_response(
+            200,
+            &json!({"cleared": true, "project": name, "removed": removed}),
+        ))
+        .map_err(Into::into)
+}
+
+fn handle_cancel_run(state: &Arc<ApiState>, request: tiny_http::Request, id: &str) -> Result<()> {
+    let (matched, state_dir) = {
+        let shared = state.shared.lock().expect("shared");
+        (shared.cancel_run(id), shared.state_dir.clone())
+    };
+    if let Some((project, run_id)) = matched {
+        return request
+            .respond(json_response(
+                202,
+                &json!({
+                    "cancelling": true,
+                    "run_id": run_id,
+                    "project": project,
+                }),
+            ))
+            .map_err(Into::into);
+    }
+    if lookup_run(&state_dir, id).is_some() {
+        return request
+            .respond(error_response(409, "run is not running"))
+            .map_err(Into::into);
+    }
+    request
+        .respond(error_response(404, "run not found"))
+        .map_err(Into::into)
+}
+
+fn handle_cancel_project(
+    state: &Arc<ApiState>,
+    request: tiny_http::Request,
+    name: &str,
+) -> Result<()> {
+    let outcome = {
+        let shared = state.shared.lock().expect("shared");
+        shared.cancel_project(name)
+    };
+    match outcome {
+        crate::daemon::CancelProjectOutcome::Cancelling(run_id) => request
+            .respond(json_response(
+                202,
+                &json!({
+                    "cancelling": true,
+                    "run_id": run_id,
+                    "project": name,
+                }),
+            ))
+            .map_err(Into::into),
+        crate::daemon::CancelProjectOutcome::NotRunning => request
+            .respond(error_response(409, "project is not running"))
+            .map_err(Into::into),
+        crate::daemon::CancelProjectOutcome::NotFound => request
+            .respond(error_response(404, "project not found"))
+            .map_err(Into::into),
+    }
+}
+
+fn handle_deploy_checks(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
+    let (cfg, snapshots, state_dir) = {
+        let shared = state.shared.lock().expect("shared");
+        let snaps: Vec<crate::deploy_check::ProjectSnapshot> =
+            shared.projects.iter().map(Into::into).collect();
+        (shared.config.clone(), snaps, shared.state_dir.clone())
+    };
+    let report = crate::deploy_check::build_deploy_checks(
+        &cfg,
+        &snapshots,
+        &state_dir,
+        crate::config::Os::current(),
+    );
+    let body = serde_json::to_value(report)?;
+    request
+        .respond(json_response(200, &body))
         .map_err(Into::into)
 }
 
@@ -620,6 +1193,9 @@ fn handle_put_config(state: &Arc<ApiState>, mut request: tiny_http::Request) -> 
                 let mut existing = old_projects.remove(pos);
                 existing.branch = project.branch.clone();
                 existing.github_repo = project.github_repo.clone();
+                if !project.watch_prs {
+                    existing.open_prs.clear();
+                }
                 ordered.push(existing);
             } else {
                 ordered.push(crate::daemon::ProjectState::new_public(project, &state_dir));
@@ -666,12 +1242,22 @@ struct WebhookPayload {
     check_run: Option<WebhookCheckRun>,
     #[serde(default)]
     check_suite: Option<WebhookCheckSuite>,
+    #[serde(default)]
+    pull_request: Option<WebhookPullRequest>,
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    deleted: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WebhookRepo {
     #[serde(default)]
     full_name: Option<String>,
+    #[serde(default)]
+    fork: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,6 +1270,28 @@ struct WebhookCheckRun {
 struct WebhookCheckSuite {
     #[serde(default)]
     head_sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookPullRequest {
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    head: Option<WebhookPrRef>,
+    #[serde(default)]
+    base: Option<WebhookPrRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookPrRef {
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+    #[serde(default)]
+    repo: Option<WebhookRepo>,
 }
 
 /// Verify `X-Hub-Signature-256` = `sha256=<hex hmac>` over the raw body.
@@ -715,8 +1323,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Compute the header value for a body (tests and docs).
-#[cfg(test)]
+/// Compute the `X-Hub-Signature-256` header value for a body (tests and docs).
 pub fn signature_header(secret: &str, body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
     mac.update(body);
@@ -727,6 +1334,7 @@ pub fn signature_header(secret: &str, body: &[u8]) -> String {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Result<()> {
     let secret = state
         .shared
@@ -749,14 +1357,19 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
         .as_reader()
         .read_to_string(&mut body)
         .context("reading the webhook body")?;
-    let header = request
+    let sig_header = request
         .headers()
         .iter()
         .find(|h| h.field.equiv("X-Hub-Signature-256"))
         .map(|h| h.value.as_str().to_string())
         .unwrap_or_default();
+    let event_header = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("X-GitHub-Event"))
+        .map(|h| h.value.as_str().trim().to_ascii_lowercase());
 
-    if !verify_signature(&secret, body.as_bytes(), &header) {
+    if !verify_signature(&secret, body.as_bytes(), &sig_header) {
         return request
             .respond(error_response(401, "invalid signature"))
             .map_err(Into::into);
@@ -770,64 +1383,348 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
                 .map_err(Into::into)
         }
     };
-    if payload.action.as_deref() != Some("rerequested") {
-        return request
-            .respond(json_response(
-                202,
-                &json!({"queued": false, "reason": "ignored action"}),
-            ))
-            .map_err(Into::into);
-    }
-    let sha = payload
-        .check_run
-        .and_then(|c| c.head_sha)
-        .or_else(|| payload.check_suite.and_then(|c| c.head_sha));
-    let Some(sha) = sha else {
-        return request
-            .respond(json_response(
-                202,
-                &json!({"queued": false, "reason": "no head_sha"}),
-            ))
-            .map_err(Into::into);
-    };
-    let full_name = payload.repository.and_then(|r| r.full_name);
 
-    let commands = state.commands.lock().expect("commands").clone();
-    let targets: Vec<(String, Sender<Command>)> = {
-        let shared = state.shared.lock().expect("shared");
-        shared
-            .projects
-            .iter()
-            .filter(|p| match (&full_name, &p.github_repo) {
-                (Some(want), Some(have)) => want == have,
-                _ => false,
-            })
-            .filter_map(|p| commands.get(&p.name).map(|tx| (p.name.clone(), tx.clone())))
-            .collect()
+    let event_kind = match event_header.as_deref() {
+        Some(ev) if !ev.is_empty() => ev,
+        _ if payload.pull_request.is_some() => "pull_request",
+        _ if payload.git_ref.is_some() && payload.after.is_some() => "push",
+        _ => "check_run",
     };
-    if targets.is_empty() {
-        return request
+
+    let full_name = payload.repository.and_then(|r| r.full_name);
+    let commands = state.commands.lock().expect("commands").clone();
+
+    match event_kind {
+        "pull_request" => {
+            let action = payload.action.as_deref().unwrap_or("");
+            if !matches!(action, "opened" | "synchronize" | "reopened") {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "ignored action"}),
+                    ))
+                    .map_err(Into::into);
+            }
+            let Some(pr) = payload.pull_request else {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "missing pull_request"}),
+                    ))
+                    .map_err(Into::into);
+            };
+            let Some(number) = pr.number else {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "missing pull_request.number"}),
+                    ))
+                    .map_err(Into::into);
+            };
+            let head = pr.head.unwrap_or(WebhookPrRef {
+                sha: None,
+                git_ref: None,
+                repo: None,
+            });
+            let base = pr.base.unwrap_or(WebhookPrRef {
+                sha: None,
+                git_ref: None,
+                repo: None,
+            });
+            let is_same_repo = match head.repo.as_ref() {
+                Some(hr) if hr.fork != Some(true) => {
+                    match hr.full_name.as_deref().filter(|s| !s.is_empty()) {
+                        Some(head_name) => {
+                            let base_name = base
+                                .repo
+                                .as_ref()
+                                .and_then(|r| r.full_name.as_deref())
+                                .filter(|s| !s.is_empty());
+                            let repo_name = full_name.as_deref().filter(|s| !s.is_empty());
+                            let matches_base = base_name
+                                .map(|b| head_name.eq_ignore_ascii_case(b))
+                                .unwrap_or(true);
+                            let matches_repo = repo_name
+                                .map(|r| head_name.eq_ignore_ascii_case(r))
+                                .unwrap_or(true);
+                            (base_name.is_some() || repo_name.is_some())
+                                && matches_base
+                                && matches_repo
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if !is_same_repo {
+                return request
+                    .respond(json_response(
+                        200,
+                        &json!({"ignored": true, "reason": "fork pull request"}),
+                    ))
+                    .map_err(Into::into);
+            }
+            let Some(head_sha) = head.sha.filter(|s| !s.is_empty()) else {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "no head_sha"}),
+                    ))
+                    .map_err(Into::into);
+            };
+            if !git::is_valid_sha(&head_sha) {
+                return request
+                    .respond(error_response(400, "invalid head_sha"))
+                    .map_err(Into::into);
+            }
+            let head_ref = head
+                .git_ref
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| format!("pull/{number}"));
+            if !git::is_valid_git_ref(&head_ref) {
+                return request
+                    .respond(error_response(400, "invalid head ref"))
+                    .map_err(Into::into);
+            }
+            let base_ref = base.git_ref.unwrap_or_default();
+            if !base_ref.is_empty() && !git::is_valid_git_ref(&base_ref) {
+                return request
+                    .respond(error_response(400, "invalid base ref"))
+                    .map_err(Into::into);
+            }
+            let base_sha = base.sha.unwrap_or_default();
+            if !base_sha.is_empty() && !git::is_valid_sha(&base_sha) {
+                return request
+                    .respond(error_response(400, "invalid base_sha"))
+                    .map_err(Into::into);
+            }
+            let title = pr.title.unwrap_or_default();
+
+            let targets: Vec<(String, Sender<Command>)> = {
+                let shared = state.shared.lock().expect("shared");
+                shared
+                    .projects
+                    .iter()
+                    .filter(|p| match (&full_name, &p.github_repo) {
+                        (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
+                        _ => false,
+                    })
+                    .filter(|p| {
+                        shared
+                            .config
+                            .project(&p.name)
+                            .is_some_and(|cfg_p| cfg_p.watch_prs)
+                    })
+                    .filter_map(|p| commands.get(&p.name).map(|tx| (p.name.clone(), tx.clone())))
+                    .collect()
+            };
+            if targets.is_empty() {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "no matching project"}),
+                    ))
+                    .map_err(Into::into);
+            }
+            let pr_ctx = PrContext {
+                number,
+                title,
+                head_ref: head_ref.clone(),
+                base_ref,
+                base_sha,
+            };
+            let mut queued = Vec::new();
+            for (name, tx) in targets {
+                let _ = tx.send(Command::Trigger {
+                    sha: Some(head_sha.clone()),
+                    force: true,
+                    trigger: Trigger::PullRequest,
+                    git_ref: Some(head_ref.clone()),
+                    pr: Some(pr_ctx.clone()),
+                    deploy_only: false,
+                    force_deploy: false,
+                });
+                queued.push(name);
+            }
+            request
+                .respond(json_response(
+                    202,
+                    &json!({"queued": true, "projects": queued, "pr_number": number}),
+                ))
+                .map_err(Into::into)
+        }
+        "push" => {
+            if payload.deleted == Some(true) {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "branch or tag deleted"}),
+                    ))
+                    .map_err(Into::into);
+            }
+            let Some(raw_ref) = payload.git_ref.filter(|r| !r.is_empty()) else {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "no ref"}),
+                    ))
+                    .map_err(Into::into);
+            };
+            if !git::is_valid_git_ref(&raw_ref) {
+                return request
+                    .respond(error_response(400, "invalid git ref"))
+                    .map_err(Into::into);
+            }
+            let Some(after) = payload
+                .after
+                .filter(|s| !s.is_empty() && s != crate::act::ZERO_SHA)
+            else {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "no after sha"}),
+                    ))
+                    .map_err(Into::into);
+            };
+            if !git::is_valid_sha(&after) {
+                return request
+                    .respond(error_response(400, "invalid after sha"))
+                    .map_err(Into::into);
+            }
+            let is_tag = raw_ref.starts_with("refs/tags/") || raw_ref.starts_with("tags/");
+            let norm_ref = if let Some(tag) = raw_ref.strip_prefix("refs/tags/") {
+                format!("tags/{tag}")
+            } else if let Some(branch) = raw_ref.strip_prefix("refs/heads/") {
+                branch.to_string()
+            } else {
+                raw_ref.clone()
+            };
+            let trigger = if is_tag {
+                Trigger::Tag
+            } else {
+                Trigger::Webhook
+            };
+
+            let targets: Vec<(String, Sender<Command>)> = {
+                let shared = state.shared.lock().expect("shared");
+                shared
+                    .projects
+                    .iter()
+                    .filter(|p| match (&full_name, &p.github_repo) {
+                        (Some(want), Some(have)) => want == have,
+                        _ => false,
+                    })
+                    .filter(|p| {
+                        shared.config.project(&p.name).is_some_and(|cfg_p| {
+                            raw_ref == format!("refs/heads/{}", cfg_p.branch)
+                                || config::matches_deploy_ref(cfg_p, &raw_ref, false)
+                                || (is_tag && cfg_p.watch_tags)
+                        })
+                    })
+                    .filter_map(|p| commands.get(&p.name).map(|tx| (p.name.clone(), tx.clone())))
+                    .collect()
+            };
+            if targets.is_empty() {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "no matching project"}),
+                    ))
+                    .map_err(Into::into);
+            }
+            let mut queued = Vec::new();
+            for (name, tx) in targets {
+                let _ = tx.send(Command::Trigger {
+                    sha: Some(after.clone()),
+                    force: false,
+                    trigger,
+                    git_ref: Some(norm_ref.clone()),
+                    pr: None,
+                    deploy_only: false,
+                    force_deploy: false,
+                });
+                queued.push(name);
+            }
+            request
+                .respond(json_response(
+                    202,
+                    &json!({"queued": true, "projects": queued, "ref": norm_ref}),
+                ))
+                .map_err(Into::into)
+        }
+        "check_run" | "check_suite" => {
+            if payload.action.as_deref() != Some("rerequested") {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "ignored action"}),
+                    ))
+                    .map_err(Into::into);
+            }
+            let sha = payload
+                .check_run
+                .and_then(|c| c.head_sha)
+                .or_else(|| payload.check_suite.and_then(|c| c.head_sha));
+            let Some(sha) = sha else {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "no head_sha"}),
+                    ))
+                    .map_err(Into::into);
+            };
+            if !git::is_valid_sha(&sha) {
+                return request
+                    .respond(error_response(400, "invalid head_sha"))
+                    .map_err(Into::into);
+            }
+            let targets: Vec<(String, Sender<Command>)> = {
+                let shared = state.shared.lock().expect("shared");
+                shared
+                    .projects
+                    .iter()
+                    .filter(|p| match (&full_name, &p.github_repo) {
+                        (Some(want), Some(have)) => want == have,
+                        _ => false,
+                    })
+                    .filter_map(|p| commands.get(&p.name).map(|tx| (p.name.clone(), tx.clone())))
+                    .collect()
+            };
+            if targets.is_empty() {
+                return request
+                    .respond(json_response(
+                        202,
+                        &json!({"queued": false, "reason": "no matching project"}),
+                    ))
+                    .map_err(Into::into);
+            }
+            let mut queued = Vec::new();
+            for (name, tx) in targets {
+                let _ = tx.send(Command::Trigger {
+                    sha: Some(sha.clone()),
+                    force: true,
+                    trigger: Trigger::Webhook,
+                    git_ref: None,
+                    pr: None,
+                    deploy_only: false,
+                    force_deploy: false,
+                });
+                queued.push(name);
+            }
+            request
+                .respond(json_response(
+                    202,
+                    &json!({"queued": true, "projects": queued}),
+                ))
+                .map_err(Into::into)
+        }
+        _ => request
             .respond(json_response(
                 202,
-                &json!({"queued": false, "reason": "no matching project"}),
+                &json!({"queued": false, "reason": "ignored event"}),
             ))
-            .map_err(Into::into);
+            .map_err(Into::into),
     }
-    let mut queued = Vec::new();
-    for (name, tx) in targets {
-        let _ = tx.send(Command::Trigger {
-            sha: Some(sha.clone()),
-            force: true,
-            trigger: Trigger::Webhook,
-        });
-        queued.push(name);
-    }
-    request
-        .respond(json_response(
-            202,
-            &json!({"queued": true, "projects": queued}),
-        ))
-        .map_err(Into::into)
 }
 
 // -------------------------------------------------------------- system

@@ -119,9 +119,12 @@ fn check(path: PathBuf) -> Result<()> {
     let cfg = load(&path)?;
     println!("config ok: {}", path.display());
     println!(
-        "state_dir: {}  poll_interval: {}s  log_level: {}",
+        "state_dir: {}  poll_interval: {}s  step_timeout: {}s  log_level: {}",
         cfg.state_dir().display(),
         cfg.general.poll_interval,
+        cfg.general
+            .step_timeout
+            .unwrap_or(config::DEFAULT_STEP_TIMEOUT),
         cfg.general.log_level
     );
     if let Some(g) = cfg.github.as_ref() {
@@ -162,15 +165,21 @@ fn check(path: PathBuf) -> Result<()> {
                     .and_then(config::repo_from_remote)
             })
             .unwrap_or_else(|| "-".into());
+        let timeout_info = match p.timeout {
+            Some(t) => format!(" timeout={t}s"),
+            None => String::new(),
+        };
         println!(
-            "  {:<12} branch={:<8} checkout={:<8} github={:<22} ci={} deploy={} poll={}s",
+            "  {:<12} branch={:<8} checkout={:<8} github={:<22} ci={} deploy={} poll={}s step_timeout={}s{}",
             p.name,
             p.branch,
             format!("{:?}", p.checkout).to_lowercase(),
             repo,
             p.ci.len(),
             p.deploy.len(),
-            p.poll_interval(&cfg.general)
+            p.poll_interval(&cfg.general),
+            p.effective_step_timeout(&cfg.general),
+            timeout_info
         );
         for s in p.ci.iter().chain(p.deploy.iter()) {
             let what = match s.kind {
@@ -282,6 +291,7 @@ fn once(path: PathBuf, project_name: String, sha: Option<String>, force: bool) -
         github: github.as_ref(),
         on_update: &on_update,
         act_lock: &act_lock,
+        cancel: None,
     };
     let run = pipeline::run_pipeline(&ctx, &project, &sha, Trigger::Manual);
     model::write_last_sha(&state_dir, &project.name, &sha)?;
@@ -314,12 +324,10 @@ fn once(path: PathBuf, project_name: String, sha: Option<String>, force: bool) -
             }
         }
     }
-    let failed = matches!(
-        run.status,
-        model::RunStatus::Failure | model::RunStatus::Error
-    );
-    if failed {
-        std::process::exit(3);
+    match run.status {
+        model::RunStatus::Failure | model::RunStatus::Error => std::process::exit(3),
+        model::RunStatus::Cancelled => std::process::exit(4),
+        _ => {}
     }
     Ok(())
 }

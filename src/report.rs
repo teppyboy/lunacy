@@ -28,6 +28,109 @@ struct AppState {
     tokens: Mutex<std::collections::HashMap<u64, InstallationTokenCache>>,
 }
 
+/// Summary of an open GitHub pull request returned by `GET /repos/{repo}/pulls`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PullRequestInfo {
+    pub number: u64,
+    pub title: String,
+    pub head_sha: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub base_sha: String,
+}
+
+fn parse_open_pulls(body: &Value, target_repo: &str) -> Result<Vec<PullRequestInfo>> {
+    let items = body
+        .as_array()
+        .context("GitHub pulls response was not a JSON array")?;
+    let mut pulls = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(number) = item.get("number").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(head_repo) = item
+            .get("head")
+            .and_then(|h| h.get("repo"))
+            .filter(|v| v.is_object())
+        else {
+            continue;
+        };
+        if head_repo.get("fork").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(head_full_name) = head_repo
+            .get("full_name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(base_full_name) = item
+            .get("base")
+            .and_then(|b| b.get("repo"))
+            .and_then(|r| r.get("full_name"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if !head_full_name.eq_ignore_ascii_case(base_full_name)
+            || !head_full_name.eq_ignore_ascii_case(target_repo)
+        {
+            continue;
+        }
+        let Some(head_sha) = item
+            .get("head")
+            .and_then(|h| h.get("sha"))
+            .and_then(Value::as_str)
+            .filter(|s| crate::git::is_valid_sha(s))
+        else {
+            continue;
+        };
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let head_ref = item
+            .get("head")
+            .and_then(|h| h.get("ref"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !head_ref.is_empty() && !crate::git::is_valid_git_ref(&head_ref) {
+            continue;
+        }
+        let base_ref = item
+            .get("base")
+            .and_then(|b| b.get("ref"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !base_ref.is_empty() && !crate::git::is_valid_git_ref(&base_ref) {
+            continue;
+        }
+        let base_sha = item
+            .get("base")
+            .and_then(|b| b.get("sha"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !base_sha.is_empty() && !crate::git::is_valid_sha(&base_sha) {
+            continue;
+        }
+        pulls.push(PullRequestInfo {
+            number,
+            title,
+            head_sha: head_sha.to_string(),
+            head_ref,
+            base_ref,
+            base_sha,
+        });
+    }
+    Ok(pulls)
+}
+
 impl Github {
     pub fn new(cfg: &GithubCfg) -> Result<Github> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -212,6 +315,14 @@ impl Github {
         let url = format!("{}/repos/{repo}/check-runs/{check_id}", self.api_url);
         self.request_json("PATCH", &url, Some(&token), Some(body))
     }
+
+    /// `GET /repos/{owner}/{repo}/pulls?state=open&per_page=30`
+    pub fn list_open_pulls(&self, repo: &str) -> Result<Vec<PullRequestInfo>> {
+        let token = self.bearer(repo)?;
+        let url = format!("{}/repos/{repo}/pulls?state=open&per_page=30", self.api_url);
+        let body = self.request_json("GET", &url, Some(&token), None)?;
+        parse_open_pulls(&body, repo)
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -352,6 +463,7 @@ impl StepStatus {
             StepStatus::Failure => "failure",
             StepStatus::Timeout => "timed out",
             StepStatus::Skipped => "skipped",
+            StepStatus::Cancelled => "cancelled",
         }
     }
 }
@@ -363,13 +475,24 @@ pub fn conclusion(run: &Run, phase: Phase) -> &'static str {
         return "success";
     }
     let mut any = false;
+    let mut any_skipped = false;
     for s in &steps {
         match s.status {
-            StepStatus::Skipped => {}
+            StepStatus::Skipped => any_skipped = true,
             StepStatus::Timeout => return "timed_out",
             StepStatus::Failure => return "failure",
+            StepStatus::Cancelled => return "cancelled",
             StepStatus::Success => any = true,
             StepStatus::Pending | StepStatus::Running => return "cancelled",
+        }
+    }
+    if run.status == RunStatus::Cancelled {
+        let cancelled_in_other_phase = run
+            .steps
+            .iter()
+            .any(|s| s.phase != phase && s.status == StepStatus::Cancelled);
+        if !cancelled_in_other_phase && (!any || any_skipped || phase == Phase::Deploy) {
+            return "cancelled";
         }
     }
     if any || !steps.is_empty() {
@@ -498,14 +621,7 @@ impl Github {
 
     pub fn finish_phase(&self, r: &PhaseReporter, check: &CheckHandle, run: &Run) -> Result<()> {
         let conclusion = conclusion(run, r.phase);
-        let mut description = match run.failed() {
-            Some(step) if step.status == StepStatus::Timeout => format!("{} timed out", step.name),
-            Some(step) => format!("{} failed", step.name),
-            None if run.status == RunStatus::Error && conclusion == "success" => {
-                "pipeline error".into()
-            }
-            None => "passed".into(),
-        };
+        let mut description = phase_description(run, r.phase, conclusion);
         if conclusion == "success" && run.status == RunStatus::Error {
             description.push_str(" (pipeline error)");
         }
@@ -545,6 +661,29 @@ impl Github {
             }
         }
         Ok(())
+    }
+}
+
+/// Human-readable description for a finished phase (used for commit statuses and check-run titles).
+pub(crate) fn phase_description(run: &Run, phase: Phase, conclusion: &str) -> String {
+    if conclusion == "cancelled" {
+        let cancelled_step = run
+            .steps
+            .iter()
+            .find(|s| s.phase == phase && s.status == StepStatus::Cancelled)
+            .or_else(|| run.steps.iter().find(|s| s.status == StepStatus::Cancelled));
+        return match cancelled_step {
+            Some(step) => format!("{} cancelled", step.name),
+            None => "cancelled".into(),
+        };
+    }
+    match run.failed() {
+        Some(step) if step.status == StepStatus::Timeout => format!("{} timed out", step.name),
+        Some(step) => format!("{} failed", step.name),
+        None if run.status == RunStatus::Error && conclusion == "success" => {
+            "pipeline error".into()
+        }
+        None => "passed".into(),
     }
 }
 
@@ -676,6 +815,34 @@ mod tests {
         // A skipped-only phase passes.
         let skipped = run_with(vec![step(Phase::Ci, "A", StepStatus::Skipped)]);
         assert_eq!(conclusion(&skipped, Phase::Ci), "success");
+
+        // A cancelled step reports "cancelled" and status_state "error".
+        let mut cancelled = run_with(vec![
+            step(Phase::Ci, "A", StepStatus::Success),
+            step(Phase::Ci, "B", StepStatus::Cancelled),
+            step(Phase::Deploy, "D", StepStatus::Skipped),
+        ]);
+        cancelled.status = RunStatus::Cancelled;
+        assert_eq!(conclusion(&cancelled, Phase::Ci), "cancelled");
+        assert_eq!(status_state(&cancelled, Phase::Ci), "error");
+        assert_eq!(
+            phase_description(&cancelled, Phase::Ci, "cancelled"),
+            "B cancelled"
+        );
+        let md = steps_markdown(&cancelled, 50);
+        assert!(md.contains("| 🚫 B | cancelled |"), "{md}");
+
+        // Cancelled between CI steps (all remaining skipped) -> cancelled, not passed.
+        let mut between = run_with(vec![
+            step(Phase::Ci, "A", StepStatus::Success),
+            step(Phase::Ci, "B", StepStatus::Skipped),
+        ]);
+        between.status = RunStatus::Cancelled;
+        assert_eq!(conclusion(&between, Phase::Ci), "cancelled");
+        assert_eq!(
+            phase_description(&between, Phase::Ci, "cancelled"),
+            "cancelled"
+        );
     }
 
     #[test]
@@ -700,5 +867,103 @@ mod tests {
         let s = "é".repeat(100);
         let t = truncate_chars(&s, 51);
         assert!(t.len() <= 51 + 16);
+    }
+
+    #[test]
+    fn parses_open_pulls_response_and_rejects_forks() {
+        let body = json!([
+            {
+                "number": 42,
+                "title": "feat: add pr builds",
+                "head": {
+                    "sha": "1111111111111111111111111111111111111111",
+                    "ref": "feat/pr",
+                    "repo": { "full_name": "TeppyBoy/Demo", "fork": false }
+                },
+                "base": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "ref": "master",
+                    "repo": { "full_name": "teppyboy/demo", "fork": false }
+                }
+            },
+            {
+                "number": 43,
+                "title": "fork pr with fork=true",
+                "head": {
+                    "sha": "2222222222222222222222222222222222222222",
+                    "ref": "evil",
+                    "repo": { "full_name": "teppyboy/demo", "fork": true }
+                },
+                "base": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "ref": "master",
+                    "repo": { "full_name": "teppyboy/demo", "fork": false }
+                }
+            },
+            {
+                "number": 44,
+                "title": "cross-repo fork pr",
+                "head": {
+                    "sha": "3333333333333333333333333333333333333333",
+                    "ref": "feat/fork",
+                    "repo": { "full_name": "attacker/demo", "fork": false }
+                },
+                "base": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "ref": "master",
+                    "repo": { "full_name": "teppyboy/demo", "fork": false }
+                }
+            },
+            {
+                "number": 45,
+                "title": "deleted head repo",
+                "head": {
+                    "sha": "4444444444444444444444444444444444444444",
+                    "ref": "deleted",
+                    "repo": null
+                },
+                "base": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "ref": "master",
+                    "repo": { "full_name": "teppyboy/demo", "fork": false }
+                }
+            },
+            {
+                "number": 46,
+                "title": "mismatched target repo",
+                "head": {
+                    "sha": "5555555555555555555555555555555555555555",
+                    "ref": "feat/other",
+                    "repo": { "full_name": "other/repo", "fork": false }
+                },
+                "base": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "ref": "master",
+                    "repo": { "full_name": "other/repo", "fork": false }
+                }
+            },
+            {
+                "number": 99,
+                "title": "incomplete"
+            }
+        ]);
+        let pulls = parse_open_pulls(&body, "teppyboy/demo").unwrap();
+        assert_eq!(
+            pulls.len(),
+            1,
+            "expected only same-repo non-fork PR: {pulls:?}"
+        );
+        assert_eq!(pulls[0].number, 42);
+        assert_eq!(pulls[0].title, "feat: add pr builds");
+        assert_eq!(
+            pulls[0].head_sha,
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(pulls[0].head_ref, "feat/pr");
+        assert_eq!(pulls[0].base_ref, "master");
+        assert_eq!(
+            pulls[0].base_sha,
+            "0000000000000000000000000000000000000000"
+        );
     }
 }

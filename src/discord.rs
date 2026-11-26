@@ -52,66 +52,7 @@ impl Discord {
         repo: Option<&str>,
         state_dir: &std::path::Path,
     ) -> Result<()> {
-        let (status_text, color) = match run.status {
-            RunStatus::Success => ("success", 0x2ECC71),
-            RunStatus::Failure => ("failure", 0xE74C3C),
-            RunStatus::Error => ("error", 0xE67E22),
-            RunStatus::Running => ("running", 0x3498DB),
-        };
-        let link = match repo {
-            Some(repo) => format!("[{repo}](https://github.com/{repo}/commit/{})", run.sha),
-            None => format!("`{}`", &run.sha[..run.sha.len().min(7)]),
-        };
-        let mut fields = vec![
-            json!({ "name": "Commit", "value": format!("{} `{}`", link, &run.sha[..run.sha.len().min(7)]), "inline": true }),
-            json!({ "name": "Result", "value": status_text, "inline": true }),
-            json!({ "name": "Duration", "value": format!("{}s", run.duration_secs()), "inline": true }),
-        ];
-        if let Some(step) = run.failed() {
-            let mut where_ = step.name.clone();
-            if let Some(sub) = step
-                .substeps
-                .iter()
-                .find(|s| matches!(s.status, StepStatus::Failure | StepStatus::Timeout))
-            {
-                where_ = format!("{} / {} ({})", step.name, sub.name, sub.job);
-            }
-            fields.push(json!({
-                "name": step_status_label(step.status),
-                "value": truncate(&where_, MAX_FIELD),
-                "inline": false,
-            }));
-        }
-        let log = failing_tail(state_dir, run, LOG_TAIL_LINES);
-        if !log.is_empty() {
-            fields.push(json!({
-                "name": format!("Log tail ({LOG_TAIL_LINES} lines)"),
-                "value": truncate(&log, MAX_FIELD),
-                "inline": false,
-            }));
-        }
-        fields.push(json!({
-            "name": "Steps",
-            "value": truncate(
-                &run.steps
-                    .iter()
-                    .map(|s| format!("{} {}", s.status.emoji(), s.name))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                MAX_FIELD
-            ),
-            "inline": false,
-        }));
-
-        self.post(json!({
-            "embeds": [{
-                "title": truncate(&format!("{} {} — {}", run.project, status_text, truncate(&run.subject, 120)), 256),
-                "color": color,
-                "fields": fields,
-                "footer": { "text": format!("{} · {}", run.project, run.id) },
-            }],
-            "allowed_mentions": { "parse": [] },
-        }))
+        self.post(finish_payload(run, repo, state_dir))
     }
 
     fn post(&self, payload: serde_json::Value) -> Result<()> {
@@ -137,9 +78,82 @@ impl Discord {
     }
 }
 
+pub(crate) fn finish_payload(
+    run: &Run,
+    repo: Option<&str>,
+    state_dir: &std::path::Path,
+) -> serde_json::Value {
+    let (status_text, color) = match run.status {
+        RunStatus::Success => ("success", 0x2ECC71),
+        RunStatus::Failure => ("failure", 0xE74C3C),
+        RunStatus::Error => ("error", 0xE67E22),
+        RunStatus::Cancelled => ("cancelled", 0x95A5A6),
+        RunStatus::Running => ("running", 0x3498DB),
+    };
+    let link = match repo {
+        Some(repo) => format!("[{repo}](https://github.com/{repo}/commit/{})", run.sha),
+        None => format!("`{}`", &run.sha[..run.sha.len().min(7)]),
+    };
+    let mut fields = vec![
+        json!({ "name": "Commit", "value": format!("{} `{}`", link, &run.sha[..run.sha.len().min(7)]), "inline": true }),
+        json!({ "name": "Result", "value": status_text, "inline": true }),
+        json!({ "name": "Duration", "value": format!("{}s", run.duration_secs()), "inline": true }),
+    ];
+    let highlight = run
+        .failed()
+        .or_else(|| run.steps.iter().find(|s| s.status == StepStatus::Cancelled));
+    if let Some(step) = highlight {
+        let mut where_ = step.name.clone();
+        if let Some(sub) = step.substeps.iter().find(|s| {
+            matches!(
+                s.status,
+                StepStatus::Failure | StepStatus::Timeout | StepStatus::Cancelled
+            )
+        }) {
+            where_ = format!("{} / {} ({})", step.name, sub.name, sub.job);
+        }
+        fields.push(json!({
+            "name": step_status_label(step.status),
+            "value": truncate(&where_, MAX_FIELD),
+            "inline": false,
+        }));
+    }
+    let log = failing_tail(state_dir, run, LOG_TAIL_LINES);
+    if !log.is_empty() {
+        fields.push(json!({
+            "name": format!("Log tail ({LOG_TAIL_LINES} lines)"),
+            "value": truncate(&log, MAX_FIELD),
+            "inline": false,
+        }));
+    }
+    fields.push(json!({
+        "name": "Steps",
+        "value": truncate(
+            &run.steps
+                .iter()
+                .map(|s| format!("{} {}", s.status.emoji(), s.name))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            MAX_FIELD
+        ),
+        "inline": false,
+    }));
+
+    json!({
+        "embeds": [{
+            "title": truncate(&format!("{} {} — {}", run.project, status_text, truncate(&run.subject, 120)), 256),
+            "color": color,
+            "fields": fields,
+            "footer": { "text": format!("{} · {}", run.project, run.id) },
+        }],
+        "allowed_mentions": { "parse": [] },
+    })
+}
+
 fn step_status_label(status: StepStatus) -> &'static str {
     match status {
         StepStatus::Timeout => "Timed out in",
+        StepStatus::Cancelled => "Cancelled at",
         _ => "Failed at",
     }
 }
@@ -168,20 +182,6 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
-}
-
-impl StepStatus {
-    /// Short label used in messages.
-    pub fn label(self) -> &'static str {
-        match self {
-            StepStatus::Pending => "pending",
-            StepStatus::Running => "running",
-            StepStatus::Success => "success",
-            StepStatus::Failure => "failure",
-            StepStatus::Timeout => "timeout",
-            StepStatus::Skipped => "skipped",
-        }
-    }
 }
 
 #[cfg(test)]
@@ -271,5 +271,70 @@ mod tests {
                 <= MAX_FIELD
         );
         assert!(embed["description"].as_str().unwrap().chars().count() <= MAX_DESCRIPTION);
+    }
+
+    #[test]
+    fn cancelled_run_embed_uses_grey_and_cancelled_at_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let steps = vec![
+            Step {
+                phase: Phase::Ci,
+                name: "Lint".into(),
+                status: StepStatus::Success,
+                duration_ms: Some(10),
+                exit_code: Some(0),
+                kind: crate::config::StepKind::Shell,
+                substeps: Vec::new(),
+            },
+            Step {
+                phase: Phase::Ci,
+                name: "Build".into(),
+                status: StepStatus::Cancelled,
+                duration_ms: Some(25),
+                exit_code: None,
+                kind: crate::config::StepKind::Shell,
+                substeps: Vec::new(),
+            },
+            Step {
+                phase: Phase::Deploy,
+                name: "Publish".into(),
+                status: StepStatus::Skipped,
+                duration_ms: None,
+                exit_code: None,
+                kind: crate::config::StepKind::Shell,
+                substeps: Vec::new(),
+            },
+        ];
+        let mut run = Run::new(
+            "demo",
+            "abcdef1234567890",
+            "feat: cancel me".into(),
+            Trigger::Manual,
+            steps,
+        );
+        run.status = RunStatus::Cancelled;
+        run.finished_at = Some(run.started_at + 12);
+
+        let payload = finish_payload(&run, Some("owner/demo"), dir.path());
+        let embed = &payload["embeds"][0];
+        assert_eq!(embed["color"], 0x95A5A6);
+        assert!(embed["title"].as_str().unwrap().contains("demo cancelled"));
+        let fields = embed["fields"].as_array().unwrap();
+        assert!(
+            fields
+                .iter()
+                .any(|f| f["name"] == "Result" && f["value"] == "cancelled"),
+            "{fields:?}"
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|f| f["name"] == "Cancelled at" && f["value"] == "Build"),
+            "{fields:?}"
+        );
+        let steps_val = fields.iter().find(|f| f["name"] == "Steps").unwrap()["value"]
+            .as_str()
+            .unwrap();
+        assert!(steps_val.contains("🚫 Build"), "{steps_val}");
     }
 }

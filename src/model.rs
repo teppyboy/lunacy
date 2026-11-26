@@ -1,6 +1,7 @@
 //! Run/step model, persistence layout and log helpers shared by the daemon and the API.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +20,7 @@ pub enum RunStatus {
     Success,
     Failure,
     Error,
+    Cancelled,
 }
 
 impl RunStatus {
@@ -36,6 +38,7 @@ pub enum StepStatus {
     Failure,
     Timeout,
     Skipped,
+    Cancelled,
 }
 
 impl StepStatus {
@@ -51,6 +54,20 @@ impl StepStatus {
             StepStatus::Failure => "❌",
             StepStatus::Timeout => "⏱️",
             StepStatus::Skipped => "⏭️",
+            StepStatus::Cancelled => "🚫",
+        }
+    }
+
+    /// Short label used in logs and messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            StepStatus::Pending => "pending",
+            StepStatus::Running => "running",
+            StepStatus::Success => "success",
+            StepStatus::Failure => "failure",
+            StepStatus::Timeout => "timeout",
+            StepStatus::Skipped => "skipped",
+            StepStatus::Cancelled => "cancelled",
         }
     }
 }
@@ -72,12 +89,15 @@ impl Phase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Trigger {
     #[default]
     Poll,
     Manual,
     Webhook,
+    PullRequest,
+    ForceDeploy,
+    Tag,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +137,20 @@ pub struct Run {
     pub steps: Vec<Step>,
     #[serde(default)]
     pub trigger: Trigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_head_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_skipped_reason: Option<String>,
+    #[serde(default)]
+    pub deploy_only: bool,
 }
 
 impl Run {
@@ -140,6 +174,13 @@ impl Run {
             github_url: None,
             steps,
             trigger,
+            git_ref: None,
+            pr_number: None,
+            pr_title: None,
+            pr_head_ref: None,
+            pr_base_ref: None,
+            deploy_skipped_reason: None,
+            deploy_only: false,
         }
     }
 
@@ -149,6 +190,7 @@ impl Run {
             RunStatus::Success => "success",
             RunStatus::Failure => "failure",
             RunStatus::Error => "error",
+            RunStatus::Cancelled => "cancelled",
         }
     }
 
@@ -211,6 +253,58 @@ pub fn write_last_sha(state_dir: &Path, project: &str, sha: &str) -> std::io::Re
     std::fs::rename(&tmp, &path)
 }
 
+pub fn pr_shas_path(state_dir: &Path, project: &str) -> PathBuf {
+    state_dir
+        .join("last-pr-shas")
+        .join(format!("{project}.json"))
+}
+
+pub fn read_pr_shas(state_dir: &Path, project: &str) -> BTreeMap<u64, String> {
+    let Ok(text) = std::fs::read_to_string(pr_shas_path(state_dir, project)) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+pub fn write_pr_shas(
+    state_dir: &Path,
+    project: &str,
+    map: &BTreeMap<u64, String>,
+) -> std::io::Result<()> {
+    let path = pr_shas_path(state_dir, project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(map)?)?;
+    std::fs::rename(&tmp, &path)
+}
+
+pub fn seen_tags_path(state_dir: &Path, project: &str) -> PathBuf {
+    state_dir.join("seen-tags").join(format!("{project}.json"))
+}
+
+pub fn read_seen_tags(state_dir: &Path, project: &str) -> BTreeMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(seen_tags_path(state_dir, project)) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+pub fn write_seen_tags(
+    state_dir: &Path,
+    project: &str,
+    map: &BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    let path = seen_tags_path(state_dir, project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(map)?)?;
+    std::fs::rename(&tmp, &path)
+}
+
 pub fn persist_run(state_dir: &Path, run: &Run) -> std::io::Result<()> {
     let path = run_json_path(state_dir, &run.project, &run.id);
     if let Some(parent) = path.parent() {
@@ -264,6 +358,12 @@ pub fn find_run_project(state_dir: &Path, id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Read a persisted run by id across all project run directories.
+pub fn read_run(state_dir: &Path, id: &str) -> Option<Run> {
+    let project = find_run_project(state_dir, id)?;
+    find_run(state_dir, &project, id)
 }
 
 pub const LOG_TAIL_BYTES: u64 = 512 * 1024;
@@ -333,5 +433,36 @@ mod tests {
             RunStatus::Success
         );
         assert_eq!(find_run_project(dir.path(), &run.id).as_deref(), Some("p"));
+        assert_eq!(read_run(dir.path(), &run.id).unwrap().id, run.id);
+    }
+
+    #[test]
+    fn pr_shas_and_seen_tags_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_pr_shas(dir.path(), "demo").is_empty());
+        let prs = BTreeMap::from([(12u64, "aaa".to_string()), (42u64, "bbb".to_string())]);
+        write_pr_shas(dir.path(), "demo", &prs).unwrap();
+        assert_eq!(read_pr_shas(dir.path(), "demo"), prs);
+
+        assert!(!seen_tags_path(dir.path(), "demo").is_file());
+        assert!(read_seen_tags(dir.path(), "demo").is_empty());
+        let tags = BTreeMap::from([("v1.0.0".to_string(), "ccc".to_string())]);
+        write_seen_tags(dir.path(), "demo", &tags).unwrap();
+        assert!(seen_tags_path(dir.path(), "demo").is_file());
+        assert_eq!(read_seen_tags(dir.path(), "demo"), tags);
+    }
+
+    #[test]
+    fn trigger_serde_variants() {
+        assert_eq!(
+            serde_json::to_string(&Trigger::PullRequest).unwrap(),
+            "\"pull_request\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Trigger::ForceDeploy).unwrap(),
+            "\"force_deploy\""
+        );
+        assert_eq!(serde_json::to_string(&Trigger::Tag).unwrap(), "\"tag\"");
+        assert_eq!(serde_json::to_string(&Trigger::Poll).unwrap(), "\"poll\"");
     }
 }

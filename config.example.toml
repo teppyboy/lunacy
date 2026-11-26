@@ -9,6 +9,7 @@
 # %LOCALAPPDATA%\lunacy on Windows, ~/Library/Application Support/lunacy on macOS).
 # state_dir = "/home/tretrauit/.local/share/lunacy"
 poll_interval = 300      # seconds between `git fetch` checks, per project
+# step_timeout = 3600    # default per-step timeout in seconds (project/step override)
 log_level = "info"       # trace | debug | info | warn | error
 # Shell argv used for `kind = "shell"` steps, project/step `shell` overrides it.
 # Unix default: ["bash", "-c"]; Windows default: ["cmd", "/C"].
@@ -68,6 +69,11 @@ platforms = { "ubuntu-latest" = "catthehacker/ubuntu:act-latest" }
 # scripts/with-act-lock.sh locks ~/.local/state/act-gate.lock with `flock`), so
 # the two never run act concurrently. Default: <state_dir>/act.lock. `~/` expands.
 # lock_file = "~/.local/state/act-gate.lock"
+# Aggressive build caching is enabled by default: persists act action/cache-server
+# dirs, mounts shared & per-project Docker cache volumes, sets DOCKER_BUILDKIT=1
+# and LUNACY_CACHE_DIR, and auto-adds --pull=false when mapped images exist locally.
+cache = true
+# cache_dir = "~/.local/share/lunacy/cache"   # defaults to <state_dir>/cache
 
 # ---------------------------------------------------------------------------
 # lunarum: Flutter web frontend. CI = the `web` job of local-deploy-ci.yml
@@ -85,6 +91,12 @@ github_repo = "teppyboy/lunarum"
 # every later step gets its path as LUNACY_CI_DIR (see the deploy step below).
 checkout = "none"
 poll_interval = 300
+# step_timeout = 3600    # default per-step timeout in seconds for this project
+# timeout = 7200         # total pipeline timeout in seconds across all steps
+# watch_prs = false      # poll & build open GitHub PRs (CI-only; PRs never deploy)
+# deploy_refs = ["master", "release/*", "tags/v*"]  # refs allowed to deploy (empty = [branch])
+# watch_tags = false     # watch remote tags even when deploy_refs has no tags/ pattern
+# cache = true           # override global [act] cache per project
 env = { }
 
 [[project.ci]]

@@ -107,6 +107,8 @@ pub fn wsl_translate_args(args: &[String]) -> Vec<String> {
         "--secret-file",
         "--var-file",
         "--artifact-server-path",
+        "--action-cache-path",
+        "--cache-server-path",
         "-C",
         "--directory",
     ];
@@ -189,6 +191,15 @@ impl ActProgress {
 
     pub fn substeps(&self) -> Vec<Substep> {
         self.substeps.clone()
+    }
+
+    /// Mark any substeps still in `StepStatus::Running` with `status` (e.g. on cancel or timeout).
+    pub fn finalize_running(&mut self, status: StepStatus) {
+        for s in self.substeps.iter_mut() {
+            if s.status == StepStatus::Running {
+                s.status = status;
+            }
+        }
     }
 
     /// Feed one output line. Returns the human-readable text act intended
@@ -380,6 +391,53 @@ pub fn job_runs_on(workflow_text: Option<&str>, job: Option<&str>) -> Vec<String
 
 // ---------------------------------------------------------- invocation
 
+/// Persistent named Docker cache volumes shared across all projects.
+pub const SHARED_CACHE_VOLUMES: &[(&str, &str)] = &[
+    ("lunacy-cache-cargo-registry", "/root/.cargo/registry"),
+    ("lunacy-cache-cargo-git", "/root/.cargo/git"),
+    ("lunacy-cache-rustup", "/root/.rustup"),
+    ("lunacy-cache-pub", "/root/.pub-cache"),
+    ("lunacy-cache-dart-server", "/root/.dartServer"),
+    ("lunacy-cache-npm", "/root/.npm"),
+    ("lunacy-cache-pnpm", "/root/.local/share/pnpm/store"),
+    ("lunacy-cache-go", "/root/go/pkg/mod"),
+    ("lunacy-cache-pip", "/root/.cache/pip"),
+    ("lunacy-cache-uv", "/root/.cache/uv"),
+    ("lunacy-cache-ccache", "/root/.cache/ccache"),
+];
+
+/// Default container env vars injected when aggressive caching is enabled.
+pub const DEFAULT_CACHE_ENVS: &[(&str, &str)] = &[
+    ("CARGO_TARGET_DIR", "/cache/cargo-target"),
+    ("CARGO_INCREMENTAL", "0"),
+    ("PUB_CACHE", "/root/.pub-cache"),
+];
+
+/// Project-scoped Docker cache volumes for a sanitized project slug.
+pub fn project_cache_volumes(slug: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            format!("lunacy-cache-{slug}-cargo-target"),
+            "/cache/cargo-target".to_string(),
+        ),
+        (
+            format!("lunacy-cache-{slug}-build"),
+            "/cache/build".to_string(),
+        ),
+    ]
+}
+
+/// Aggressive caching settings resolved for a single `act` invocation.
+#[derive(Debug, Clone)]
+pub struct ActCachePlan {
+    pub action_cache_path: PathBuf,
+    pub cache_server_path: PathBuf,
+    pub project_slug: String,
+    pub pull_false: bool,
+    pub include_container_volumes: bool,
+    pub project_env: BTreeMap<String, String>,
+}
+
 /// Everything a step needs, resolved from config plus the repo checkout.
 pub struct ActPlan {
     /// Files act needs on the command line; created by the caller, deleted after.
@@ -390,6 +448,180 @@ pub struct ActPlan {
     pub workflow: String,
     pub job: Option<String>,
     pub event: String,
+    pub cache: Option<ActCachePlan>,
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    let prefix = format!("{flag}=");
+    args.iter().any(|a| a == flag || a.starts_with(&prefix))
+}
+
+pub fn has_pull_flag(args: &[String]) -> bool {
+    has_flag(args, "--pull") || has_flag(args, "-p")
+}
+
+fn args_has_env_key(args: &[String], key: &str) -> bool {
+    let mut expect_val = false;
+    let key_eq = format!("{key}=");
+    for arg in args {
+        if expect_val {
+            expect_val = false;
+            if arg == key || arg.starts_with(&key_eq) {
+                return true;
+            }
+            continue;
+        }
+        if arg == "--env" {
+            expect_val = true;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--env=") {
+            if val == key || val.starts_with(&key_eq) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Extract all `--container-options <val>` / `--container-options=<val>` occurrences from `args`,
+/// returning `(remaining_args, extracted_option_strings)`.
+fn extract_container_options(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut rest = Vec::with_capacity(args.len());
+    let mut extracted = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--container-options" {
+            if i + 1 < args.len() {
+                let val = args[i + 1].trim();
+                if !val.is_empty() {
+                    extracted.push(val.to_string());
+                }
+                i += 2;
+                continue;
+            }
+        } else if let Some(val) = arg.strip_prefix("--container-options=") {
+            let val = val.trim();
+            if !val.is_empty() {
+                extracted.push(val.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        rest.push(arg.clone());
+        i += 1;
+    }
+    (rest, extracted)
+}
+
+/// Tokenize a `--container-options` string into whitespace-delimited shell-like tokens.
+fn split_option_tokens(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for ch in s.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => cur.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(ch),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+fn normalize_mount_path(p: &str) -> &str {
+    let trimmed = p.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// Return true if a Docker `--container-options` string already mounts `target_path`.
+fn container_opts_has_mount(opts: &str, target_path: &str) -> bool {
+    let target = normalize_mount_path(target_path);
+    let tokens = split_option_tokens(opts);
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        let vol_spec = if tok == "-v" || tok == "--volume" {
+            i += 1;
+            tokens.get(i).map(String::as_str)
+        } else {
+            tok.strip_prefix("--volume=")
+                .or_else(|| tok.strip_prefix("-v="))
+        };
+        if let Some(spec) = vol_spec {
+            let parts: Vec<&str> = spec.split(':').collect();
+            let mount_dest = if parts.len() >= 3
+                && parts[0].len() == 1
+                && parts[0].chars().all(|c| c.is_ascii_alphabetic())
+            {
+                // Windows host path like `C:\path:/container/path`
+                parts.get(2).copied()
+            } else if parts.len() >= 2 {
+                parts.get(1).copied()
+            } else {
+                parts.first().copied()
+            };
+            if let Some(dest) = mount_dest {
+                if normalize_mount_path(dest) == target {
+                    return true;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        let mount_spec = if tok == "--mount" {
+            i += 1;
+            tokens.get(i).map(String::as_str)
+        } else {
+            tok.strip_prefix("--mount=")
+        };
+        if let Some(spec) = mount_spec {
+            for part in spec.split(',') {
+                for key in ["target=", "dst=", "destination="] {
+                    if let Some(dest) = part.strip_prefix(key) {
+                        if normalize_mount_path(dest) == target {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Merge existing user `--container-options` with cache `-v <vol>:<mount>` mounts,
+/// skipping any mount whose container target path is already configured by the user.
+pub fn merge_container_options(existing: &[String], volumes: &[(String, String)]) -> String {
+    let mut parts: Vec<String> = existing
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let baseline = parts.join(" ");
+    for (vol, mount) in volumes {
+        if !container_opts_has_mount(&baseline, mount) {
+            parts.push(format!("-v {vol}:{mount}"));
+        }
+    }
+    parts.join(" ")
 }
 
 /// Build the act argv (without the program, which is returned separately).
@@ -423,8 +655,63 @@ pub fn build_args(
     }
     args.push("--artifact-server-path".into());
     args.push(plan.artifact_dir.to_string_lossy().to_string());
-    args.extend(act.args.iter().cloned());
-    args.extend(step.args.iter().cloned());
+
+    let mut user_args: Vec<String> = Vec::with_capacity(act.args.len() + step.args.len());
+    user_args.extend(act.args.iter().cloned());
+    user_args.extend(step.args.iter().cloned());
+
+    if let Some(cache) = &plan.cache {
+        if !has_flag(&user_args, "--use-new-action-cache") {
+            args.push("--use-new-action-cache".into());
+        }
+        if !has_flag(&user_args, "--action-cache-path") {
+            args.push("--action-cache-path".into());
+            args.push(cache.action_cache_path.to_string_lossy().to_string());
+        }
+        if !has_flag(&user_args, "--action-offline-mode") {
+            args.push("--action-offline-mode".into());
+        }
+        if !has_flag(&user_args, "--cache-server-path")
+            && !has_flag(&user_args, "--no-cache-server")
+        {
+            args.push("--cache-server-path".into());
+            args.push(cache.cache_server_path.to_string_lossy().to_string());
+        }
+        if cache.pull_false && !has_pull_flag(&user_args) {
+            args.push("--pull=false".into());
+        }
+
+        let (remaining_user_args, existing_container_opts) = extract_container_options(&user_args);
+        if cache.include_container_volumes {
+            let mut volumes: Vec<(String, String)> = SHARED_CACHE_VOLUMES
+                .iter()
+                .map(|(v, m)| ((*v).to_string(), (*m).to_string()))
+                .collect();
+            volumes.extend(project_cache_volumes(&cache.project_slug));
+            let merged = merge_container_options(&existing_container_opts, &volumes);
+            if !merged.is_empty() {
+                args.push("--container-options".into());
+                args.push(merged);
+            }
+            for (k, v) in DEFAULT_CACHE_ENVS {
+                if !args_has_env_key(&remaining_user_args, k)
+                    && !step.env.contains_key(*k)
+                    && !cache.project_env.contains_key(*k)
+                {
+                    args.push("--env".into());
+                    args.push(format!("{k}={v}"));
+                }
+            }
+        } else if !existing_container_opts.is_empty() {
+            args.push("--container-options".into());
+            args.push(existing_container_opts.join(" "));
+        }
+
+        args.extend(remaining_user_args);
+    } else {
+        args.extend(user_args);
+    }
+
     if wsl {
         wsl_translate_args(&args)
     } else {
@@ -457,7 +744,7 @@ pub fn pick_before(
     }
 }
 
-/// The `event.json` body act expects; the same shape lunarum's deploy worker builds.
+/// The `event.json` body act expects for push events; the same shape lunarum's deploy worker builds.
 #[allow(clippy::too_many_arguments)]
 pub fn event_json(
     sha: &str,
@@ -470,6 +757,15 @@ pub fn event_json(
     let repo = repo.unwrap_or("local/repo");
     let (owner, name) = repo.split_once('/').unwrap_or(("local", repo));
     let (pusher_name, pusher_email) = pusher;
+    let full_ref = if let Some(tag) = branch.strip_prefix("refs/tags/") {
+        format!("refs/tags/{tag}")
+    } else if let Some(tag) = branch.strip_prefix("tags/") {
+        format!("refs/tags/{tag}")
+    } else if branch.starts_with("refs/heads/") {
+        branch.to_string()
+    } else {
+        format!("refs/heads/{branch}")
+    };
     let head = serde_json::json!({
         "id": sha,
         "message": message,
@@ -479,7 +775,7 @@ pub fn event_json(
     serde_json::json!({
         "after": sha,
         "before": before,
-        "ref": format!("refs/heads/{branch}"),
+        "ref": full_ref,
         "repository": {
             "full_name": repo,
             "name": name,
@@ -489,6 +785,46 @@ pub fn event_json(
         "head_commit": head,
         "commits": [head],
         "pusher": { "name": pusher_name, "email": pusher_email },
+        "sender": { "login": owner, "type": "User" },
+    })
+    .to_string()
+}
+
+/// The `event.json` body act expects for `pull_request` events.
+#[allow(clippy::too_many_arguments)]
+pub fn pull_request_event_json(
+    number: u64,
+    title: &str,
+    head_sha: &str,
+    head_ref: &str,
+    base_sha: &str,
+    base_ref: &str,
+    default_branch: &str,
+    repo: Option<&str>,
+) -> String {
+    let repo = repo.unwrap_or("local/repo");
+    let (owner, name) = repo.split_once('/').unwrap_or(("local", repo));
+    serde_json::json!({
+        "action": "synchronize",
+        "number": number,
+        "pull_request": {
+            "number": number,
+            "title": title,
+            "head": {
+                "sha": head_sha,
+                "ref": head_ref,
+            },
+            "base": {
+                "sha": base_sha,
+                "ref": base_ref,
+            },
+        },
+        "repository": {
+            "full_name": repo,
+            "name": name,
+            "owner": { "login": owner },
+            "default_branch": default_branch,
+        },
         "sender": { "login": owner, "type": "User" },
     })
     .to_string()
@@ -717,6 +1053,9 @@ jobs:
             "--secret-file".to_string(),
             r"C:\Temp\secrets".to_string(),
             r"--artifact-server-path=D:\state\artifacts".to_string(),
+            "--action-cache-path".to_string(),
+            r"D:\state\cache\act-actions".to_string(),
+            r"--cache-server-path=D:\state\cache\act-cache-server".to_string(),
             "-P".to_string(),
             "ubuntu-latest=node:16".to_string(),
         ];
@@ -725,7 +1064,12 @@ jobs:
         assert_eq!(out[5], "/mnt/c/Temp/event.json");
         assert_eq!(out[7], "/mnt/c/Temp/secrets");
         assert_eq!(out[8], "--artifact-server-path=/mnt/d/state/artifacts");
-        assert_eq!(out[10], "ubuntu-latest=node:16");
+        assert_eq!(out[10], "/mnt/d/state/cache/act-actions");
+        assert_eq!(
+            out[11],
+            "--cache-server-path=/mnt/d/state/cache/act-cache-server"
+        );
+        assert_eq!(out[13], "ubuntu-latest=node:16");
     }
 
     #[test]
@@ -796,6 +1140,7 @@ jobs:
             workflow: ".github/workflows/ci.yml".into(),
             job: Some("web".into()),
             event: "push".into(),
+            cache: None,
         };
         let step = StepCfg {
             name: "s".into(),
@@ -824,5 +1169,277 @@ jobs:
         assert!(joined.contains("--secret-file /tmp/secrets"));
         assert!(joined.contains("--artifact-server-path /tmp/art"));
         assert!(joined.ends_with("--pull=false"));
+    }
+
+    #[test]
+    fn aggressive_cache_injects_flags_volumes_and_envs_cleanly() {
+        let plan = ActPlan {
+            event_file: PathBuf::from("/tmp/event.json"),
+            secret_file: None,
+            var_file: None,
+            artifact_dir: PathBuf::from("/tmp/art"),
+            workflow: ".github/workflows/ci.yml".into(),
+            job: Some("validate".into()),
+            event: "push".into(),
+            cache: Some(ActCachePlan {
+                action_cache_path: PathBuf::from("/state/cache/act-actions"),
+                cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
+                project_slug: "frostedge".into(),
+                pull_false: true,
+                include_container_volumes: true,
+                project_env: BTreeMap::from([("CARGO_INCREMENTAL".to_string(), "1".to_string())]),
+            }),
+        };
+        let step = StepCfg {
+            name: "Validate".into(),
+            kind: crate::config::StepKind::Act,
+            run: None,
+            workflow: Some(".github/workflows/ci.yml".into()),
+            job: Some("validate".into()),
+            event: None,
+            platforms: BTreeMap::new(),
+            args: vec![
+                "--container-options".into(),
+                "--shm-size=2g -v custom-cargo:/root/.cargo/registry".into(),
+                "--env".into(),
+                "PUB_CACHE=/custom/pub".into(),
+            ],
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            only_on: Vec::new(),
+            timeout: None,
+            cwd: None,
+            shell: None,
+            env: BTreeMap::new(),
+        };
+        let act = ActCfg {
+            args: vec!["--container-options=--add-host=host.docker.internal:host-gateway".into()],
+            ..ActCfg::default()
+        };
+        let platforms = BTreeMap::from([("ubuntu-latest".to_string(), "img".to_string())]);
+        let args = build_args(&plan, &step, &platforms, &act, false);
+
+        // Action cache, offline mode, cache server, and pull=false injected.
+        assert!(args.contains(&"--use-new-action-cache".to_string()));
+        assert!(args.contains(&"--action-offline-mode".to_string()));
+        assert!(args.contains(&"--pull=false".to_string()));
+        let acp_idx = args
+            .iter()
+            .position(|a| a == "--action-cache-path")
+            .expect("--action-cache-path");
+        assert_eq!(args[acp_idx + 1], "/state/cache/act-actions");
+        let csp_idx = args
+            .iter()
+            .position(|a| a == "--cache-server-path")
+            .expect("--cache-server-path");
+        assert_eq!(args[csp_idx + 1], "/state/cache/act-cache-server");
+
+        // Exactly ONE --container-options flag containing both user options AND cache mounts,
+        // without duplicating /root/.cargo/registry!
+        let co_indices: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--container-options" || a.starts_with("--container-options="))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            co_indices.len(),
+            1,
+            "must emit single --container-options: {args:?}"
+        );
+        let co_val = &args[co_indices[0] + 1];
+        assert!(
+            co_val.contains("--add-host=host.docker.internal:host-gateway"),
+            "{co_val}"
+        );
+        assert!(co_val.contains("--shm-size=2g"), "{co_val}");
+        assert!(
+            co_val.contains("-v custom-cargo:/root/.cargo/registry"),
+            "{co_val}"
+        );
+        assert!(
+            !co_val.contains("lunacy-cache-cargo-registry:/root/.cargo/registry"),
+            "must not duplicate already-mounted target: {co_val}"
+        );
+        assert!(
+            co_val.contains("-v lunacy-cache-cargo-git:/root/.cargo/git"),
+            "{co_val}"
+        );
+        assert!(
+            co_val.contains("-v lunacy-cache-npm:/root/.npm"),
+            "{co_val}"
+        );
+        assert!(
+            co_val.contains("-v lunacy-cache-frostedge-cargo-target:/cache/cargo-target"),
+            "{co_val}"
+        );
+        assert!(
+            co_val.contains("-v lunacy-cache-frostedge-build:/cache/build"),
+            "{co_val}"
+        );
+
+        // CARGO_TARGET_DIR auto-injected; CARGO_INCREMENTAL skipped (in project_env);
+        // PUB_CACHE skipped (already in step.args).
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--env CARGO_TARGET_DIR=/cache/cargo-target"),
+            "{joined}"
+        );
+        assert!(!joined.contains("CARGO_INCREMENTAL=0"), "{joined}");
+        assert!(!joined.contains("PUB_CACHE=/root/.pub-cache"), "{joined}");
+        assert!(joined.contains("--env PUB_CACHE=/custom/pub"), "{joined}");
+    }
+
+    #[test]
+    fn cache_flags_do_not_duplicate_user_overrides() {
+        let plan = ActPlan {
+            event_file: PathBuf::from("/tmp/event.json"),
+            secret_file: None,
+            var_file: None,
+            artifact_dir: PathBuf::from("/tmp/art"),
+            workflow: ".github/workflows/ci.yml".into(),
+            job: None,
+            event: "push".into(),
+            cache: Some(ActCachePlan {
+                action_cache_path: PathBuf::from("/state/cache/act-actions"),
+                cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
+                project_slug: "demo".into(),
+                pull_false: true,
+                include_container_volumes: false,
+                project_env: BTreeMap::new(),
+            }),
+        };
+        let step = StepCfg {
+            name: "S".into(),
+            kind: crate::config::StepKind::Act,
+            run: None,
+            workflow: Some(".github/workflows/ci.yml".into()),
+            job: None,
+            event: None,
+            platforms: BTreeMap::new(),
+            args: vec![
+                "--action-cache-path=/custom/actions".into(),
+                "--no-cache-server".into(),
+                "--pull=true".into(),
+                "--action-offline-mode=false".into(),
+                "--use-new-action-cache".into(),
+            ],
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            only_on: Vec::new(),
+            timeout: None,
+            cwd: None,
+            shell: None,
+            env: BTreeMap::from([("CARGO_TARGET_DIR".to_string(), "/custom/target".to_string())]),
+        };
+        let args = build_args(&plan, &step, &BTreeMap::new(), &ActCfg::default(), false);
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.starts_with("--action-cache-path"))
+                .count(),
+            1
+        );
+        assert!(!args.iter().any(|a| a.starts_with("--cache-server-path")));
+        assert_eq!(args.iter().filter(|a| a.starts_with("--pull")).count(), 1);
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.starts_with("--action-offline-mode"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| *a == "--use-new-action-cache")
+                .count(),
+            1
+        );
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("CARGO_TARGET_DIR=/cache/cargo-target")));
+    }
+
+    #[test]
+    fn self_hosted_cache_omits_container_volumes_and_container_envs() {
+        let plan = ActPlan {
+            event_file: PathBuf::from("/tmp/event.json"),
+            secret_file: None,
+            var_file: None,
+            artifact_dir: PathBuf::from("/tmp/art"),
+            workflow: ".github/workflows/ci.yml".into(),
+            job: Some("windows".into()),
+            event: "push".into(),
+            cache: Some(ActCachePlan {
+                action_cache_path: PathBuf::from("/state/cache/act-actions"),
+                cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
+                project_slug: "demo".into(),
+                pull_false: false,
+                include_container_volumes: false,
+                project_env: BTreeMap::new(),
+            }),
+        };
+        let step = StepCfg {
+            name: "WinBuild".into(),
+            kind: crate::config::StepKind::Act,
+            run: None,
+            workflow: Some(".github/workflows/ci.yml".into()),
+            job: Some("windows".into()),
+            event: None,
+            platforms: BTreeMap::new(),
+            args: Vec::new(),
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            only_on: Vec::new(),
+            timeout: None,
+            cwd: None,
+            shell: None,
+            env: BTreeMap::new(),
+        };
+        let platforms = BTreeMap::from([("windows-latest".to_string(), SELF_HOSTED.to_string())]);
+        let args = build_args(&plan, &step, &platforms, &ActCfg::default(), false);
+        let joined = args.join(" ");
+
+        assert!(args.contains(&"--use-new-action-cache".to_string()));
+        assert!(args.contains(&"--action-cache-path".to_string()));
+        assert!(args.contains(&"--cache-server-path".to_string()));
+        assert!(
+            !joined.contains("--container-options"),
+            "self-hosted should not inject docker volumes: {joined}"
+        );
+        assert!(
+            !joined.contains("/cache/cargo-target"),
+            "self-hosted must not receive container CARGO_TARGET_DIR: {joined}"
+        );
+        assert!(
+            !joined.contains("CARGO_INCREMENTAL=0"),
+            "self-hosted must not receive container CARGO_INCREMENTAL: {joined}"
+        );
+        assert!(
+            !joined.contains("/root/.pub-cache"),
+            "self-hosted must not receive container PUB_CACHE: {joined}"
+        );
+    }
+
+    #[test]
+    fn pull_request_event_json_shape() {
+        let raw = pull_request_event_json(
+            77,
+            "feat: pr ci",
+            "aaaa1111",
+            "feat/pr-ci",
+            "bbbb2222",
+            "master",
+            "master",
+            Some("teppyboy/frostedge"),
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["action"], "synchronize");
+        assert_eq!(v["number"], 77);
+        assert_eq!(v["pull_request"]["number"], 77);
+        assert_eq!(v["pull_request"]["title"], "feat: pr ci");
+        assert_eq!(v["pull_request"]["head"]["sha"], "aaaa1111");
+        assert_eq!(v["pull_request"]["head"]["ref"], "feat/pr-ci");
+        assert_eq!(v["pull_request"]["base"]["sha"], "bbbb2222");
+        assert_eq!(v["pull_request"]["base"]["ref"], "master");
+        assert_eq!(v["repository"]["full_name"], "teppyboy/frostedge");
     }
 }

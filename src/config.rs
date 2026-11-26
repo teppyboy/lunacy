@@ -98,6 +98,9 @@ pub struct General {
     /// argv prefix used to run a `shell` step, e.g. `["bash", "-c"]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<Vec<String>>,
+    /// Default per-step timeout in seconds (fallback when project/step don't set one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_timeout: Option<u64>,
 }
 
 impl Default for General {
@@ -107,6 +110,7 @@ impl Default for General {
             poll_interval: DEFAULT_POLL_INTERVAL,
             log_level: default_log_level(),
             shell: None,
+            step_timeout: None,
         }
     }
 }
@@ -255,7 +259,11 @@ impl DiscordCfg {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActCfg {
     /// e.g. `["act"]`, or `["wsl.exe", "-e", "act"]` on Windows.
@@ -272,6 +280,27 @@ pub struct ActCfg {
     /// Defaults to `state_dir/act.lock`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_file: Option<PathBuf>,
+    /// Enable aggressive build caching by default across act, Docker volumes, and shell env.
+    #[serde(default = "default_true")]
+    pub cache: bool,
+    /// Root directory for disk caches (action cache, cache server, per-project cache dirs).
+    /// Defaults to `state_dir/cache`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl Default for ActCfg {
+    fn default() -> Self {
+        ActCfg {
+            command: None,
+            native_command: None,
+            platforms: BTreeMap::new(),
+            args: Vec::new(),
+            lock_file: None,
+            cache: true,
+            cache_dir: None,
+        }
+    }
 }
 
 impl ActCfg {
@@ -285,6 +314,13 @@ impl ActCfg {
         self.native_command
             .clone()
             .unwrap_or_else(|| vec!["act".to_string()])
+    }
+
+    pub fn effective_cache_dir(&self, state_dir: &Path) -> PathBuf {
+        match &self.cache_dir {
+            Some(path) => expand_tilde(path),
+            None => state_dir.join("cache"),
+        }
     }
 
     pub fn is_wsl(&self) -> bool {
@@ -317,6 +353,12 @@ pub struct ProjectCfg {
     pub checkout: Checkout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<u64>,
+    /// Default per-step timeout in seconds for this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_timeout: Option<u64>,
+    /// Total pipeline timeout in seconds across all steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -329,6 +371,19 @@ pub struct ProjectCfg {
     pub shell: Option<Vec<String>>,
     #[serde(default)]
     pub platforms: BTreeMap<String, String>,
+    /// Poll/build open GitHub Pull Requests (CI-only; PRs never deploy).
+    #[serde(default)]
+    pub watch_prs: bool,
+    /// Optional branch/tag patterns allowed to trigger deploy (glob `*` supported).
+    /// Empty defaults to `[branch]`. Patterns starting with `tags/` or `refs/tags/` match tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deploy_refs: Vec<String>,
+    /// Watch remote tags even if `deploy_refs` has no `tags/` pattern.
+    #[serde(default)]
+    pub watch_tags: bool,
+    /// Override global `[act] cache` for this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<bool>,
     #[serde(default)]
     pub ci: Vec<StepCfg>,
     #[serde(default)]
@@ -347,6 +402,102 @@ impl ProjectCfg {
     pub fn poll_interval(&self, general: &General) -> u64 {
         self.poll_interval.unwrap_or(general.poll_interval).max(1)
     }
+
+    pub fn effective_step_timeout(&self, general: &General) -> u64 {
+        self.step_timeout
+            .or(general.step_timeout)
+            .unwrap_or(DEFAULT_STEP_TIMEOUT)
+            .max(1)
+    }
+
+    pub fn watches_tags(&self) -> bool {
+        self.watch_tags
+            || self
+                .deploy_refs
+                .iter()
+                .any(|r| r.starts_with("tags/") || r.starts_with("refs/tags/"))
+    }
+}
+
+/// Sanitize a project name into a lowercase ASCII alnum/`-` slug safe for Docker volumes and dirs.
+pub fn project_cache_slug(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "project".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Normalize a git ref or pattern into `(is_tag, short_name)`.
+fn normalize_ref(raw: &str) -> (bool, &str) {
+    if let Some(tag) = raw.strip_prefix("refs/tags/") {
+        (true, tag)
+    } else if let Some(tag) = raw.strip_prefix("tags/") {
+        (true, tag)
+    } else if let Some(branch) = raw.strip_prefix("refs/heads/") {
+        (false, branch)
+    } else {
+        (false, raw)
+    }
+}
+
+/// Simple glob matcher supporting `*` (matches zero or more characters).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// True when `git_ref` is allowed to run deploy steps for `project`.
+///
+/// Pull requests (`is_pr == true`) NEVER deploy.
+pub fn matches_deploy_ref(project: &ProjectCfg, git_ref: &str, is_pr: bool) -> bool {
+    if is_pr {
+        return false;
+    }
+    let (is_tag, short_name) = normalize_ref(git_ref);
+    if project.deploy_refs.is_empty() {
+        return !is_tag && short_name == project.branch;
+    }
+    project.deploy_refs.iter().any(|pattern| {
+        let (pat_is_tag, pat_short) = normalize_ref(pattern);
+        pat_is_tag == is_tag && glob_match(pat_short, short_name)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +597,21 @@ pub fn resolve_shell(
         .unwrap_or_else(|| default_shell(os))
 }
 
+/// Effective timeout for a single step: `step.timeout -> project.step_timeout -> general.step_timeout -> DEFAULT_STEP_TIMEOUT`.
+pub fn resolve_step_timeout(
+    general: &General,
+    project: Option<&ProjectCfg>,
+    step: &StepCfg,
+) -> std::time::Duration {
+    let secs = step
+        .timeout
+        .or_else(|| project.and_then(|p| p.step_timeout))
+        .or(general.step_timeout)
+        .unwrap_or(DEFAULT_STEP_TIMEOUT)
+        .max(1);
+    std::time::Duration::from_secs(secs)
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text =
@@ -468,6 +634,12 @@ impl Config {
             return Err(ConfigError::new(
                 "general.poll_interval",
                 "must be at least 1 second",
+            ));
+        }
+        if self.general.step_timeout == Some(0) {
+            return Err(ConfigError::new(
+                "general.step_timeout",
+                "must be at least 1",
             ));
         }
         if let Some(server) = &self.server {
@@ -548,6 +720,36 @@ impl Config {
                     return Err(ConfigError::new("act.lock_file", "must not be empty"));
                 }
             }
+            if let Some(cache_dir) = &act.cache_dir {
+                if cache_dir.as_os_str().is_empty() || cache_dir.to_string_lossy().trim().is_empty()
+                {
+                    return Err(ConfigError::new("act.cache_dir", "must not be empty"));
+                }
+                let norm_cache = normalize_path(&expand_tilde(cache_dir));
+                if norm_cache.parent().is_none() || norm_cache == Path::new("/") {
+                    return Err(ConfigError::new(
+                        "act.cache_dir",
+                        "must not be the filesystem root",
+                    ));
+                }
+                let norm_state = normalize_path(&expand_tilde(&self.state_dir()));
+                if norm_cache == norm_state {
+                    return Err(ConfigError::new(
+                        "act.cache_dir",
+                        "must not equal general.state_dir",
+                    ));
+                }
+                for p in &self.projects {
+                    if !p.repo_path.as_os_str().is_empty()
+                        && norm_cache == normalize_path(&expand_tilde(&p.repo_path))
+                    {
+                        return Err(ConfigError::new(
+                            "act.cache_dir",
+                            format!("must not equal project {:?} repo_path", p.name),
+                        ));
+                    }
+                }
+            }
         }
 
         let mut seen = std::collections::BTreeSet::new();
@@ -557,6 +759,17 @@ impl Config {
                 return Err(ConfigError::new(
                     format!("{base}.name"),
                     "must not be empty",
+                ));
+            }
+            if p.name == "."
+                || p.name.contains('/')
+                || p.name.contains('\\')
+                || p.name.contains("..")
+                || p.name.chars().any(|c| c.is_ascii_control())
+            {
+                return Err(ConfigError::new(
+                    format!("{base}.name"),
+                    "must not contain path separators or '..'",
                 ));
             }
             if !seen.insert(p.name.clone()) {
@@ -590,6 +803,24 @@ impl Config {
                         "expected \"owner/name\"",
                     ));
                 }
+            }
+            if p.step_timeout == Some(0) {
+                return Err(ConfigError::new(
+                    format!("{base}.step_timeout"),
+                    "must be at least 1",
+                ));
+            }
+            if p.timeout == Some(0) {
+                return Err(ConfigError::new(
+                    format!("{base}.timeout"),
+                    "must be at least 1",
+                ));
+            }
+            if p.deploy_refs.iter().any(|r| r.trim().is_empty()) {
+                return Err(ConfigError::new(
+                    format!("{base}.deploy_refs"),
+                    "must not contain empty entries",
+                ));
             }
             for (kind, steps) in [("ci", &p.ci), ("deploy", &p.deploy)] {
                 for (j, s) in steps.iter().enumerate() {
@@ -759,6 +990,33 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
     match directories::BaseDirs::new() {
         Some(base) => base.home_dir().join(rest),
         None => path.to_path_buf(),
+    }
+}
+
+/// Lexically normalize `.` and `..` segments and strip trailing separators.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    out.push(comp.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
     }
 }
 
@@ -1267,5 +1525,203 @@ chekout = "worktree"
         step.only_on = vec![Os::Windows];
         assert!(!step.applies_to(Os::Linux));
         assert!(step.applies_to(Os::Windows));
+    }
+
+    #[test]
+    fn timeout_resolution_and_validation() {
+        let mut general = General::default();
+        let mut project = example().projects.remove(0);
+        project.step_timeout = None;
+        project.timeout = None;
+        let mut step = project.ci[0].clone();
+        step.timeout = None;
+
+        // Default fallback -> 3600s
+        assert_eq!(
+            resolve_step_timeout(&general, Some(&project), &step),
+            std::time::Duration::from_secs(DEFAULT_STEP_TIMEOUT)
+        );
+        // General override
+        general.step_timeout = Some(1200);
+        assert_eq!(
+            resolve_step_timeout(&general, Some(&project), &step),
+            std::time::Duration::from_secs(1200)
+        );
+        assert_eq!(project.effective_step_timeout(&general), 1200);
+        // Project override
+        project.step_timeout = Some(900);
+        assert_eq!(
+            resolve_step_timeout(&general, Some(&project), &step),
+            std::time::Duration::from_secs(900)
+        );
+        assert_eq!(project.effective_step_timeout(&general), 900);
+        // Step override
+        step.timeout = Some(45);
+        assert_eq!(
+            resolve_step_timeout(&general, Some(&project), &step),
+            std::time::Duration::from_secs(45)
+        );
+
+        // Validation rejects 0 on general.step_timeout, project[i].step_timeout, project[i].timeout
+        let mut cfg = example();
+        cfg.general.step_timeout = Some(0);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("general.step_timeout"));
+
+        let mut cfg = example();
+        cfg.projects[0].step_timeout = Some(0);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("project[0].step_timeout"));
+
+        let mut cfg = example();
+        cfg.projects[0].timeout = Some(0);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("project[0].timeout"));
+    }
+
+    #[test]
+    fn deploy_ref_matching_and_pr_never_deploys() {
+        let mut p = example().projects.remove(0);
+        p.branch = "master".into();
+        p.deploy_refs.clear();
+        p.watch_tags = false;
+
+        // Default (empty deploy_refs): only watched branch deploys.
+        assert!(!p.watches_tags());
+        assert!(matches_deploy_ref(&p, "master", false));
+        assert!(matches_deploy_ref(&p, "refs/heads/master", false));
+        assert!(!matches_deploy_ref(&p, "main", false));
+        assert!(!matches_deploy_ref(&p, "develop", false));
+        assert!(!matches_deploy_ref(&p, "tags/master", false));
+        assert!(!matches_deploy_ref(&p, "refs/tags/master", false));
+        // PRs NEVER deploy, even if head_ref happens to be named `master`.
+        assert!(!matches_deploy_ref(&p, "master", true));
+        assert!(!matches_deploy_ref(&p, "refs/heads/master", true));
+
+        // Explicit branch & tag globs.
+        p.deploy_refs = vec![
+            "main".into(),
+            "release/*".into(),
+            "refs/heads/hotfix-*".into(),
+            "tags/v*".into(),
+            "refs/tags/prod-*".into(),
+        ];
+        assert!(p.watches_tags());
+        assert!(!matches_deploy_ref(&p, "master", false));
+        assert!(matches_deploy_ref(&p, "main", false));
+        assert!(matches_deploy_ref(&p, "refs/heads/main", false));
+        assert!(matches_deploy_ref(&p, "release/1.2", false));
+        assert!(matches_deploy_ref(&p, "refs/heads/release/2.0-rc1", false));
+        assert!(matches_deploy_ref(&p, "hotfix-urgent", false));
+        assert!(!matches_deploy_ref(&p, "feature/x", false));
+        // Tags match tag patterns only (both tags/ and refs/tags/ forms).
+        assert!(matches_deploy_ref(&p, "tags/v1.0.0", false));
+        assert!(matches_deploy_ref(&p, "refs/tags/v2.3.4-beta", false));
+        assert!(matches_deploy_ref(&p, "tags/prod-2026", false));
+        assert!(matches_deploy_ref(&p, "refs/tags/prod-1", false));
+        assert!(!matches_deploy_ref(&p, "tags/nightly", false));
+        assert!(!matches_deploy_ref(&p, "v1.0.0", false)); // branch named v1.0.0 != tag
+                                                           // Still NEVER deploys on PR!
+        assert!(!matches_deploy_ref(&p, "main", true));
+        assert!(!matches_deploy_ref(&p, "release/1.0", true));
+        assert!(!matches_deploy_ref(&p, "tags/v1.0.0", true));
+
+        // watch_tags alone enables tag watching.
+        p.deploy_refs = vec!["master".into()];
+        assert!(!p.watches_tags());
+        p.watch_tags = true;
+        assert!(p.watches_tags());
+    }
+
+    #[test]
+    fn act_cache_defaults_and_slug() {
+        let act = ActCfg::default();
+        assert!(act.cache);
+        assert_eq!(
+            act.effective_cache_dir(Path::new("/state")),
+            PathBuf::from("/state/cache")
+        );
+        let custom = ActCfg {
+            cache: false,
+            cache_dir: Some(PathBuf::from("/var/cache/lunacy")),
+            ..ActCfg::default()
+        };
+        assert!(!custom.cache);
+        assert_eq!(
+            custom.effective_cache_dir(Path::new("/state")),
+            PathBuf::from("/var/cache/lunacy")
+        );
+
+        assert_eq!(project_cache_slug("FrostEdge"), "frostedge");
+        assert_eq!(project_cache_slug("my_cool app/1"), "my-cool-app-1");
+        assert_eq!(project_cache_slug("___"), "project");
+    }
+
+    #[test]
+    fn project_name_rejects_path_traversal_and_control_chars() {
+        for bad in [
+            "foo/bar",
+            "foo\\bar",
+            "..",
+            "a..b",
+            ".",
+            "bad\nname",
+            "a\0b",
+        ] {
+            let mut cfg = example();
+            cfg.projects[0].name = bad.into();
+            let err = cfg.validate().unwrap_err();
+            assert_eq!(
+                err.field.as_deref(),
+                Some("project[0].name"),
+                "name={bad:?}"
+            );
+            assert!(
+                err.message.contains("path separators") || err.message.contains(".."),
+                "name={bad:?} msg={}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn act_cache_dir_rejects_root_state_dir_and_repo_path() {
+        for bad in ["", "   ", "/", "///", "/tmp/.."] {
+            let mut cfg = example();
+            cfg.act = Some(ActCfg {
+                cache_dir: Some(PathBuf::from(bad)),
+                ..ActCfg::default()
+            });
+            let err = cfg.validate().unwrap_err();
+            assert_eq!(err.field.as_deref(), Some("act.cache_dir"), "bad={bad:?}");
+        }
+
+        // Equal to general.state_dir (even with trailing slash).
+        let mut cfg = example();
+        cfg.general.state_dir = Some(PathBuf::from("/var/lib/lunacy"));
+        cfg.act = Some(ActCfg {
+            cache_dir: Some(PathBuf::from("/var/lib/lunacy/")),
+            ..ActCfg::default()
+        });
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("act.cache_dir"));
+
+        // Equal to a project's repo_path.
+        let mut cfg = example();
+        let repo = cfg.projects[0].repo_path.clone();
+        cfg.act = Some(ActCfg {
+            cache_dir: Some(repo),
+            ..ActCfg::default()
+        });
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("act.cache_dir"));
+
+        // Distinct non-root cache_dir is accepted.
+        let mut cfg = example();
+        cfg.act = Some(ActCfg {
+            cache_dir: Some(PathBuf::from("/var/cache/lunacy")),
+            ..ActCfg::default()
+        });
+        cfg.validate().expect("valid cache_dir");
     }
 }

@@ -311,16 +311,16 @@ if [ -n "${LUNACY_SYNC_LOCAL_WEB_DIR:-}" ]; then
   if [ -n "$sync_dir" ]; then
     sync_parent="$(dirname "$sync_dir")"
     if [ -d "$sync_parent" ]; then
-      src_real="$(realpath ./apps/lunacy-apps/lunacy-ui/dist)"
+      src_real="$(realpath ./apps/lunacy-ui/dist)"
       dst_real="$(realpath -m "$sync_dir")"
       if [ "$src_real" != "$dst_real" ]; then
         echo "==> [release] Syncing web UI bundle to $sync_dir"
         if command -v rsync >/dev/null 2>&1; then
           mkdir -p "$sync_dir"
-          rsync -a --delete --delay-updates ./apps/lunacy-apps/lunacy-ui/dist/ "$sync_dir/"
+          rsync -a --delete --delay-updates ./apps/lunacy-ui/dist/ "$sync_dir/"
         else
           tmp_sync="$(mktemp -d "$sync_parent/.lunacy-web-sync.XXXXXX")"
-          cp -a ./apps/lunacy-apps/lunacy-ui/dist/. "$tmp_sync/"
+          cp -a ./apps/lunacy-ui/dist/. "$tmp_sync/"
           if [ -e "$sync_dir" ]; then
             old_sync="$sync_parent/.lunacy-web-old.$$"
             rm -rf "$old_sync"

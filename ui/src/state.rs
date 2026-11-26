@@ -4,7 +4,7 @@
 //! shared worker pool) and `spawn_local` + `fetch` on web. Answers land in `poll`, and one
 //! `tx.wake_at` for the next deadline is what keeps an idle window from redrawing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[cfg(not(target_arch = "wasm32"))]
 use rune::Latest;
@@ -13,9 +13,13 @@ use serde_json::Value;
 
 use crate::api::{self, Answer, Call};
 use crate::config::{Project, Step};
-use crate::model::{Project as ProjectView, ProjectState, Run, SystemInfo, Workflow};
+use crate::model::{
+    DeployChecksReport, Project as ProjectView, ProjectState, Run, StepStatus, Substep, SystemInfo,
+    Workflow,
+};
 use crate::net::Failure;
 use crate::paths::{self, Key};
+use crate::updater::{UpdateStatus, Updater};
 
 /// The projects list's poll period (`docs/api.md`: "every ~2 s").
 pub const PROJECTS_EVERY: f64 = 2.0;
@@ -164,6 +168,8 @@ const PREF_THEME_KEY: &str = "theme";
 const PREF_ZOOM_KEY: &str = "zoom";
 #[cfg(not(target_arch = "wasm32"))]
 const PREF_LOG_WRAP_KEY: &str = "log_wrap";
+#[cfg(not(target_arch = "wasm32"))]
+const PREF_AUTO_UPDATE_KEY: &str = "auto_update_check";
 
 /// Supported discrete UI zoom stops shown in Appearance and stepped by `Ctrl/Cmd` `=`/`-`.
 pub const ZOOM_STEPS: [f32; 5] = [0.9, 1.0, 1.1, 1.25, 1.5];
@@ -238,6 +244,40 @@ pub(crate) fn save_zoom_to(prefs: &mut rune::prefs::Prefs, zoom: Option<f32>) {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn save_log_wrap_to(prefs: &mut rune::prefs::Prefs, wrap: bool) {
     let _ = prefs.set(PREF_LOG_WRAP_KEY, &wrap);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn load_auto_update_from(prefs: &rune::prefs::Prefs) -> Option<bool> {
+    prefs.get::<bool>(PREF_AUTO_UPDATE_KEY)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_auto_update_to(prefs: &mut rune::prefs::Prefs, enabled: bool) {
+    let _ = prefs.set(PREF_AUTO_UPDATE_KEY, &enabled);
+}
+
+fn load_auto_update_pref() -> Option<bool> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+        load_auto_update_from(&prefs)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
+fn save_auto_update_pref(enabled: bool) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+        save_auto_update_to(&mut prefs, enabled);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = enabled;
+    }
 }
 
 fn load_window_prefs() -> (Option<crate::theme::ThemeMode>, Option<f32>, Option<bool>) {
@@ -329,9 +369,13 @@ pub enum Slot {
     System,
     Workflows,
     Trigger,
+    Cancel,
+    DeployChecks,
+    ForceDeploy,
+    ClearCache,
 }
 
-const SLOTS: usize = 8;
+const SLOTS: usize = 12;
 
 fn slot_of(slot: Slot) -> usize {
     match slot {
@@ -343,6 +387,10 @@ fn slot_of(slot: Slot) -> usize {
         Slot::System => 5,
         Slot::Workflows => 6,
         Slot::Trigger => 7,
+        Slot::Cancel => 8,
+        Slot::DeployChecks => 9,
+        Slot::ForceDeploy => 10,
+        Slot::ClearCache => 11,
     }
 }
 
@@ -506,6 +554,7 @@ pub enum SettingsPage {
     Discord,
     Act,
     Projects,
+    Deploy,
     Diagnostics,
     Connection,
     Appearance,
@@ -522,18 +571,22 @@ impl SettingsPage {
         SettingsPage::Projects,
     ];
 
-    /// Window-local pages (not written to `config.toml`), in sidebar order.
-    pub const WINDOW: [SettingsPage; 3] = [
+    /// Window-local / inspection pages (not written to `config.toml`), in sidebar order.
+    pub const WINDOW: [SettingsPage; 4] = [
+        SettingsPage::Deploy,
         SettingsPage::Diagnostics,
         SettingsPage::Connection,
         SettingsPage::Appearance,
     ];
 
-    /// Whether this page belongs to this window rather than `config.toml`.
+    /// Whether this page belongs to this window or read-only inspection rather than `config.toml`.
     pub fn is_local(self) -> bool {
         matches!(
             self,
-            SettingsPage::Diagnostics | SettingsPage::Connection | SettingsPage::Appearance
+            SettingsPage::Deploy
+                | SettingsPage::Diagnostics
+                | SettingsPage::Connection
+                | SettingsPage::Appearance
         )
     }
 
@@ -545,6 +598,7 @@ impl SettingsPage {
             SettingsPage::Discord => "Discord",
             SettingsPage::Act => "act",
             SettingsPage::Projects => "Projects",
+            SettingsPage::Deploy => "Deploy",
             SettingsPage::Diagnostics => "Diagnostics",
             SettingsPage::Connection => "Connection",
             SettingsPage::Appearance => "Appearance",
@@ -553,7 +607,9 @@ impl SettingsPage {
 
     pub fn blurb(self) -> &'static str {
         match self {
-            SettingsPage::General => "State directory, poll interval and the default shell.",
+            SettingsPage::General => {
+                "State directory, poll interval, step timeouts and the default shell."
+            }
             SettingsPage::Server => {
                 "Where the HTTP API listens, its token, and the web build's root."
             }
@@ -565,11 +621,14 @@ impl SettingsPage {
             SettingsPage::Projects => {
                 "Repositories to watch, and the CI and deploy steps for each."
             }
+            SettingsPage::Deploy => {
+                "Pre-flight deploy checks, checkout safety, timeouts, and step readiness."
+            }
             SettingsPage::Diagnostics => "The daemon's host, tools and config file.",
             SettingsPage::Connection => {
                 "This window's server URL and token, not part of config.toml."
             }
-            SettingsPage::Appearance => "Theme mode and interface scale for this window.",
+            SettingsPage::Appearance => "Theme mode, interface scale, and desktop updates.",
         }
     }
 }
@@ -801,15 +860,30 @@ pub struct State {
     pub editor: Editor,
     pub system: Option<SystemInfo>,
     pub system_error: Option<String>,
+    pub deploy_checks: Option<DeployChecksReport>,
+    pub deploy_checks_error: Option<String>,
+    pub deploy_checks_loading: bool,
 
     pub toasts: Vec<Toast>,
     pub(crate) next_toast: u64,
     /// A "Run now" in flight, by project.
     pub triggering: Option<String>,
+    /// A "Cancel" in flight, by run id or project name.
+    pub cancelling: Option<String>,
+    /// A "Force deploy" in flight, by project name or run id.
+    pub force_deploying: Option<String>,
+    /// A cache-clear request in flight.
+    pub clearing_cache: bool,
     /// The force toggle beside "Run now".
     pub force: bool,
 
     pub bus: Bus,
+    pub update_status: UpdateStatus,
+    pub update_dismissed: bool,
+    pub auto_update_check: bool,
+    pub(crate) updater: Updater,
+    #[cfg(not(target_arch = "wasm32"))]
+    auto_update_triggered: bool,
 
     // Deadlines on the runtime's clock.
     next_projects: f64,
@@ -833,6 +907,14 @@ pub struct State {
     pub user_zoom: Option<f32>,
     /// Whether step logs wrap long lines to fit the pane (persisted; default `true`).
     pub log_wrap: bool,
+    /// Whether `act` steps show the raw log stream instead of the expandable Steps summary accordion.
+    pub log_view_raw: bool,
+    /// Tracks `(run_id, step_index, substep_index)` toggled open by the user in the Steps accordion.
+    pub expanded_substeps: BTreeSet<(String, usize, usize)>,
+    /// Tracks `(run_id, step_index)` where the user has manually interacted with the accordion.
+    pub substep_toggled: BTreeSet<(String, usize)>,
+    /// Lets users collapse/expand a shell step's log summary header cleanly.
+    pub shell_log_collapsed: bool,
     /// Tracks `(commit_gen, target_zoom)` so responsive default zoom never oscillates.
     pub(crate) zoom_track: std::cell::Cell<(u64, f32)>,
     /// Re-scroll run log to bottom once the next active `Answer::Log` arrives (run open / Tail<->Full).
@@ -868,11 +950,23 @@ impl State {
             editor: Editor::default(),
             system: None,
             system_error: None,
+            deploy_checks: None,
+            deploy_checks_error: None,
+            deploy_checks_loading: false,
             toasts: Vec::new(),
             next_toast: 1,
             triggering: None,
+            cancelling: None,
+            force_deploying: None,
+            clearing_cache: false,
             force: false,
             bus: Bus::default(),
+            update_status: UpdateStatus::Idle,
+            update_dismissed: false,
+            auto_update_check: true,
+            updater: Updater::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            auto_update_triggered: false,
             next_projects: 0.0,
             next_runs: 0.0,
             next_run: 0.0,
@@ -886,6 +980,10 @@ impl State {
             theme_mode: crate::theme::ThemeMode::System,
             user_zoom: None,
             log_wrap: true,
+            log_view_raw: false,
+            expanded_substeps: BTreeSet::new(),
+            substep_toggled: BTreeSet::new(),
+            shell_log_collapsed: false,
             zoom_track: std::cell::Cell::new((0, 1.0)),
             stick_log_pending: false,
         };
@@ -898,7 +996,7 @@ impl State {
         state
     }
 
-    /// Loads persisted window appearance, zoom, and log-wrap preferences (`localStorage` on web, `Prefs` natively).
+    /// Loads persisted window appearance, zoom, log-wrap, and update preferences (`localStorage` on web, `Prefs` natively).
     pub fn load_prefs(&mut self) {
         let (theme, zoom, log_wrap) = load_window_prefs();
         if let Some(mode) = theme {
@@ -910,6 +1008,66 @@ impl State {
         if let Some(wrap) = log_wrap {
             self.log_wrap = wrap;
         }
+        if let Some(auto_update) = load_auto_update_pref() {
+            self.auto_update_check = auto_update;
+        }
+    }
+
+    pub fn set_auto_update_check(&mut self, enabled: bool, tx: &mut Tx) {
+        self.auto_update_check = enabled;
+        save_auto_update_pref(enabled);
+        let _ = tx;
+    }
+
+    pub fn toggle_auto_update_check(&mut self, tx: &mut Tx) {
+        self.set_auto_update_check(!self.auto_update_check, tx);
+    }
+
+    pub fn check_for_updates(&mut self, tx: &mut Tx) {
+        if self.update_status.is_busy() {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        if !self.demo {
+            self.updater.check_now();
+        }
+        self.refresh(tx);
+    }
+
+    pub fn install_update(&mut self, tx: &mut Tx) {
+        if self.update_status.is_busy() {
+            return;
+        }
+        let Some(info) = self.update_status.info().cloned() else {
+            return;
+        };
+        if info.asset_url.is_none() {
+            if !info.html_url.is_empty() {
+                let _ = tx.open_url(&info.html_url);
+            }
+            return;
+        }
+        self.update_status = UpdateStatus::Installing {
+            info: info.clone(),
+            stage: "Starting download…".into(),
+        };
+        if !self.demo {
+            self.updater.install(info);
+        }
+        self.refresh(tx);
+    }
+
+    pub fn restart_for_update(&mut self, tx: &mut Tx) {
+        match crate::updater::relaunch_current_exe() {
+            Ok(()) => tx.close_window(),
+            Err(err) => {
+                self.toast(tx, ToastKind::Error, "Could not restart", &err);
+            }
+        }
+    }
+
+    pub fn dismiss_update_banner(&mut self) {
+        self.update_dismissed = true;
     }
 
     /// Updates window theme mode and persists it immediately, smoothly crossfading colors.
@@ -981,6 +1139,10 @@ impl State {
         self.run_error = None;
         self.runs_error = None;
         self.system_error = None;
+        self.deploy_checks_error = None;
+        self.cancelling = None;
+        self.force_deploying = None;
+        self.clearing_cache = false;
         if self.live.server != prev_server {
             self.projects.clear();
             self.runs.clear();
@@ -988,7 +1150,11 @@ impl State {
             self.run = None;
             self.open_step = None;
             self.logs.clear();
+            self.expanded_substeps.clear();
+            self.substep_toggled.clear();
+            self.shell_log_collapsed = false;
             self.system = None;
+            self.deploy_checks = None;
         }
         self.editor = Editor {
             page: self.editor.page,
@@ -1005,13 +1171,24 @@ impl State {
         self.request_projects();
         self.request_config();
         self.request_system();
+        if matches!(
+            self.view,
+            View::Settings {
+                page: SettingsPage::Deploy
+            }
+        ) {
+            self.request_deploy_checks();
+        }
         self.refresh(tx);
     }
 
     /// The runtime's waker, from `AppSpec::setup`: native answers wake `poll` with it.
     pub fn attach(&mut self, waker: rune::Waker) {
         #[cfg(not(target_arch = "wasm32"))]
-        self.bus.set_waker(waker);
+        {
+            self.bus.set_waker(waker.clone());
+            self.updater.set_waker(waker);
+        }
         #[cfg(target_arch = "wasm32")]
         let _ = waker;
     }
@@ -1046,7 +1223,9 @@ impl State {
     /// Whether an answer for `call` is still what the view wants.
     pub fn wants(&self, call: &Call) -> bool {
         match call {
-            Call::Projects | Call::Config | Call::System | Call::Health => true,
+            Call::Projects | Call::Config | Call::System | Call::DeployChecks | Call::Health => {
+                true
+            }
             Call::Runs(name, _) => {
                 matches!(&self.view, View::Project { name: open } if open == name)
             }
@@ -1062,7 +1241,13 @@ impl State {
             // The workflows answer carries no project, so it is kept unless the editor closed.
             Call::Workflows { .. } => self.editor.loaded,
             Call::Project(_) => true,
-            Call::Trigger { .. } | Call::SaveConfig(_) => true,
+            Call::Trigger { .. }
+            | Call::CancelRun { .. }
+            | Call::CancelProject { .. }
+            | Call::ForceDeployProject { .. }
+            | Call::ForceDeployRun { .. }
+            | Call::ClearCache { .. }
+            | Call::SaveConfig(_) => true,
         }
     }
 
@@ -1096,6 +1281,17 @@ impl State {
 
     pub fn request_system(&mut self) {
         self.send(Slot::System, Call::System);
+    }
+
+    pub fn request_deploy_checks(&mut self) {
+        self.deploy_checks_loading = true;
+        self.deploy_checks_error = None;
+        if !self.demo {
+            self.send(Slot::DeployChecks, Call::DeployChecks);
+        } else {
+            self.deploy_checks_loading = false;
+            self.deploy_checks = Some(crate::demo::deploy_checks());
+        }
     }
 
     pub fn request_log(&mut self, run: &str, index: usize, mode: LogMode) {
@@ -1138,6 +1334,152 @@ impl State {
                 force: self.force,
             },
         );
+    }
+
+    pub fn cancel_run(&mut self, id: &str, tx: &mut Tx) {
+        if self.cancelling.as_deref() == Some(id) {
+            return;
+        }
+        self.cancelling = Some(id.to_string());
+        if !self.demo {
+            self.send(Slot::Cancel, Call::CancelRun { id: id.to_string() });
+        }
+        self.refresh(tx);
+    }
+
+    pub fn cancel_project(&mut self, name: &str, tx: &mut Tx) {
+        if self.cancelling.as_deref() == Some(name) {
+            return;
+        }
+        self.cancelling = Some(name.to_string());
+        if !self.demo {
+            self.send(
+                Slot::Cancel,
+                Call::CancelProject {
+                    name: name.to_string(),
+                },
+            );
+        }
+        self.refresh(tx);
+    }
+
+    pub fn force_deploy_project(&mut self, name: &str, tx: &mut Tx) {
+        if self.force_deploying.as_deref() == Some(name) {
+            return;
+        }
+        self.force_deploying = Some(name.to_string());
+        if !self.demo {
+            self.send(
+                Slot::ForceDeploy,
+                Call::ForceDeployProject {
+                    name: name.to_string(),
+                },
+            );
+        }
+        self.refresh(tx);
+    }
+
+    pub fn force_deploy_run(&mut self, id: &str, tx: &mut Tx) {
+        if self.force_deploying.as_deref() == Some(id) {
+            return;
+        }
+        self.force_deploying = Some(id.to_string());
+        if !self.demo {
+            self.send(
+                Slot::ForceDeploy,
+                Call::ForceDeployRun { id: id.to_string() },
+            );
+        }
+        self.refresh(tx);
+    }
+
+    pub fn clear_cache(&mut self, project: Option<&str>, tx: &mut Tx) {
+        if self.clearing_cache {
+            return;
+        }
+        self.clearing_cache = true;
+        if !self.demo {
+            self.send(
+                Slot::ClearCache,
+                Call::ClearCache {
+                    project: project.map(str::to_string),
+                },
+            );
+        }
+        self.refresh(tx);
+    }
+
+    /// Whether a substep card in the Steps accordion is expanded.
+    /// Before the user interacts with a step, running and failed/timed-out substeps auto-expand
+    /// while passed/pending/skipped substeps stay compactly collapsed.
+    pub fn is_substep_expanded(
+        &self,
+        run_id: &str,
+        step_index: usize,
+        sub_idx: usize,
+        status: StepStatus,
+    ) -> bool {
+        let step_key = (run_id.to_string(), step_index);
+        if self.substep_toggled.contains(&step_key) {
+            self.expanded_substeps
+                .contains(&(run_id.to_string(), step_index, sub_idx))
+        } else {
+            matches!(
+                status,
+                StepStatus::Running | StepStatus::Failure | StepStatus::Timeout
+            )
+        }
+    }
+
+    /// Toggles one substep card in the Steps accordion while preserving any initially auto-expanded cards.
+    pub fn toggle_substep(
+        &mut self,
+        run_id: &str,
+        step_index: usize,
+        sub_idx: usize,
+        substeps: &[Substep],
+        preamble_auto_open: bool,
+    ) {
+        let step_key = (run_id.to_string(), step_index);
+        if self.substep_toggled.insert(step_key) {
+            for (idx, sub) in substeps.iter().enumerate() {
+                if matches!(
+                    sub.status,
+                    StepStatus::Running | StepStatus::Failure | StepStatus::Timeout
+                ) {
+                    self.expanded_substeps
+                        .insert((run_id.to_string(), step_index, idx));
+                }
+            }
+            if preamble_auto_open {
+                self.expanded_substeps
+                    .insert((run_id.to_string(), step_index, substeps.len()));
+            }
+        }
+        let item_key = (run_id.to_string(), step_index, sub_idx);
+        if !self.expanded_substeps.remove(&item_key) {
+            self.expanded_substeps.insert(item_key);
+        }
+    }
+
+    /// Expands or collapses every substep card (plus optional preamble bucket) for a step.
+    pub fn set_all_substeps_expanded(
+        &mut self,
+        run_id: &str,
+        step_index: usize,
+        total_cards: usize,
+        expand: bool,
+    ) {
+        self.substep_toggled
+            .insert((run_id.to_string(), step_index));
+        for sub_idx in 0..total_cards {
+            let item_key = (run_id.to_string(), step_index, sub_idx);
+            if expand {
+                self.expanded_substeps.insert(item_key);
+            } else {
+                self.expanded_substeps.remove(&item_key);
+            }
+        }
     }
 
     pub fn save(&mut self) {
@@ -1263,6 +1605,10 @@ impl State {
             Call::System => {
                 self.system_error = Some(failure.message());
             }
+            Call::DeployChecks => {
+                self.deploy_checks_loading = false;
+                self.deploy_checks_error = Some(failure.message());
+            }
             Call::Workflows { .. } => {
                 self.editor.workflows_loading = false;
                 toast = Some((
@@ -1288,6 +1634,38 @@ impl State {
                         failure.message(),
                     ));
                 }
+            }
+            Call::CancelRun { .. } | Call::CancelProject { .. } => {
+                self.cancelling = None;
+                toast = Some((
+                    ToastKind::Error,
+                    "Could not cancel run".into(),
+                    failure.message(),
+                ));
+            }
+            Call::ForceDeployProject { name } | Call::ForceDeployRun { id: name } => {
+                self.force_deploying = None;
+                if matches!(failure, Failure::Api { status: 409, .. }) {
+                    toast = Some((
+                        ToastKind::Info,
+                        "Already running".into(),
+                        format!("{name} already has a run in progress."),
+                    ));
+                } else {
+                    toast = Some((
+                        ToastKind::Error,
+                        "Force deploy failed".into(),
+                        failure.message(),
+                    ));
+                }
+            }
+            Call::ClearCache { .. } => {
+                self.clearing_cache = false;
+                toast = Some((
+                    ToastKind::Error,
+                    "Could not clear cache".into(),
+                    failure.message(),
+                ));
             }
             Call::Project(_) | Call::Health => {}
         }
@@ -1326,6 +1704,22 @@ impl State {
                     }
                 }
                 self.projects = projects;
+                if let Some(cid) = self.cancelling.as_deref() {
+                    let still_running = self.projects.iter().any(|p| {
+                        p.running
+                            && (p.name == cid
+                                || p.current_run
+                                    .as_ref()
+                                    .is_some_and(|r| r.id == cid && r.status.is_running()))
+                    });
+                    let finished_seen = self.projects.iter().any(|p| {
+                        (!p.running && p.name == cid)
+                            || p.last_run.as_ref().is_some_and(|r| r.id == cid)
+                    });
+                    if !still_running && finished_seen {
+                        self.cancelling = None;
+                    }
+                }
                 // A project that vanished from the config takes the detail view with it.
                 if let View::Project { name } = &self.view {
                     if !self.projects.iter().any(|p| &p.name == name) {
@@ -1359,15 +1753,21 @@ impl State {
                         .is_some_and(|s| s.status.is_live())
                         && !run.steps[idx].status.is_live()
                 });
-                let changed = self
-                    .run
-                    .as_ref()
-                    .map(|r| (r.status, r.finished_at, r.steps.len()))
-                    != Some((run.status, run.finished_at, run.steps.len()));
+                let changed = self.run.as_ref() != Some(run.as_ref());
                 self.open_step = open;
+                if !run.status.is_running() && self.cancelling.as_deref() == Some(run.id.as_str()) {
+                    self.cancelling = None;
+                }
                 self.run = Some(*run);
                 self.run_error = None;
-                if prev_open != open && open.is_some() {
+                let in_steps_accordion = !self.log_view_raw
+                    && open.is_some_and(|idx| {
+                        self.run
+                            .as_ref()
+                            .and_then(|r| r.steps.get(idx))
+                            .is_some_and(|st| !st.substeps.is_empty())
+                    });
+                if prev_open != open && open.is_some() && !in_steps_accordion {
                     self.stick_log_pending = true;
                     tx.scroll_to_bottom_instant("run-log-scroll");
                 }
@@ -1393,6 +1793,12 @@ impl State {
             } => {
                 let active =
                     self.run.as_ref().is_some_and(|r| r.id == run) && self.open_step == Some(index);
+                let in_steps_accordion = !self.log_view_raw
+                    && self
+                        .run
+                        .as_ref()
+                        .and_then(|r| r.steps.get(index))
+                        .is_some_and(|st| !st.substeps.is_empty());
                 match self.logs.get_mut(&(run, index)) {
                     Some(entry)
                         if entry.mode
@@ -1407,7 +1813,7 @@ impl State {
                         entry.text = text;
                         entry.loading = false;
                         entry.error = None;
-                        if active && (was_empty || self.stick_log_pending) {
+                        if active && !in_steps_accordion && (was_empty || self.stick_log_pending) {
                             self.stick_log_pending = false;
                             tx.scroll_to_bottom_instant("run-log-scroll");
                         }
@@ -1432,6 +1838,64 @@ impl State {
                 self.next_projects = 0.0;
                 self.next_runs = 0.0;
                 self.next_run = 0.0;
+                true
+            }
+            Answer::Cancelled { id, ok } => {
+                self.cancelling = None;
+                match ok {
+                    Ok(res) => {
+                        let target = if res.project.is_empty() {
+                            id
+                        } else {
+                            res.project
+                        };
+                        self.toast(
+                            tx,
+                            ToastKind::Info,
+                            "Cancelling run",
+                            &format!("{target}: cancellation requested."),
+                        );
+                        self.next_projects = 0.0;
+                        self.next_runs = 0.0;
+                        self.next_run = 0.0;
+                        self.refresh(tx);
+                    }
+                    Err(err) => {
+                        self.toast(tx, ToastKind::Error, "Could not cancel run", &err.error);
+                    }
+                }
+                true
+            }
+            Answer::ForceDeployed { target, result } => {
+                self.force_deploying = None;
+                let body = if result.sha.is_empty() {
+                    format!("{target}: deploy-only run queued.")
+                } else {
+                    format!(
+                        "{target}: deploy-only run queued for {}.",
+                        crate::widgets::short_sha(&result.sha)
+                    )
+                };
+                self.toast(tx, ToastKind::Success, "Deploy queued", &body);
+                self.next_projects = 0.0;
+                self.next_runs = 0.0;
+                self.next_run = 0.0;
+                self.refresh(tx);
+                true
+            }
+            Answer::CacheCleared { project, result } => {
+                self.clearing_cache = false;
+                let scope = project.as_deref().unwrap_or("All projects");
+                let count = result.removed.len();
+                let body = if count == 0 {
+                    format!("{scope}: build cache was already empty.")
+                } else {
+                    format!(
+                        "{scope}: cleared {count} cached {}.",
+                        if count == 1 { "entry" } else { "entries" }
+                    )
+                };
+                self.toast(tx, ToastKind::Success, "Cache cleared", &body);
                 true
             }
             Answer::Config(cfg) => {
@@ -1465,6 +1929,16 @@ impl State {
                     )
                 };
                 self.toast(tx, ToastKind::Success, "Config saved", &body);
+                if self.deploy_checks.is_some()
+                    || matches!(
+                        self.view,
+                        View::Settings {
+                            page: SettingsPage::Deploy
+                        }
+                    )
+                {
+                    self.request_deploy_checks();
+                }
                 true
             }
             Answer::System(info) => {
@@ -1473,6 +1947,12 @@ impl State {
                 }
                 self.system = Some(*info);
                 self.system_error = None;
+                true
+            }
+            Answer::DeployChecks(report) => {
+                self.deploy_checks_loading = false;
+                self.deploy_checks = Some(*report);
+                self.deploy_checks_error = None;
                 true
             }
             Answer::Workflows {
@@ -1605,6 +2085,49 @@ impl State {
             tx.animated();
         }
 
+        // Drain desktop auto-updater events.
+        for status in self.updater.drain() {
+            match &status {
+                UpdateStatus::Available(info) => {
+                    let same = self
+                        .update_status
+                        .info()
+                        .is_some_and(|prev| prev.sha == info.sha);
+                    if !same {
+                        self.update_dismissed = false;
+                    }
+                    tx.animated();
+                }
+                UpdateStatus::ReadyToRestart(info) => {
+                    self.update_dismissed = false;
+                    self.toast(
+                        tx,
+                        ToastKind::Success,
+                        "Update ready",
+                        &format!(
+                            "Version {} installed. Restart lunacy-ui to apply.",
+                            info.short_sha
+                        ),
+                    );
+                }
+                UpdateStatus::Error(msg) => {
+                    self.toast(tx, ToastKind::Error, "Update check failed", msg);
+                }
+                _ => {}
+            }
+            self.update_status = status;
+            changed = true;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.auto_update_triggered && self.auto_update_check && self.clock >= 1.5 {
+            self.auto_update_triggered = true;
+            if crate::updater::should_auto_check() {
+                self.check_for_updates(tx);
+                changed = true;
+            }
+        }
+
         // `poll` runs only after the first frame, which is exactly when a live window may start
         // talking to the daemon. Demo scenes set `ready` themselves.
         self.ready = true;
@@ -1729,6 +2252,9 @@ impl State {
         self.stick_log_pending = true;
         self.run_error = None;
         self.logs.clear();
+        self.expanded_substeps.clear();
+        self.substep_toggled.clear();
+        self.shell_log_collapsed = false;
         self.next_run = 0.0;
         self.next_log = 0.0;
         self.set_hash(&format!("#/runs/{id}"));
@@ -1765,6 +2291,9 @@ impl State {
         if page == SettingsPage::Diagnostics {
             self.request_system();
             self.next_system = self.clock + 30.0;
+        }
+        if page == SettingsPage::Deploy {
+            self.request_deploy_checks();
         }
         self.refresh(tx);
     }
@@ -2326,6 +2855,235 @@ mod tests {
             },
         );
         assert!(!s.open_step_needs_log_poll());
+    }
+
+    #[test]
+    fn cancel_run_sets_and_clears_state_on_answer_and_final_run() {
+        use crate::model::{CancelResult, Run, RunStatus};
+
+        let mut s = State::new(Conn::default());
+        s.demo = true;
+        let mut tx = Tx::default();
+        s.cancel_run("r-live", &mut tx);
+        assert_eq!(s.cancelling.as_deref(), Some("r-live"));
+
+        s.apply(
+            Call::CancelRun {
+                id: "r-live".into(),
+            },
+            Answer::Cancelled {
+                id: "r-live".into(),
+                ok: Ok(CancelResult {
+                    cancelling: true,
+                    run_id: "r-live".into(),
+                    project: "lunarum".into(),
+                }),
+            },
+            &mut tx,
+        );
+        assert_eq!(s.cancelling, None);
+        assert_eq!(s.toasts.len(), 1);
+        assert_eq!(s.toasts[0].title, "Cancelling run");
+
+        s.cancelling = Some("r-live".into());
+        s.apply(
+            Call::Run("r-live".into()),
+            Answer::Run(Box::new(Run {
+                id: "r-live".into(),
+                project: "lunarum".into(),
+                status: RunStatus::Cancelled,
+                ..Run::default()
+            })),
+            &mut tx,
+        );
+        assert_eq!(s.cancelling, None);
+
+        s.cancel_project("lunarum", &mut tx);
+        assert_eq!(s.cancelling.as_deref(), Some("lunarum"));
+        s.apply(
+            Call::CancelProject {
+                name: "lunarum".into(),
+            },
+            Answer::Cancelled {
+                id: "lunarum".into(),
+                ok: Ok(CancelResult {
+                    cancelling: true,
+                    run_id: String::new(),
+                    project: "lunarum".into(),
+                }),
+            },
+            &mut tx,
+        );
+        assert_eq!(s.cancelling, None);
+    }
+
+    #[test]
+    fn answer_run_redraws_on_step_and_substep_updates() {
+        use crate::model::{Phase, Run, RunStatus, Step, StepKind, StepStatus, Substep};
+
+        let mut s = State::new(Conn::default());
+        let mut tx = Tx::default();
+        s.open_run("r-steps", &mut tx);
+        s.open_step = Some(0);
+
+        let initial = Run {
+            id: "r-steps".into(),
+            project: "alpha".into(),
+            status: RunStatus::Running,
+            steps: vec![
+                Step {
+                    phase: Phase::Ci,
+                    name: "Build".into(),
+                    status: StepStatus::Running,
+                    kind: StepKind::Shell,
+                    ..Step::default()
+                },
+                Step {
+                    phase: Phase::Ci,
+                    name: "act".into(),
+                    status: StepStatus::Pending,
+                    kind: StepKind::Act,
+                    substeps: vec![],
+                    ..Step::default()
+                },
+            ],
+            ..Run::default()
+        };
+
+        assert!(s.apply(
+            Call::Run("r-steps".into()),
+            Answer::Run(Box::new(initial.clone())),
+            &mut tx,
+        ));
+        // Identical poll should not force a redraw.
+        assert!(!s.apply(
+            Call::Run("r-steps".into()),
+            Answer::Run(Box::new(initial.clone())),
+            &mut tx,
+        ));
+
+        // Non-open step changes status: must redraw immediately.
+        let mut step_updated = initial.clone();
+        step_updated.steps[1].status = StepStatus::Running;
+        assert!(s.apply(
+            Call::Run("r-steps".into()),
+            Answer::Run(Box::new(step_updated.clone())),
+            &mut tx,
+        ));
+
+        // Substep added to non-open step: must redraw immediately.
+        let mut substep_added = step_updated.clone();
+        substep_added.steps[1].substeps.push(Substep {
+            job: "ci".into(),
+            job_id: "ci".into(),
+            name: "Checkout".into(),
+            status: StepStatus::Running,
+            duration_ms: None,
+        });
+        assert!(s.apply(
+            Call::Run("r-steps".into()),
+            Answer::Run(Box::new(substep_added.clone())),
+            &mut tx,
+        ));
+
+        // Substep status changes: must redraw immediately.
+        let mut substep_done = substep_added;
+        substep_done.steps[1].substeps[0].status = StepStatus::Success;
+        assert!(s.apply(
+            Call::Run("r-steps".into()),
+            Answer::Run(Box::new(substep_done)),
+            &mut tx,
+        ));
+    }
+
+    #[test]
+    fn auto_update_pref_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunacy-ui-autoupdate-pref-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("prefs.json");
+        {
+            let mut prefs = rune::prefs::Prefs::at(&path);
+            save_auto_update_to(&mut prefs, false);
+        }
+        let reopened = rune::prefs::Prefs::at(&path);
+        assert_eq!(load_auto_update_from(&reopened), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_checks_page_is_local_and_receives_report() {
+        assert!(SettingsPage::Deploy.is_local());
+        assert_eq!(SettingsPage::WINDOW[0], SettingsPage::Deploy);
+
+        let mut s = State::new(Conn::default());
+        let mut tx = Tx::default();
+        s.deploy_checks_loading = true;
+        let report = crate::demo::deploy_checks();
+        assert!(!report.projects.is_empty());
+        s.apply(
+            Call::DeployChecks,
+            Answer::DeployChecks(Box::new(report)),
+            &mut tx,
+        );
+        assert!(!s.deploy_checks_loading);
+        assert!(s.deploy_checks.is_some());
+        assert_eq!(s.deploy_checks_error, None);
+    }
+
+    #[test]
+    fn force_deploy_and_clear_cache_update_state_and_emit_toasts() {
+        use crate::model::{CacheClearResult, ForceDeployResult};
+
+        let mut s = State::new(Conn::default());
+        s.demo = true;
+        let mut tx = Tx::default();
+
+        s.force_deploy_project("lunarum", &mut tx);
+        assert_eq!(s.force_deploying.as_deref(), Some("lunarum"));
+        s.apply(
+            Call::ForceDeployProject {
+                name: "lunarum".into(),
+            },
+            Answer::ForceDeployed {
+                target: "lunarum".into(),
+                result: ForceDeployResult {
+                    queued: true,
+                    sha: "4f1c2b9e8a7d6c5b".into(),
+                    deploy_only: true,
+                },
+            },
+            &mut tx,
+        );
+        assert_eq!(s.force_deploying, None);
+        assert_eq!(
+            s.toasts.last().map(|t| t.title.as_str()),
+            Some("Deploy queued")
+        );
+
+        s.clear_cache(Some("lunarum"), &mut tx);
+        assert!(s.clearing_cache);
+        s.apply(
+            Call::ClearCache {
+                project: Some("lunarum".into()),
+            },
+            Answer::CacheCleared {
+                project: Some("lunarum".into()),
+                result: CacheClearResult {
+                    cleared: true,
+                    removed: vec!["lunarum".into()],
+                },
+            },
+            &mut tx,
+        );
+        assert!(!s.clearing_cache);
+        assert_eq!(
+            s.toasts.last().map(|t| t.title.as_str()),
+            Some("Cache cleared")
+        );
     }
 }
 

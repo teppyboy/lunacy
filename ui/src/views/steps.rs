@@ -352,6 +352,13 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact
 
     c = c.child(host_note(s, k, &path));
     c = c.child(widgets::divider(k));
+    let inherited_timeout =
+        crate::paths::get_u64(&e.draft, &format!("project[{project}].step_timeout"))
+            .or_else(|| crate::paths::get_u64(&e.draft, "general.step_timeout"))
+            .unwrap_or(3600);
+    let timeout_help = format!(
+        "Kill the step after this long. Empty inherits the project/global default ({inherited_timeout}s)."
+    );
     c = c.child(widgets::pair_for(
         compact,
         u64_field(
@@ -359,7 +366,7 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact
             k,
             &format!("{path}.timeout"),
             "Timeout (seconds)",
-            Some("Kill the step after this long. Empty waits forever."),
+            Some(timeout_help.as_str()),
             false,
         ),
         text_field(

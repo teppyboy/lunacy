@@ -40,6 +40,7 @@ pub fn run_pill(k: &Kit, status: RunStatus) -> El {
         RunStatus::Success => ("Success", s.success),
         RunStatus::Failure => ("Failed", s.failure),
         RunStatus::Error => ("Error", s.error),
+        RunStatus::Cancelled => ("Cancelled", s.cancelled),
         RunStatus::Other => ("Unknown", s.pending),
     };
     pill(k, label, ink)
@@ -53,6 +54,7 @@ pub fn project_pill(k: &Kit, state: ProjectState) -> El {
         ProjectState::Success => ("Success", s.success),
         ProjectState::Failure => ("Failed", s.failure),
         ProjectState::Error => ("Error", s.error),
+        ProjectState::Cancelled => ("Cancelled", s.cancelled),
         ProjectState::Idle => ("Idle", s.pending),
     };
     pill(k, label, ink)
@@ -97,8 +99,8 @@ pub fn card(k: &Kit) -> El {
         .w_full()
         .gap(0.0)
         .radius(k.radius.lg)
-        .fill(k.c.layer_01)
-        .border(theme::hair(1.0), k.c.border_base)
+        .fill(k.c.layer_02)
+        .border(theme::SECTION_BORDER, k.c.border_base)
 }
 
 /// A titled section inside a settings page.
@@ -306,6 +308,32 @@ pub fn mono_chip(k: &Kit, value: &str) -> El {
         )
 }
 
+/// Distinct pull-request pill (`PR #42`).
+pub fn pr_pill(k: &Kit, number: u64) -> El {
+    pill(k, format!("PR #{number}"), k.c.text_accent)
+}
+
+/// Formats a git ref for compact UI badges (`refs/tags/v1.0` -> `tags/v1.0`, `refs/heads/main` -> `main`).
+pub fn short_ref(git_ref: &str) -> &str {
+    git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| git_ref.strip_prefix("refs/"))
+        .unwrap_or(git_ref)
+}
+
+/// Returns a `PR #N` pill or a ref chip when `run` is a PR or non-default branch/tag.
+pub fn run_ref_badge(k: &Kit, run: &crate::model::Run, default_branch: Option<&str>) -> Option<El> {
+    if let Some(pr) = run.pr_number {
+        return Some(pr_pill(k, pr));
+    }
+    let raw = run.git_ref.as_deref().filter(|r| !r.is_empty())?;
+    let display = short_ref(raw);
+    if default_branch.is_some_and(|b| b == display || b == raw) {
+        return None;
+    }
+    Some(mono_chip(k, display))
+}
+
 /// The reason a skipped step was skipped, or `None` when it was skipped for another reason.
 pub fn skipped_reason(only_on: &[String], host_os: Option<&str>) -> Option<String> {
     if only_on.is_empty() {
@@ -467,6 +495,7 @@ pub fn status_glyph(k: &Kit, status: StepStatus, host_os: Option<&str>) -> El {
         StepStatus::Failure | StepStatus::Timeout => {
             icon(&rune_kit::glyphs::CIRCLE_X, size).color(ink)
         }
+        StepStatus::Cancelled => icon(&rune_kit::glyphs::CIRCLE_X, size).color(ink),
         StepStatus::Running => rune_kit::Loader::new().size(size).color(ink).build(k),
         StepStatus::Skipped => {
             let _ = host_os;

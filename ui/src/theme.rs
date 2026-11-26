@@ -16,6 +16,7 @@ pub struct Status {
     pub failure: Color,
     pub error: Color,
     pub running: Color,
+    pub cancelled: Color,
     pub pending: Color,
     pub skipped: Color,
 }
@@ -67,9 +68,18 @@ impl ThemeMode {
     }
 }
 
-/// The kit for the current appearance: the neutral tokens, light or dark.
+/// Crisp 1pt divider used for major section boundaries.
+pub const SECTION_BORDER: f32 = 1.0;
+
+/// The kit for the current appearance: stepped surfaces and borders over the neutral palette.
 pub fn kit(dark: bool) -> Kit {
-    Kit::neutral(dark)
+    let mut k = Kit::neutral(dark);
+    if dark {
+        apply_dark(&mut k);
+    } else {
+        apply_light(&mut k);
+    }
+    k
 }
 
 /// The kit for the resolved window theme mode and responsive density (`compact` => ≥ 44 pt touch targets).
@@ -104,36 +114,7 @@ fn srgb_hex(rgb: u32) -> Color {
     }
 }
 
-fn apply_oled(k: &mut Kit) {
-    // True black canvas with stepped near-black surfaces and crisp borders/rings.
-    k.c.page = Color::BLACK;
-    k.c.bg_deep = Color::BLACK;
-    k.c.bg_base = srgb_hex(0x0a0a0d);
-    k.c.layer_01 = srgb_hex(0x08080a);
-    k.c.layer_02 = srgb_hex(0x101014);
-    k.c.layer_03 = srgb_hex(0x18181f);
-    k.c.layer_04 = srgb_hex(0x22222b);
-
-    k.c.surface_base = k.c.layer_02;
-    k.c.surface_weak = k.c.layer_02;
-    k.c.surface_disabled = k.c.layer_02;
-    k.c.surface_raised = k.c.bg_base;
-    k.c.surface_raised_base = k.c.bg_base;
-    k.c.bg_button_neutral = k.c.layer_02;
-
-    k.c.hover = srgb_hex(0x18181f);
-    k.c.surface_hover = srgb_hex(0x18181f);
-    k.c.surface_raised_hover = srgb_hex(0x1d1d26);
-    k.c.pressed = srgb_hex(0x23232e);
-
-    k.c.border_muted = srgb_hex(0x24242c);
-    k.c.border_weak = srgb_hex(0x24242c);
-    k.c.border_disabled = srgb_hex(0x1e1e24);
-    k.c.border_base = srgb_hex(0x3a3a46);
-    k.c.border_hover = srgb_hex(0x4c4c5c);
-    k.c.std_border = srgb_hex(0x3a3a46);
-    k.c.border_strong = srgb_hex(0x58586a);
-
+fn sync_elevation_borders(k: &mut Kit) {
     for list in [
         &mut k.elevation.raised,
         &mut k.elevation.floating,
@@ -146,6 +127,103 @@ fn apply_oled(k: &mut Kit) {
             }
         }
     }
+}
+
+fn apply_dark(k: &mut Kit) {
+    k.c.bg_deep = srgb_hex(0x0b0d12);
+    k.c.page = srgb_hex(0x11141b);
+    k.c.bg_base = srgb_hex(0x151923);
+    k.c.layer_01 = srgb_hex(0x171b26);
+    k.c.layer_02 = srgb_hex(0x1e2331);
+    k.c.layer_03 = srgb_hex(0x272d3f);
+    k.c.layer_04 = srgb_hex(0x30374c);
+
+    k.c.surface_base = k.c.layer_02;
+    k.c.surface_weak = k.c.layer_02;
+    k.c.surface_disabled = k.c.layer_02;
+    k.c.surface_raised = k.c.layer_02;
+    k.c.surface_raised_base = k.c.layer_02;
+    k.c.bg_button_neutral = k.c.layer_02;
+
+    k.c.hover = srgb_hex(0x232939);
+    k.c.surface_hover = srgb_hex(0x232939);
+    k.c.surface_raised_hover = srgb_hex(0x272d3f);
+    k.c.pressed = srgb_hex(0x2c3347);
+
+    k.c.border_muted = srgb_hex(0x2a3142);
+    k.c.border_weak = srgb_hex(0x2a3142);
+    k.c.border_disabled = srgb_hex(0x242a3a);
+    k.c.border_base = srgb_hex(0x3a4358);
+    k.c.std_border = srgb_hex(0x3a4358);
+    k.c.border_hover = srgb_hex(0x4f5a75);
+    k.c.border_strong = srgb_hex(0x525e7a);
+
+    sync_elevation_borders(k);
+}
+
+fn apply_light(k: &mut Kit) {
+    k.c.bg_deep = srgb_hex(0xffffff);
+    k.c.page = srgb_hex(0xf4f6fa);
+    k.c.bg_base = srgb_hex(0xf0f3f8);
+    k.c.layer_01 = srgb_hex(0xe9edf5);
+    k.c.layer_02 = srgb_hex(0xffffff);
+    k.c.layer_03 = srgb_hex(0xdfe5f0);
+    k.c.layer_04 = srgb_hex(0xffffff);
+
+    k.c.surface_base = k.c.layer_02;
+    k.c.surface_weak = k.c.layer_01;
+    k.c.surface_disabled = k.c.layer_01;
+    k.c.surface_raised = k.c.layer_02;
+    k.c.surface_raised_base = k.c.layer_02;
+    k.c.bg_button_neutral = k.c.layer_02;
+
+    k.c.hover = srgb_hex(0xdce2ee);
+    k.c.surface_hover = srgb_hex(0xe4e9f2);
+    k.c.surface_raised_hover = srgb_hex(0xf7f9fc);
+    k.c.pressed = srgb_hex(0xd2dae8);
+
+    k.c.border_muted = srgb_hex(0xd5dce8);
+    k.c.border_weak = srgb_hex(0xd5dce8);
+    k.c.border_disabled = srgb_hex(0xe0e6f0);
+    k.c.border_base = srgb_hex(0xbcc6d8);
+    k.c.std_border = srgb_hex(0xbcc6d8);
+    k.c.border_hover = srgb_hex(0x9eabbf);
+    k.c.border_strong = srgb_hex(0x8f9db5);
+
+    sync_elevation_borders(k);
+}
+
+fn apply_oled(k: &mut Kit) {
+    // True black canvas with stepped near-black cool-slate surfaces and crisp borders/rings.
+    k.c.page = Color::BLACK;
+    k.c.bg_deep = Color::BLACK;
+    k.c.bg_base = srgb_hex(0x0b0d12);
+    k.c.layer_01 = srgb_hex(0x0b0d12);
+    k.c.layer_02 = srgb_hex(0x131620);
+    k.c.layer_03 = srgb_hex(0x1c2130);
+    k.c.layer_04 = srgb_hex(0x252b3d);
+
+    k.c.surface_base = k.c.layer_02;
+    k.c.surface_weak = k.c.layer_02;
+    k.c.surface_disabled = k.c.layer_02;
+    k.c.surface_raised = k.c.layer_02;
+    k.c.surface_raised_base = k.c.layer_02;
+    k.c.bg_button_neutral = k.c.layer_02;
+
+    k.c.hover = srgb_hex(0x1c2130);
+    k.c.surface_hover = srgb_hex(0x1c2130);
+    k.c.surface_raised_hover = srgb_hex(0x212738);
+    k.c.pressed = srgb_hex(0x252b3d);
+
+    k.c.border_muted = srgb_hex(0x282f40);
+    k.c.border_weak = srgb_hex(0x282f40);
+    k.c.border_disabled = srgb_hex(0x1f2534);
+    k.c.border_base = srgb_hex(0x414a60);
+    k.c.border_hover = srgb_hex(0x525e7a);
+    k.c.std_border = srgb_hex(0x414a60);
+    k.c.border_strong = srgb_hex(0x5d6985);
+
+    sync_elevation_borders(k);
 }
 
 /// The kit adjusted for compact / touch viewports: enlarged tap heights (≥ 44 pt) on buttons
@@ -197,6 +275,11 @@ pub fn status(k: &Kit) -> Status {
         } else {
             oklch(0.53, 0.16, 252.0)
         },
+        cancelled: if k.dark {
+            oklch(0.73, 0.09, 72.0)
+        } else {
+            oklch(0.50, 0.10, 68.0)
+        },
         pending: k.c.icon_faint,
         skipped: k.c.icon_faint,
     }
@@ -209,6 +292,7 @@ impl Status {
             ProjectState::Success => self.success,
             ProjectState::Failure => self.failure,
             ProjectState::Error => self.error,
+            ProjectState::Cancelled => self.cancelled,
             ProjectState::Idle => self.pending,
         }
     }
@@ -219,6 +303,7 @@ impl Status {
             RunStatus::Success => self.success,
             RunStatus::Failure => self.failure,
             RunStatus::Error => self.error,
+            RunStatus::Cancelled => self.cancelled,
             RunStatus::Other => self.pending,
         }
     }
@@ -228,6 +313,7 @@ impl Status {
             StepStatus::Running => self.running,
             StepStatus::Success => self.success,
             StepStatus::Failure | StepStatus::Timeout => self.failure,
+            StepStatus::Cancelled => self.cancelled,
             StepStatus::Skipped => self.skipped,
             StepStatus::Pending | StepStatus::Other => self.pending,
         }

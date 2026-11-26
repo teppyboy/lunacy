@@ -95,7 +95,8 @@ fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
             .px(14.0)
             .py(12.0)
             .gap(10.0)
-            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+            .fill(k.c.layer_01)
+            .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
             .child(
                 row()
                     .w_full()
@@ -125,6 +126,7 @@ fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
             );
     }
 
+    let _ = hair;
     row()
         .key("projects-header")
         .w_full()
@@ -132,7 +134,8 @@ fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
         .py(14.0)
         .gap(12.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+        .fill(k.c.layer_01)
+        .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
         .child(
             col()
                 .gap(1.0)
@@ -176,18 +179,53 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         } else {
             subj.nowrap().truncate().min_w(0.0).grow(1.0)
         };
-        facts = facts.child(widgets::run_pill(k, run.status)).child(
-            row()
-                .gap(6.0)
-                .center_y()
-                .grow(1.0)
-                .min_w(0.0)
-                .child(mono_chip(k, &short_sha(&run.sha)))
-                .child(subj),
-        );
+        let ref_badge = widgets::run_ref_badge(k, run, Some(&project.branch));
+        let deploy_only_pill = run
+            .deploy_only
+            .then(|| widgets::pill(k, "Deploy only", theme::status(k).running));
+        facts = facts
+            .child(widgets::run_pill(k, run.status))
+            .children(ref_badge)
+            .children(deploy_only_pill)
+            .child(
+                row()
+                    .gap(6.0)
+                    .center_y()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(mono_chip(k, &short_sha(&run.sha)))
+                    .child(subj),
+            );
     } else {
         facts = facts.child(widgets::pill(k, "Never run", k.c.text_faint));
     }
+
+    let cancel_btn = (state == ProjectState::Running).then(|| {
+        let current_run_id = project.current_run.as_ref().map(|cur| cur.id.clone());
+        let cancelling = match current_run_id.as_deref() {
+            Some(id) => {
+                s.cancelling.as_deref() == Some(id)
+                    || s.cancelling.as_deref() == Some(project.name.as_str())
+            }
+            None => s.cancelling.as_deref() == Some(project.name.as_str()),
+        };
+        let project_name = project.name.clone();
+        Button::new(if cancelling {
+            "Cancelling…"
+        } else {
+            "Cancel"
+        })
+        .variant(ButtonVariant::Danger)
+        .control_size(ControlSize::Small)
+        .disabled(cancelling)
+        .help("Stop this running pipeline")
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| match &current_run_id {
+            Some(run_id) => s.cancel_run(run_id, tx),
+            None => s.cancel_project(&project_name, tx),
+        })
+        .build(k)
+        .key(format!("cancel-{}", project.name))
+    });
 
     let run_btn = Button::new(if triggering { "Starting…" } else { "Run now" })
         .variant(ButtonVariant::Outline)
@@ -205,6 +243,14 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
     let mut meta_left = row().gap(8.0).flex_wrap().center_y();
     if project.pending_update() {
         meta_left = meta_left.child(widgets::pill(k, "Update waiting", theme::status(k).running));
+    }
+    if !project.open_prs.is_empty() {
+        let count = project.open_prs.len();
+        meta_left = meta_left.child(widgets::pill(
+            k,
+            format!("{count} PR{}", if count == 1 { "" } else { "s" }),
+            k.c.text_accent,
+        ));
     }
     if let Some(run) = run {
         meta_left = meta_left.child(
@@ -262,9 +308,9 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         .padding(14.0)
         .gap(if compact { 10.0 } else { 8.0 })
         .radius(k.radius.lg)
-        .fill(k.c.layer_01)
+        .fill(k.c.layer_02)
         .border(hair_width(k), k.c.border_base)
-        .hover(k.c.layer_02)
+        .hover(k.c.layer_03)
         .press_scale(0.992)
         .on_press_tx({
             let name = project.name.clone();
@@ -274,6 +320,11 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         .child(title_row);
 
     if compact {
+        let mut actions = row().gap(8.0).flex_wrap().center_y();
+        if let Some(btn) = cancel_btn {
+            actions = actions.child(btn);
+        }
+        actions = actions.child(run_btn);
         card = card.child(facts).child(
             row()
                 .w_full()
@@ -281,10 +332,14 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
                 .flex_wrap()
                 .center_y()
                 .child(meta_left.grow(1.0))
-                .child(run_btn),
+                .child(actions),
         );
     } else {
-        let right = meta_left.child(run_btn);
+        let mut right = meta_left;
+        if let Some(btn) = cancel_btn {
+            right = right.child(btn);
+        }
+        right = right.child(run_btn);
         card = card.child(
             row()
                 .w_full()

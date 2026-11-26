@@ -8,7 +8,7 @@ use rune::TextEdit;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::model::{Project, Run, SystemInfo, Workflow};
+use crate::model::{DeployChecksReport, Project, Run, SystemInfo, Workflow};
 use crate::state::{Conn, LogMode, LogState, SettingsPage, State, View};
 
 /// The fixtures exactly as `tools/fixtures.json` holds them.
@@ -62,6 +62,10 @@ pub fn projects() -> Vec<Project> {
 
 pub fn system() -> SystemInfo {
     serde_json::from_value(fixtures()["system"].clone()).unwrap_or_default()
+}
+
+pub fn deploy_checks() -> DeployChecksReport {
+    serde_json::from_value(fixtures()["deploy_checks"].clone()).unwrap_or_default()
 }
 
 pub fn workflows() -> Vec<Workflow> {
@@ -129,6 +133,7 @@ pub fn load(s: &mut State, view: View) {
     s.editor.loaded = true;
     s.editor.workflows = workflows();
     s.system = Some(system());
+    s.deploy_checks = Some(deploy_checks());
 
     match view {
         View::Projects => {}

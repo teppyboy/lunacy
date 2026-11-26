@@ -11,6 +11,7 @@ pub enum RunStatus {
     Success,
     Failure,
     Error,
+    Cancelled,
     #[serde(other)]
     Other,
 }
@@ -25,6 +26,7 @@ impl RunStatus {
             RunStatus::Success => "Success",
             RunStatus::Failure => "Failure",
             RunStatus::Error => "Error",
+            RunStatus::Cancelled => "Cancelled",
             RunStatus::Other => "Unknown",
         }
     }
@@ -40,6 +42,7 @@ pub enum StepStatus {
     Failure,
     Timeout,
     Skipped,
+    Cancelled,
     #[serde(other)]
     Other,
 }
@@ -53,6 +56,7 @@ impl StepStatus {
             StepStatus::Failure => "Failed",
             StepStatus::Timeout => "Timed out",
             StepStatus::Skipped => "Skipped",
+            StepStatus::Cancelled => "Cancelled",
             StepStatus::Other => "Unknown",
         }
     }
@@ -90,7 +94,7 @@ pub enum StepKind {
     Other,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Substep {
     #[serde(default)]
     pub job: String,
@@ -104,7 +108,7 @@ pub struct Substep {
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Step {
     #[serde(default = "phase_ci")]
     pub phase: Phase,
@@ -130,7 +134,7 @@ fn phase_ci() -> Phase {
     Phase::Ci
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Run {
     #[serde(default)]
     pub id: String,
@@ -155,6 +159,20 @@ pub struct Run {
     /// Not in the v1 contract (`poll` / `manual` / `webhook`).
     #[serde(default)]
     pub trigger: Option<String>,
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    #[serde(default)]
+    pub pr_number: Option<u64>,
+    #[serde(default)]
+    pub pr_title: Option<String>,
+    #[serde(default)]
+    pub pr_head_ref: Option<String>,
+    #[serde(default)]
+    pub pr_base_ref: Option<String>,
+    #[serde(default)]
+    pub deploy_only: bool,
+    #[serde(default)]
+    pub deploy_skipped_reason: Option<String>,
 }
 
 impl Run {
@@ -162,6 +180,24 @@ impl Run {
         let end = self.finished_at.unwrap_or(now);
         end.saturating_sub(self.started_at) * 1000
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrSummary {
+    #[serde(default)]
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub head_ref: String,
+    #[serde(default)]
+    pub base_ref: String,
+    #[serde(default)]
+    pub head_sha: String,
+    #[serde(default)]
+    pub last_tested_sha: Option<String>,
+    #[serde(default)]
+    pub status: Option<RunStatus>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -184,6 +220,8 @@ pub struct Project {
     pub last_run: Option<Run>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub open_prs: Vec<PrSummary>,
 }
 
 impl Project {
@@ -204,6 +242,7 @@ pub enum ProjectState {
     Success,
     Failure,
     Error,
+    Cancelled,
     Idle,
 }
 
@@ -221,6 +260,7 @@ impl Project {
             Some(RunStatus::Success) => ProjectState::Success,
             Some(RunStatus::Failure) => ProjectState::Failure,
             Some(RunStatus::Error) => ProjectState::Error,
+            Some(RunStatus::Cancelled) => ProjectState::Cancelled,
             _ => ProjectState::Idle,
         }
     }
@@ -299,6 +339,200 @@ pub struct ApiError {
     pub error: String,
     #[serde(default)]
     pub field: Option<String>,
+}
+
+/// Response from `POST /api/runs/{id}/cancel` or `POST /api/projects/{name}/cancel`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CancelResult {
+    #[serde(default)]
+    pub cancelling: bool,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub project: String,
+}
+
+/// Response from `POST /api/projects/{name}/deploy` or `POST /api/runs/{id}/deploy`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForceDeployResult {
+    #[serde(default)]
+    pub queued: bool,
+    #[serde(default)]
+    pub sha: String,
+    #[serde(default)]
+    pub deploy_only: bool,
+}
+
+/// Response from `POST /api/cache/clear` or `POST /api/projects/{name}/cache/clear`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheClearResult {
+    #[serde(default)]
+    pub cleared: bool,
+    #[serde(default)]
+    pub removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckLevel {
+    #[default]
+    Ok,
+    Warn,
+    Error,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CheckItem {
+    #[serde(default)]
+    pub level: CheckLevel,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployGitStatus {
+    #[serde(default)]
+    pub repo_exists: bool,
+    #[serde(default)]
+    pub is_git_repo: bool,
+    #[serde(default)]
+    pub remote_ok: bool,
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
+    pub dirty: Option<bool>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    #[serde(default)]
+    pub upstream_sha: Option<String>,
+    #[serde(default)]
+    pub last_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployReporting {
+    #[serde(default)]
+    pub github_enabled: bool,
+    #[serde(default)]
+    pub ci_context: String,
+    #[serde(default)]
+    pub deploy_context: String,
+    #[serde(default)]
+    pub discord_source: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployStepCheck {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub applies_to_host: bool,
+    #[serde(default)]
+    pub only_on: Vec<String>,
+    #[serde(default)]
+    pub effective_timeout: u64,
+    #[serde(default)]
+    pub command_summary: String,
+    #[serde(default)]
+    pub checks: Vec<CheckItem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LastDeployStep {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub status: StepStatus,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LastDeploySummary {
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub sha: String,
+    #[serde(default)]
+    pub status: RunStatus,
+    #[serde(default)]
+    pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub steps: Vec<LastDeployStep>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployProjectCheck {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub repo_path: String,
+    #[serde(default)]
+    pub remote: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub checkout: String,
+    #[serde(default)]
+    pub github_repo: Option<String>,
+    #[serde(default)]
+    pub poll_interval: Option<u64>,
+    #[serde(default)]
+    pub pipeline_timeout: Option<u64>,
+    #[serde(default)]
+    pub step_timeout: u64,
+    #[serde(default)]
+    pub overall: CheckLevel,
+    #[serde(default)]
+    pub git: DeployGitStatus,
+    #[serde(default)]
+    pub reporting: DeployReporting,
+    #[serde(default)]
+    pub ci_active_steps: usize,
+    #[serde(default)]
+    pub ci_total_steps: usize,
+    #[serde(default)]
+    pub deploy_active_steps: usize,
+    #[serde(default)]
+    pub deploy_total_steps: usize,
+    #[serde(default)]
+    pub deploy_steps: Vec<DeployStepCheck>,
+    #[serde(default)]
+    pub checks: Vec<CheckItem>,
+    #[serde(default)]
+    pub last_deploy: Option<LastDeploySummary>,
+    #[serde(default)]
+    pub watch_prs: bool,
+    #[serde(default)]
+    pub deploy_refs: Vec<String>,
+    #[serde(default)]
+    pub cache_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployChecksReport {
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub default_step_timeout: u64,
+    #[serde(default)]
+    pub github_enabled: bool,
+    #[serde(default)]
+    pub github_mode: Option<String>,
+    #[serde(default)]
+    pub discord_global: bool,
+    #[serde(default)]
+    pub cache_enabled: bool,
+    #[serde(default)]
+    pub cache_dir: String,
+    #[serde(default)]
+    pub projects: Vec<DeployProjectCheck>,
 }
 
 /// Unix seconds now, for "3m ago" and a running run's elapsed time. The daemon's own clock

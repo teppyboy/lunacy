@@ -45,6 +45,8 @@ pub struct General {
     #[serde(default = "default_poll")]
     pub poll_interval: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<Vec<String>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -55,6 +57,7 @@ impl Default for General {
         General {
             state_dir: None,
             poll_interval: default_poll(),
+            step_timeout: None,
             shell: None,
             extra: extra(),
         }
@@ -136,6 +139,10 @@ pub struct Act {
     pub platforms: BTreeMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -157,6 +164,18 @@ pub struct Project {
     pub checkout: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_prs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deploy_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_tags: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<bool>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,5 +455,62 @@ mod tests {
         assert!(!outcome.config.extra.contains_key("restart_required"));
         let back = serde_json::to_value(&outcome.config).unwrap();
         assert!(back.get("restart_required").is_none());
+    }
+
+    #[test]
+    fn timeout_fields_round_trip_and_omit_when_none() {
+        let cfg = Config {
+            general: General {
+                step_timeout: Some(1800),
+                ..General::default()
+            },
+            projects: vec![Project {
+                step_timeout: Some(600),
+                timeout: Some(3600),
+                ..Project::new("alpha")
+            }],
+            ..Config::default()
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["general"]["step_timeout"], 1800);
+        assert_eq!(v["project"][0]["step_timeout"], 600);
+        assert_eq!(v["project"][0]["timeout"], 3600);
+        let parsed: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed, cfg);
+
+        let empty = Config::default();
+        let v_empty = serde_json::to_value(&empty).unwrap();
+        assert!(v_empty["general"].get("step_timeout").is_none());
+    }
+
+    #[test]
+    fn wave2_pr_deploy_refs_and_cache_fields_round_trip() {
+        let cfg = Config {
+            act: Some(Act {
+                cache: Some(true),
+                cache_dir: Some("/srv/cache".into()),
+                ..Act::default()
+            }),
+            projects: vec![Project {
+                watch_prs: Some(true),
+                deploy_refs: vec!["master".into(), "release/*".into(), "tags/v*".into()],
+                watch_tags: Some(true),
+                cache: Some(false),
+                ..Project::new("alpha")
+            }],
+            ..Config::default()
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["act"]["cache"], true);
+        assert_eq!(v["act"]["cache_dir"], "/srv/cache");
+        assert_eq!(v["project"][0]["watch_prs"], true);
+        assert_eq!(
+            v["project"][0]["deploy_refs"],
+            serde_json::json!(["master", "release/*", "tags/v*"])
+        );
+        assert_eq!(v["project"][0]["watch_tags"], true);
+        assert_eq!(v["project"][0]["cache"], false);
+        let parsed: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed, cfg);
     }
 }

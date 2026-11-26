@@ -65,7 +65,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
             .padding(16.0)
             .gap(6.0)
             .radius(k.radius.lg)
-            .fill(k.c.layer_01)
+            .fill(k.c.layer_02)
             .border(1.0, k.c.border_base)
             .child(widgets::caption(k, "DAEMON HOST"))
             .child(host_row)

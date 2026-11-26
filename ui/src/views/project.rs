@@ -3,7 +3,7 @@
 use rune::{col, el, row, text, Cx, El, ScrollSpec, Tx};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
-use crate::model::{Project, ProjectState, Run, RunStatus, StepStatus};
+use crate::model::{Phase, PrSummary, Project, ProjectState, Run, RunStatus, StepStatus};
 use crate::state::State;
 use crate::theme;
 use crate::widgets::{self, ago, duration, mono_chip, short_sha};
@@ -38,12 +38,86 @@ pub fn view(s: &State, k: &Kit, name: &str, _cx: &mut Cx<State>, hair: f32, comp
         ))
 }
 
+fn has_deploy_steps(s: &State, project: &Project) -> bool {
+    if let Some(report) = &s.deploy_checks {
+        if let Some(p) = report.projects.iter().find(|p| p.name == project.name) {
+            return p.deploy_total_steps > 0;
+        }
+    }
+    if s.editor.loaded {
+        let projects = crate::paths::array(&s.editor.base, "project");
+        if let Some(cfg) = projects
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project.name.as_str()))
+        {
+            return cfg
+                .get("deploy")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| !arr.is_empty());
+        }
+    }
+    if let Some(run) = project.current_run.as_ref().or(project.last_run.as_ref()) {
+        if !run.steps.is_empty() {
+            return run.steps.iter().any(|st| st.phase == Phase::Deploy);
+        }
+    }
+    // Config not loaded yet: allow clicking so the daemon handles it cleanly.
+    true
+}
+
 fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El {
+    let _ = hair;
     let state = project.state();
     let ink = theme::status(k).for_project(state);
     let name = project.name.clone();
     let busy = state == ProjectState::Running;
     let triggering = s.triggering.as_deref() == Some(project.name.as_str());
+    let deploying = s.force_deploying.as_deref() == Some(project.name.as_str());
+    let cancel_btn = busy.then(|| {
+        let current_run_id = project.current_run.as_ref().map(|cur| cur.id.clone());
+        let cancelling = match current_run_id.as_deref() {
+            Some(id) => {
+                s.cancelling.as_deref() == Some(id)
+                    || s.cancelling.as_deref() == Some(project.name.as_str())
+            }
+            None => s.cancelling.as_deref() == Some(project.name.as_str()),
+        };
+        let project_name = project.name.clone();
+        Button::new(if cancelling {
+            "Cancelling…"
+        } else {
+            "Cancel"
+        })
+        .variant(ButtonVariant::Danger)
+        .control_size(ControlSize::Small)
+        .disabled(cancelling)
+        .help("Stop the currently running pipeline")
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| match &current_run_id {
+            Some(run_id) => s.cancel_run(run_id, tx),
+            None => s.cancel_project(&project_name, tx),
+        })
+        .build(k)
+        .key("project-cancel")
+    });
+    let force_deploy_btn = has_deploy_steps(s, project).then(|| {
+        let deploy_name = project.name.clone();
+        Button::new(if deploying {
+            "Deploying…"
+        } else {
+            "Force deploy"
+        })
+        .variant(ButtonVariant::Outline)
+        .control_size(ControlSize::Small)
+        .disabled(deploying || busy)
+        .help(if busy {
+            "Already running"
+        } else {
+            "Queue a deploy-only run for the current commit"
+        })
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.force_deploy_project(&deploy_name, tx))
+        .build(k)
+        .key("project-force-deploy")
+    });
     let back_btn = Button::new("Back")
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
@@ -80,7 +154,8 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
             .px(14.0)
             .py(12.0)
             .gap(10.0)
-            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+            .fill(k.c.layer_01)
+            .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
             .child(
                 col()
                     .w_full()
@@ -105,24 +180,31 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
                     )
                     .child(subtitle.wrap_anywhere()),
             )
-            .child(
-                row()
+            .child({
+                let mut actions = row()
                     .w_full()
                     .gap(8.0)
                     .flex_wrap()
-                    .child(back_btn.grow(1.0))
-                    .child(run_btn.grow(1.0)),
-            );
+                    .child(back_btn.grow(1.0));
+                if let Some(btn) = cancel_btn {
+                    actions = actions.child(btn.grow(1.0));
+                }
+                if let Some(btn) = force_deploy_btn {
+                    actions = actions.child(btn.grow(1.0));
+                }
+                actions.child(run_btn.grow(1.0))
+            });
     }
 
-    row()
+    let mut hdr = row()
         .key("project-header")
         .w_full()
         .px(22.0)
         .py(14.0)
         .gap(12.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+        .fill(k.c.layer_01)
+        .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
         .child(
             col()
                 .gap(3.0)
@@ -152,8 +234,14 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
                         .child(subtitle.nowrap().truncate()),
                 ),
         )
-        .child(back_btn)
-        .child(run_btn)
+        .child(back_btn);
+    if let Some(btn) = cancel_btn {
+        hdr = hdr.child(btn);
+    }
+    if let Some(btn) = force_deploy_btn {
+        hdr = hdr.child(btn);
+    }
+    hdr.child(run_btn)
 }
 
 fn body(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
@@ -164,7 +252,11 @@ fn body(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
     }
 
     if let Some(run) = &project.current_run {
-        c = c.child(current_run(k, run, compact));
+        c = c.child(current_run(k, project, run, compact));
+    }
+
+    if !project.open_prs.is_empty() {
+        c = c.child(open_prs_section(k, &project.open_prs, compact));
     }
 
     c = c.child(
@@ -195,17 +287,136 @@ fn body(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
             .w_full()
             .gap(0.0)
             .radius(k.radius.lg)
+            .fill(k.c.layer_02)
             .border(1.0, k.c.border_base);
         for (i, run) in s.runs.iter().enumerate() {
-            rows = rows.child(run_row(k, run, i + 1 == s.runs.len(), compact));
+            rows = rows.child(run_row(
+                k,
+                &project.branch,
+                run,
+                i + 1 == s.runs.len(),
+                compact,
+            ));
         }
         c = c.child(rows);
     }
     c
 }
 
+fn open_prs_section(k: &Kit, prs: &[PrSummary], compact: bool) -> El {
+    let mut list = col()
+        .w_full()
+        .gap(0.0)
+        .radius(k.radius.lg)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_base);
+    for (i, pr) in prs.iter().enumerate() {
+        let last = i + 1 == prs.len();
+        let status_pill = match pr.status {
+            Some(st) => widgets::run_pill(k, st),
+            None => widgets::pill(k, "Pending", k.c.text_faint),
+        };
+        let branch_flow = if pr.base_ref.is_empty() {
+            pr.head_ref.clone()
+        } else {
+            format!("{} → {}", pr.head_ref, pr.base_ref)
+        };
+        let mut r = if compact {
+            col()
+                .key(format!("project-pr-{}", pr.number))
+                .w_full()
+                .px(12.0)
+                .py(10.0)
+                .gap(6.0)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .flex_wrap()
+                        .center_y()
+                        .child(widgets::pr_pill(k, pr.number))
+                        .child(
+                            text(pr.title.clone())
+                                .font(k.ty.small_medium)
+                                .color(k.c.text_base)
+                                .wrap()
+                                .min_w(0.0)
+                                .grow(1.0),
+                        )
+                        .child(status_pill),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .flex_wrap()
+                        .center_y()
+                        .child(
+                            text(branch_flow)
+                                .font(k.ty.mono)
+                                .color(k.c.text_muted)
+                                .wrap_anywhere()
+                                .min_w(0.0),
+                        )
+                        .child(mono_chip(k, &short_sha(&pr.head_sha))),
+                )
+        } else {
+            row()
+                .key(format!("project-pr-{}", pr.number))
+                .w_full()
+                .min_h(40.0)
+                .px(12.0)
+                .py(8.0)
+                .gap(10.0)
+                .center_y()
+                .child(widgets::pr_pill(k, pr.number))
+                .child(
+                    text(pr.title.clone())
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_base)
+                        .nowrap()
+                        .truncate()
+                        .min_w(0.0)
+                        .grow(1.0),
+                )
+                .child(
+                    text(branch_flow)
+                        .font(k.ty.mono)
+                        .color(k.c.text_muted)
+                        .nowrap()
+                        .truncate()
+                        .min_w(0.0),
+                )
+                .child(mono_chip(k, &short_sha(&pr.head_sha)))
+                .child(status_pill)
+        };
+        if !last {
+            r = r.border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted);
+        }
+        list = list.child(r);
+    }
+
+    col()
+        .key("project-open-prs")
+        .w_full()
+        .gap(8.0)
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    text("Open pull requests")
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base),
+                )
+                .child(widgets::pill(k, format!("{}", prs.len()), k.c.text_accent)),
+        )
+        .child(list)
+}
+
 /// The run in progress, as a card with its steps.
-fn current_run(k: &Kit, run: &Run, compact: bool) -> El {
+fn current_run(k: &Kit, project: &Project, run: &Run, compact: bool) -> El {
     let mut steps = col().w_full().gap(0.0);
     for (i, step) in run.steps.iter().enumerate() {
         steps = steps.child(step_line(k, step, i, compact));
@@ -213,6 +424,10 @@ fn current_run(k: &Kit, run: &Run, compact: bool) -> El {
     let subj = text(run.subject.clone())
         .font(k.ty.small)
         .color(k.c.text_muted);
+    let ref_badge = widgets::run_ref_badge(k, run, Some(&project.branch));
+    let deploy_only_pill = run
+        .deploy_only
+        .then(|| widgets::pill(k, "Deploy only", theme::status(k).running));
     let head = if compact {
         col()
             .w_full()
@@ -224,6 +439,8 @@ fn current_run(k: &Kit, run: &Run, compact: bool) -> El {
                     .flex_wrap()
                     .center_y()
                     .child(widgets::run_pill(k, run.status))
+                    .children(ref_badge)
+                    .children(deploy_only_pill)
                     .child(mono_chip(k, &short_sha(&run.sha)))
                     .child(el().grow(1.0))
                     .child(
@@ -239,6 +456,8 @@ fn current_run(k: &Kit, run: &Run, compact: bool) -> El {
             .gap(8.0)
             .center_y()
             .child(widgets::run_pill(k, run.status))
+            .children(ref_badge)
+            .children(deploy_only_pill)
             .child(mono_chip(k, &short_sha(&run.sha)))
             .child(subj.nowrap().truncate().min_w(0.0).grow(1.0))
             .child(
@@ -252,8 +471,8 @@ fn current_run(k: &Kit, run: &Run, compact: bool) -> El {
         .padding(14.0)
         .gap(10.0)
         .radius(k.radius.lg)
-        .fill(k.c.layer_01)
-        .border(1.0, theme::status(k).running.alpha(0.4))
+        .fill(k.c.layer_02)
+        .border(1.0, theme::status(k).running.alpha(0.45))
         .child(head)
         .child(steps)
 }
@@ -290,7 +509,7 @@ fn step_line(k: &Kit, step: &crate::model::Step, index: usize, compact: bool) ->
         )
 }
 
-fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
+fn run_row(k: &Kit, default_branch: &str, run: &Run, last: bool, compact: bool) -> El {
     let ink = theme::status(k).for_run(run.status);
     let id = run.id.clone();
     let timing = match widgets::span(run.started_at, run.finished_at) {
@@ -302,6 +521,14 @@ fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
     } else {
         run.subject.clone()
     };
+    let ref_badge = widgets::run_ref_badge(k, run, Some(default_branch));
+    let deploy_only_pill = run
+        .deploy_only
+        .then(|| widgets::pill(k, "Deploy only", theme::status(k).running));
+    let skipped_note = run
+        .deploy_skipped_reason
+        .as_deref()
+        .filter(|r| !r.is_empty());
     let indicator = if run.status == RunStatus::Running {
         rune_kit::Loader::new().size(13.0).color(ink).build(k)
     } else {
@@ -345,6 +572,8 @@ fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
                     .gap(8.0)
                     .flex_wrap()
                     .center_y()
+                    .children(ref_badge)
+                    .children(deploy_only_pill)
                     .child(mono_chip(k, &short_sha(&run.sha)))
                     .child(
                         text(widgets::timestamp(run.started_at))
@@ -354,12 +583,19 @@ fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
                     )
                     .child(text(timing).font(k.ty.small).color(k.c.text_faint).nowrap()),
             )
+            .children(skipped_note.map(|reason| {
+                text(reason.to_string())
+                    .font(k.ty.small)
+                    .color(k.c.text_faint)
+                    .wrap()
+            }))
     } else {
         row()
             .key(format!("run-{}", run.id))
             .w_full()
-            .h(44.0)
+            .min_h(44.0)
             .px(12.0)
+            .py(6.0)
             .gap(10.0)
             .center_y()
             .hover(k.c.hover)
@@ -367,14 +603,29 @@ fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_run(&id, tx))
             .cursor(rune::Cursor::Pointer)
             .child(indicator)
+            .children(ref_badge)
+            .children(deploy_only_pill)
             .child(
-                text(subject)
-                    .font(k.ty.small)
-                    .color(k.c.text_base)
-                    .nowrap()
-                    .truncate()
+                col()
+                    .grow(1.0)
                     .min_w(0.0)
-                    .grow(1.0),
+                    .gap(1.0)
+                    .child(
+                        text(subject)
+                            .font(k.ty.small)
+                            .color(k.c.text_base)
+                            .nowrap()
+                            .truncate()
+                            .min_w(0.0),
+                    )
+                    .children(skipped_note.map(|reason| {
+                        text(reason.to_string())
+                            .font(k.ty.small)
+                            .color(k.c.text_faint)
+                            .nowrap()
+                            .truncate()
+                            .min_w(0.0)
+                    })),
             )
             .child(mono_chip(k, &short_sha(&run.sha)))
             .child(

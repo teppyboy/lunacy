@@ -44,6 +44,7 @@ pub fn build() -> rune::App<State> {
 }
 
 fn init() -> State {
+    crate::updater::cleanup_old_binary();
     let mut s = State::new(crate::state::conn_from_env());
     s.load_prefs();
     s
@@ -138,6 +139,14 @@ pub const SCENES: &[Scene] = &[
     }),
     ("settings-step", crate::demo::editor_step),
     ("settings-rejected", crate::demo::rejected),
+    ("settings-deploy", |s| {
+        crate::demo::load(
+            s,
+            View::Settings {
+                page: SettingsPage::Deploy,
+            },
+        )
+    }),
     ("settings-diagnostics", |s| {
         crate::demo::load(
             s,
@@ -305,18 +314,19 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(screen(s, &k, cx, hair, compact))
+            .child(screen(s, &k, cx, hair, compact, layout_w))
     } else {
         row()
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(rail(s, &k, hair, compact))
+            .child(rail(s, &k, hair, compact, layout_w))
             .child(
                 col()
                     .grow(1.0)
+                    .min_w(0.0)
                     .min_h(0.0)
-                    .child(screen(s, &k, cx, hair, compact)),
+                    .child(screen(s, &k, cx, hair, compact, layout_w)),
             )
     };
 
@@ -331,6 +341,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .pl(safe[3])
         .child(titlebar(s, &k, cx, hair, compact))
         .children(banner(s, &k, hair, compact))
+        .children(update_banner(s, &k, hair, compact))
         .child(content);
 
     let drawer = (compact && s.drawer_open).then(|| drawer_overlays(s, &k, hair, layout_w, safe));
@@ -355,6 +366,7 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
             .unwrap_or_else(|| "Run".into()),
         View::Settings { page } => format!("Settings · {}", page.title()),
     };
+    let _ = hair;
     let mut bar = row()
         .key("titlebar")
         .w_full()
@@ -363,7 +375,7 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
         .pr(inset.trailing.max(if compact { 8.0 } else { 14.0 }))
         .gap(if compact { 6.0 } else { 10.0 })
         .center_y()
-        .fill(k.c.page);
+        .fill(k.c.layer_01);
     if !compact {
         bar = bar.window_drag();
     }
@@ -437,7 +449,7 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
                 compact,
             )),
     )
-    .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+    .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
 }
 
 /// The connection chip: dot and label on desktop; compact 44×44 dot pill on phones.
@@ -597,9 +609,157 @@ fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
     )
 }
 
+/// Dismissible desktop auto-updater banner when an update is available or ready to restart.
+#[cfg(target_arch = "wasm32")]
+fn update_banner(_s: &State, _k: &Kit, _hair: f32, _compact: bool) -> Option<El> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn update_banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
+    use crate::updater::UpdateStatus;
+
+    if s.update_dismissed {
+        return None;
+    }
+    let (ink, message, primary_btn, view_url) = match &s.update_status {
+        UpdateStatus::Available(info) => {
+            let primary = info.asset_url.is_some().then(|| {
+                rune_kit::Button::new("Update")
+                    .variant(rune_kit::ButtonVariant::Outline)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press_tx(|s: &mut State, tx: &mut Tx| s.install_update(tx))
+                    .build(k)
+                    .key("update-banner-install")
+            });
+            (
+                theme::status(k).running,
+                format!("Update available ({})", info.short_sha),
+                primary,
+                (!info.html_url.is_empty()).then(|| info.html_url.clone()),
+            )
+        }
+        UpdateStatus::ReadyToRestart(info) => {
+            let primary = Some(
+                rune_kit::Button::new("Restart to apply")
+                    .variant(rune_kit::ButtonVariant::Submit)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press_tx(|s: &mut State, tx: &mut Tx| s.restart_for_update(tx))
+                    .build(k)
+                    .key("update-banner-restart"),
+            );
+            (
+                theme::status(k).success,
+                format!("Update {} ready to apply", info.short_sha),
+                primary,
+                (!info.html_url.is_empty()).then(|| info.html_url.clone()),
+            )
+        }
+        _ => return None,
+    };
+
+    let view_btn = view_url.map(|url| {
+        rune_kit::Button::new("View")
+            .variant(rune_kit::ButtonVariant::Ghost)
+            .control_size(rune_kit::ControlSize::Small)
+            .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+                let _ = tx.open_url(&url);
+            })
+            .build(k)
+            .key("update-banner-view")
+    });
+    let dismiss_btn = rune_kit::Button::new("Dismiss")
+        .variant(rune_kit::ButtonVariant::Ghost)
+        .control_size(rune_kit::ControlSize::Small)
+        .on_press_tx(|s: &mut State, _tx: &mut Tx| s.dismiss_update_banner())
+        .build(k)
+        .key("update-banner-dismiss");
+
+    let banner_enter = Transition::asymmetric(
+        Transition::move_edge(Edge::Top).combined(Transition::opacity()),
+        Transition::none(),
+    );
+
+    if compact {
+        let mut actions = row().w_full().gap(8.0).flex_wrap();
+        if let Some(btn) = primary_btn {
+            actions = actions.child(btn.grow(1.0));
+        }
+        if let Some(btn) = view_btn {
+            actions = actions.child(btn.grow(1.0));
+        }
+        actions = actions.child(dismiss_btn.grow(1.0));
+        return Some(
+            col()
+                .key("update-banner")
+                .w_full()
+                .gap(8.0)
+                .px(14.0)
+                .py(10.0)
+                .fill(theme::status(k).tint(ink))
+                .border_sides([0.0, 0.0, hair, 0.0], ink.alpha(0.35))
+                .transition(banner_enter)
+                .transition_motion(rune::tok::motion::SNAP, Spring::NONE)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .center_y()
+                        .child(widgets::dot(ink, 8.0))
+                        .child(
+                            text(message)
+                                .font(k.ty.small_medium)
+                                .color(ink)
+                                .wrap()
+                                .min_w(0.0)
+                                .grow(1.0),
+                        ),
+                )
+                .child(actions),
+        );
+    }
+
+    let mut bar = row()
+        .key("update-banner")
+        .w_full()
+        .gap(10.0)
+        .px(16.0)
+        .py(8.0)
+        .center_y()
+        .fill(theme::status(k).tint(ink))
+        .border_sides([0.0, 0.0, hair, 0.0], ink.alpha(0.35))
+        .transition(banner_enter)
+        .transition_motion(rune::tok::motion::SNAP, Spring::NONE)
+        .child(widgets::dot(ink, 8.0))
+        .child(
+            text(message)
+                .font(k.ty.small_medium)
+                .color(ink)
+                .nowrap()
+                .truncate()
+                .min_w(0.0)
+                .grow(1.0),
+        );
+    if let Some(btn) = primary_btn {
+        bar = bar.child(btn);
+    }
+    if let Some(btn) = view_btn {
+        bar = bar.child(btn);
+    }
+    Some(bar.child(dismiss_btn))
+}
+
 /// The left rail: Projects, Settings, and the projects themselves.
-fn rail(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
+fn rail(s: &State, k: &Kit, hair: f32, compact: bool, layout_w: f32) -> El {
+    let _ = hair;
     let row_h = if compact { 44.0 } else { 30.0 };
+    let rail_w = if compact {
+        272.0
+    } else if layout_w < 960.0 {
+        168.0
+    } else {
+        196.0
+    };
     let mut list = col().w_full().gap(1.0).pt(8.0).pb(8.0);
     list = list.child(nav_row(
         k,
@@ -661,7 +821,9 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
                                 k.c.text_muted
                             })
                             .nowrap()
-                            .truncate(),
+                            .truncate()
+                            .min_w(0.0)
+                            .grow(1.0),
                     )
                     .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                         s.open_project(&name.clone(), tx)
@@ -671,14 +833,26 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
         }
     }
 
-    col()
+    let version_line = format!(
+        "daemon {}",
+        if s.version.is_empty() {
+            "—"
+        } else {
+            s.version.as_str()
+        }
+    );
+
+    let mut panel = col()
         .key(if compact { "rail-drawer-body" } else { "rail" })
-        .w(if compact { 272.0 } else { 196.0 })
+        .w(rail_w)
         .h_full()
         .shrink()
         .gap(0.0)
-        .fill(k.c.layer_01)
-        .border_sides([0.0, 0.0, 0.0, hair], k.c.border_base)
+        .fill(k.c.layer_01);
+    if !compact {
+        panel = panel.border_sides([0.0, theme::SECTION_BORDER, 0.0, 0.0], k.c.border_strong);
+    }
+    panel
         .child(widgets::scroll_bar(
             col()
                 .key("rail-scroll")
@@ -691,26 +865,26 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
         ))
         .child(
             col()
+                .key("rail-footer")
                 .w_full()
+                .min_w(0.0)
                 .px(14.0)
                 .py(10.0)
                 .gap(2.0)
-                .border_sides([hair, 0.0, 0.0, 0.0], k.c.border_base)
+                .border_sides([theme::SECTION_BORDER, 0.0, 0.0, 0.0], k.c.border_strong)
                 .child(
-                    // Two lines rather than one truncated "daemon 0....": the
-                    // rail is 196px, so the address wraps under the version.
-                    text(format!(
-                        "daemon {}\n{}",
-                        if s.version.is_empty() {
-                            "—".into()
-                        } else {
-                            s.version.clone()
-                        },
-                        s.server_display()
-                    ))
-                    .font(k.ty.small)
-                    .color(k.c.text_faint)
-                    .wrap(),
+                    text(version_line)
+                        .key("rail-version")
+                        .font(k.ty.small)
+                        .color(k.c.text_faint)
+                        .wrap_anywhere(),
+                )
+                .child(
+                    text(s.server_display())
+                        .key("rail-server")
+                        .font(k.ty.small)
+                        .color(k.c.text_faint)
+                        .wrap_anywhere(),
                 ),
         )
 }
@@ -723,7 +897,7 @@ fn drawer_overlays(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4])
         .px(14.0)
         .gap(8.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+        .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
         .child(widgets::dot(k.c.text_accent, 9.0))
         .child(
             text("lunacy")
@@ -762,12 +936,17 @@ fn drawer_overlays(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4])
         .pb(safe[2])
         .pl(safe[3])
         .fill(k.c.layer_01)
-        .border_sides([0.0, 0.0, 0.0, hair], k.c.border_strong)
+        .border_sides([0.0, theme::SECTION_BORDER, 0.0, 0.0], k.c.border_strong)
         .transition(Transition::move_edge(Edge::Leading).combined(Transition::opacity()))
         .transition_motion(rune::tok::motion::GLIDE, drawer_exit)
         .on_press(|_: &mut State| {})
         .child(drawer_head)
-        .child(rail(s, k, hair, true).w_full().grow(1.0).min_h(0.0));
+        .child(
+            rail(s, k, hair, true, layout_w)
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0),
+        );
     [scrim, drawer]
 }
 
@@ -796,12 +975,12 @@ fn nav_row(k: &Kit, label: &str, selected: bool, h: f32, press: fn(&mut State, &
 }
 
 /// The screen body for the current view.
-fn screen(s: &State, k: &Kit, cx: &mut Cx<State>, hair: f32, compact: bool) -> El {
+fn screen(s: &State, k: &Kit, cx: &mut Cx<State>, hair: f32, compact: bool, layout_w: f32) -> El {
     let view = match &s.view {
         View::Projects => views::projects::view(s, k, cx, hair, compact),
         View::Project { name } => views::project::view(s, k, name, cx, hair, compact),
-        View::Run { id } => views::run::view(s, k, id, cx, hair, compact),
-        View::Settings { page } => views::settings::view(s, k, *page, cx, hair, compact),
+        View::Run { id } => views::run::view(s, k, id, cx, hair, compact, layout_w),
+        View::Settings { page } => views::settings::view(s, k, *page, cx, hair, compact, layout_w),
     };
     view.transition(Transition::asymmetric(
         Transition::opacity().combined(Transition::offset(0.0, 6.0)),
@@ -1064,6 +1243,7 @@ mod tests {
             (390.0, 844.0),
             (360.0, 780.0),
             (768.0, 1024.0),
+            (900.0, 700.0),
             (1180.0, 760.0),
         ] {
             assert_responsive_scene("projects", w, h, |s| crate::demo::load(s, View::Projects));
@@ -1119,6 +1299,14 @@ mod tests {
                     );
                 }
             });
+            assert_responsive_scene("settings-deploy", w, h, |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Deploy,
+                    },
+                )
+            });
             assert_responsive_scene("settings-appearance", w, h, |s| {
                 crate::demo::load(
                     s,
@@ -1126,6 +1314,23 @@ mod tests {
                         page: SettingsPage::Appearance,
                     },
                 )
+            });
+            assert_responsive_scene("update-banner", w, h, |s| {
+                crate::demo::load(s, View::Projects);
+                s.update_status =
+                    crate::updater::UpdateStatus::Available(crate::updater::UpdateInfo {
+                        tag: "prerelease".into(),
+                        title: "Pre-release (f5841e0)".into(),
+                        sha: "f5841e0123456789abcdef0123456789abcdef01".into(),
+                        short_sha: "f5841e0".into(),
+                        html_url: "https://github.com/teppyboy/lunacy/releases/tag/prerelease"
+                            .into(),
+                        published_at: "2026-11-26T00:00:00Z".into(),
+                        notes: String::new(),
+                        asset_name: Some("lunacy-linux-x86_64.tar.gz".into()),
+                        asset_url: Some("https://example.invalid/asset.tar.gz".into()),
+                        checksums_url: Some("https://example.invalid/SHA256SUMS.txt".into()),
+                    });
             });
             assert_responsive_scene("settings-step-editor", w, h, |s| {
                 crate::demo::editor_step(s);
@@ -1396,7 +1601,8 @@ mod tests {
         let oled = theme::kit_mode(theme::ThemeMode::Oled, false, false);
         assert_eq!(oled.c.page.hex(), "#000000ff");
         assert_eq!(oled.c.bg_deep.hex(), "#000000ff");
-        assert_eq!(oled.c.layer_01.hex(), "#08080aff");
+        assert_eq!(oled.c.layer_01.hex(), "#0b0d12ff");
+        assert_eq!(oled.c.layer_02.hex(), "#131620ff");
         let dark = theme::kit(true);
         assert_eq!(theme::status(&oled).success, theme::status(&dark).success);
 
@@ -1733,5 +1939,599 @@ mod tests {
             "toast enter should animate instead of snapping"
         );
         assert!(rt.find("toast-1").is_some());
+    }
+
+    #[test]
+    fn cancel_buttons_and_cancelled_status_render_across_views() {
+        use crate::model::{Phase, Run, RunStatus, Step, StepKind, StepStatus};
+
+        // Projects list shows cancel button for running project.
+        let rt_projects = setup_runtime(|s| crate::demo::load(s, View::Projects), 1180.0, 760.0);
+        assert!(rt_projects.find("cancel-lunarum").is_some());
+        assert!(rt_projects.find("cancel-dotfiles").is_none());
+
+        // Project detail shows cancel button for running project.
+        let rt_project = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Project {
+                        name: "lunarum".into(),
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_project.find("project-cancel").is_some());
+
+        // Run detail shows cancel button for running run and clicking it marks cancelling.
+        let running = crate::demo::running_run().expect("running demo run");
+        let rid = running.id.clone();
+        let mut rt_run = setup_runtime(
+            move |s| crate::demo::load(s, View::Run { id: rid }),
+            1180.0,
+            760.0,
+        );
+        let (cx, cy) = rt_run.find("run-cancel").expect("run-cancel button");
+        rt_run.pointer_down(cx, cy);
+        rt_run.pointer_up(cx, cy);
+        for _ in 0..3 {
+            rt_run.frame(0.016);
+            rt_run.settle_all();
+        }
+        assert_eq!(
+            rt_run.state.cancelling.as_deref(),
+            Some(running.id.as_str())
+        );
+        let has_cancelling_text = rt_run
+            .elements()
+            .into_iter()
+            .any(|e| e.text.as_deref() == Some("Cancelling…"));
+        assert!(
+            has_cancelling_text,
+            "expected Cancelling… label after click"
+        );
+
+        // Cancelled run renders Cancelled pill and no Cancel button.
+        let rt_cancelled = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Run {
+                        id: "r-cancel".into(),
+                    },
+                );
+                s.run = Some(Run {
+                    id: "r-cancel".into(),
+                    project: "lunarum".into(),
+                    sha: "abcdef1".into(),
+                    subject: "test cancel".into(),
+                    status: RunStatus::Cancelled,
+                    started_at: 100,
+                    finished_at: Some(120),
+                    steps: vec![Step {
+                        phase: Phase::Ci,
+                        name: "Long step".into(),
+                        status: StepStatus::Cancelled,
+                        kind: StepKind::Shell,
+                        ..Step::default()
+                    }],
+                    ..Run::default()
+                });
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_cancelled.find("run-cancel").is_none());
+        let has_cancelled_text = rt_cancelled
+            .elements()
+            .into_iter()
+            .any(|e| e.text.as_deref() == Some("Cancelled"));
+        assert!(has_cancelled_text, "expected Cancelled status text");
+    }
+
+    #[test]
+    fn timeout_fields_and_step_inherited_help_render() {
+        let rt_gen = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::General,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_gen.find("field-general.step_timeout").is_some());
+
+        let rt_proj = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Projects,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_proj.find("field-project[0].step_timeout").is_some());
+        assert!(rt_proj.find("field-project[0].timeout").is_some());
+
+        // Step editor shows inherited project/global timeout instead of "waits forever".
+        let rt_step = setup_runtime(
+            |s| {
+                crate::demo::editor_step(s);
+                crate::paths::set_u64(&mut s.editor.draft, "project[0].step_timeout", Some(1200));
+            },
+            1180.0,
+            760.0,
+        );
+        let texts: Vec<String> = rt_step
+            .elements()
+            .into_iter()
+            .filter_map(|e| e.text)
+            .collect();
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("1200s"),
+            "expected inherited 1200s timeout help text, got: {joined}"
+        );
+        assert!(
+            !joined.contains("waits forever"),
+            "misleading waits forever text must be removed"
+        );
+    }
+
+    #[test]
+    fn deploy_settings_and_desktop_updater_ui_render_and_interact() {
+        let mut rt_dep = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Deploy,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_dep.find("deploy-checks").is_some());
+        assert!(rt_dep.find("deploy-refresh").is_some());
+        assert!(rt_dep.find("deploy-project-lunarum").is_some());
+        assert!(rt_dep.find("deploy-project-dotfiles").is_some());
+        // Save/Discard are hidden on read-only local Deploy page.
+        assert!(rt_dep.find("settings-save").is_none());
+
+        // Click Re-check button.
+        let (rx, ry) = rt_dep.find("deploy-refresh").expect("deploy-refresh");
+        rt_dep.pointer_down(rx, ry);
+        rt_dep.pointer_up(rx, ry);
+        for _ in 0..3 {
+            rt_dep.frame(0.016);
+            rt_dep.settle_all();
+        }
+        assert!(rt_dep.state.deploy_checks.is_some());
+
+        // Appearance desktop updates section & dismissible update banner.
+        let mut rt_app = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Appearance,
+                    },
+                );
+                s.update_status =
+                    crate::updater::UpdateStatus::Available(crate::updater::UpdateInfo {
+                        tag: "prerelease".into(),
+                        title: "Pre-release (f5841e0)".into(),
+                        sha: "f5841e0123456789abcdef0123456789abcdef01".into(),
+                        short_sha: "f5841e0".into(),
+                        html_url: "https://github.com/teppyboy/lunacy/releases/tag/prerelease"
+                            .into(),
+                        published_at: "2026-11-26T00:00:00Z".into(),
+                        notes: String::new(),
+                        asset_name: Some("lunacy-linux-x86_64.tar.gz".into()),
+                        asset_url: Some("https://example.invalid/asset.tar.gz".into()),
+                        checksums_url: Some("https://example.invalid/SHA256SUMS.txt".into()),
+                    });
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_app.find("desktop-updates").is_some());
+        assert!(rt_app.find("appearance-auto-update").is_some());
+        assert!(rt_app.find("update-check-now").is_some());
+        assert!(rt_app.find("update-banner").is_some());
+
+        let (dx, dy) = rt_app
+            .find("update-banner-dismiss")
+            .expect("update-banner-dismiss");
+        rt_app.pointer_down(dx, dy);
+        rt_app.pointer_up(dx, dy);
+        for _ in 0..4 {
+            rt_app.frame(0.016);
+            rt_app.settle_all();
+        }
+        assert!(rt_app.state.update_dismissed);
+        assert!(rt_app.find("update-banner").is_none());
+    }
+
+    #[test]
+    fn expandable_substep_accordion_and_raw_switch() {
+        let running = crate::demo::running_run().expect("running demo run");
+        let rid = running.id.clone();
+        let mut rt = setup_runtime(
+            move |s| crate::demo::load(s, View::Run { id: rid }),
+            1180.0,
+            760.0,
+        );
+        // Defaults to Steps accordion view with running substep (index 5: "Test") auto-expanded,
+        // while passed substeps (e.g. index 1: "Run actions/checkout@v4") start collapsed.
+        assert!(!rt.state.log_view_raw);
+        assert!(rt.find("run-log-view").is_some());
+        assert!(rt.find("substeps").is_some());
+        assert!(rt.find("substep-log-5").is_some());
+        assert!(rt.find("substep-log-1").is_none());
+
+        // Click substep 1 to expand its sliced log.
+        let (x, y) = rt.find("substep-toggle-1").expect("substep-toggle-1");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(rt.find("substep-log-1").is_some());
+        assert!(
+            rt.find("substep-log-5").is_some(),
+            "previously auto-expanded running substep stays open"
+        );
+        let has_git_ver = rt
+            .elements()
+            .into_iter()
+            .filter_map(|e| e.text)
+            .any(|t| t.contains("git version 2.43.0"));
+        assert!(
+            has_git_ver,
+            "expected sliced Checkout log inside substep-log-1"
+        );
+
+        // Click substep 1 again to collapse it.
+        let (x, y) = rt.find("substep-toggle-1").expect("substep-toggle-1");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(rt.find("substep-log-1").is_none());
+
+        // Expand all -> opens passed substeps too; click again -> Collapse all.
+        let (ex, ey) = rt.find("substeps-expand-all").expect("substeps-expand-all");
+        rt.pointer_down(ex, ey);
+        rt.pointer_up(ex, ey);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(rt.find("substep-log-1").is_some());
+        let (ex, ey) = rt.find("substeps-expand-all").expect("substeps-expand-all");
+        rt.pointer_down(ex, ey);
+        rt.pointer_up(ex, ey);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(rt.find("substep-log-1").is_none());
+        assert!(rt.find("substep-log-5").is_none());
+
+        // Switch Steps -> Raw -> Steps.
+        let (rx, ry) = rt.find("run-log-view/segment1").expect("Raw segment");
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(rt.state.log_view_raw);
+        assert!(rt.find("log").is_some());
+        assert!(rt.find("substeps").is_none());
+
+        let (sx, sy) = rt.find("run-log-view/segment0").expect("Steps segment");
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(!rt.state.log_view_raw);
+        assert!(rt.find("substeps").is_some());
+    }
+
+    #[test]
+    fn rail_footer_never_overflows_and_narrow_desktop_adapts() {
+        let rid = crate::demo::running_run().expect("running demo run").id;
+        for (w, h, expect_rail_w, expect_stacked) in
+            [(1180.0, 760.0, 196.0, false), (800.0, 600.0, 168.0, true)]
+        {
+            let rid_clone = rid.clone();
+            let rt = setup_runtime(
+                move |s| {
+                    crate::demo::load(s, View::Run { id: rid_clone });
+                    s.conn.server = "https://lunacy-izuki.tretrauit.me".into();
+                    s.live = s.conn.clone();
+                    s.version = "0.2.0-alpha.12".into();
+                },
+                w,
+                h,
+            );
+            let els = rt.elements();
+            let rail = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("rail") && !e.exiting)
+                .expect("rail");
+            assert!(
+                (rail.rect[2] - expect_rail_w).abs() < 1.0,
+                "{w}x{h}: expected rail width {expect_rail_w}, got {}",
+                rail.rect[2]
+            );
+            let rail_right = rail.rect[0] + rail.rect[2];
+            for key in ["rail-footer", "rail-version", "rail-server"] {
+                let node = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key) && !e.exiting)
+                    .unwrap_or_else(|| panic!("{key} missing at {w}x{h}"));
+                assert!(
+                    node.rect[0] + node.rect[2] <= rail_right + 0.5,
+                    "{w}x{h}: {key} overflows rail right edge ({rail_right:.1}): {:?}",
+                    node.rect
+                );
+            }
+            let steps = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("run-steps") && !e.exiting)
+                .expect("run-steps");
+            let log = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("run-log") && !e.exiting)
+                .expect("run-log");
+            if expect_stacked {
+                assert!(
+                    log.rect[1] >= steps.rect[1] + steps.rect[3] - 1.0,
+                    "{w}x{h}: expected run-steps stacked above run-log: steps={:?} log={:?}",
+                    steps.rect,
+                    log.rect
+                );
+            } else {
+                assert!(
+                    log.rect[0] >= steps.rect[0] + steps.rect[2] - 1.0,
+                    "{w}x{h}: expected run-steps beside run-log: steps={:?} log={:?}",
+                    steps.rect,
+                    log.rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wave2_pr_force_deploy_and_cache_controls_render_and_interact() {
+        // Project view shows open PRs and Force deploy button.
+        let rt_proj = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Project {
+                        name: "lunarum".into(),
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_proj.find("project-open-prs").is_some());
+        assert!(rt_proj.find("project-force-deploy").is_some());
+
+        // Finished non-PR run with deploy steps renders Force deploy, disabled while project is running.
+        let finished = crate::demo::finished_run().expect("finished demo run");
+        let fid = finished.id.clone();
+        let mut rt_run = setup_runtime(
+            move |s| crate::demo::load(s, View::Run { id: fid }),
+            1180.0,
+            760.0,
+        );
+        let (dx, dy) = rt_run
+            .find("run-force-deploy")
+            .expect("run-force-deploy on finished non-PR run");
+        rt_run.pointer_down(dx, dy);
+        rt_run.pointer_up(dx, dy);
+        for _ in 0..3 {
+            rt_run.frame(0.016);
+            rt_run.settle_all();
+        }
+        assert_eq!(rt_run.state.force_deploying, None);
+
+        // Once the project is idle, clicking Force deploy sets in-flight state.
+        for p in &mut rt_run.state.projects {
+            p.running = false;
+            p.current_run = None;
+        }
+        rt_run.frame(0.016);
+        rt_run.settle_all();
+        let (dx, dy) = rt_run
+            .find("run-force-deploy")
+            .expect("run-force-deploy enabled when project is idle");
+        rt_run.pointer_down(dx, dy);
+        rt_run.pointer_up(dx, dy);
+        for _ in 0..3 {
+            rt_run.frame(0.016);
+            rt_run.settle_all();
+        }
+        assert_eq!(
+            rt_run.state.force_deploying.as_deref(),
+            Some(finished.id.as_str())
+        );
+
+        // Finished non-PR run without any deploy steps hides run-force-deploy.
+        let rt_ci_only = setup_runtime(
+            |s| {
+                let mut ci_run = crate::demo::finished_run().expect("finished run");
+                ci_run.id = "lunarum-ci-only".into();
+                ci_run
+                    .steps
+                    .retain(|st| st.phase != crate::model::Phase::Deploy);
+                s.view = View::Run {
+                    id: ci_run.id.clone(),
+                };
+                s.run = Some(ci_run);
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_ci_only.find("run-force-deploy").is_none());
+
+        // Startup-window running project (`running == true && current_run.is_none()`) still shows Cancel.
+        let mut rt_startup_cancel = setup_runtime(
+            |s| {
+                crate::demo::load(s, View::Projects);
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == "lunarum") {
+                    p.running = true;
+                    p.current_run = None;
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        let (cx, cy) = rt_startup_cancel
+            .find("cancel-lunarum")
+            .expect("cancel button during startup window on Projects view");
+        rt_startup_cancel.pointer_down(cx, cy);
+        rt_startup_cancel.pointer_up(cx, cy);
+        for _ in 0..3 {
+            rt_startup_cancel.frame(0.016);
+            rt_startup_cancel.settle_all();
+        }
+        assert_eq!(
+            rt_startup_cancel.state.cancelling.as_deref(),
+            Some("lunarum")
+        );
+
+        // PR run shows PR #42 pill, deploy_skipped_reason, and hides run-force-deploy.
+        let rt_pr = setup_runtime(
+            |s| {
+                let mut pr_run = crate::demo::finished_run().expect("finished run");
+                pr_run.id = "lunarum-pr-42".into();
+                pr_run.pr_number = Some(42);
+                pr_run.deploy_skipped_reason =
+                    Some("Pull request builds run CI only; deploy steps are skipped.".into());
+                s.view = View::Run {
+                    id: pr_run.id.clone(),
+                };
+                s.run = Some(pr_run);
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_pr.find("run-force-deploy").is_none());
+        assert!(rt_pr.find("run-deploy-skipped").is_some());
+        assert!(rt_pr
+            .elements()
+            .into_iter()
+            .any(|e| e.text.as_deref() == Some("PR #42")));
+
+        // Deploy page shows Force deploy for projects with deploy steps.
+        let rt_dep = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Deploy,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_dep.find("deploy-force-lunarum").is_some());
+        assert!(rt_dep.find("deploy-force-dotfiles").is_some());
+
+        // Settings -> act shows cache toggle, cache_dir, and Clear all build caches button.
+        let mut rt_act = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Act,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_act.find("field-act.cache").is_some());
+        assert!(rt_act.find("field-act.cache_dir").is_some());
+        // Scroll down so the Clear all build caches button is inside the visible viewport.
+        let (bx, by) = rt_act.find("settings-body").expect("settings-body");
+        rt_act.wheel_xy(bx, by, 0.0, -800.0);
+        for _ in 0..10 {
+            rt_act.frame(0.016);
+            rt_act.settle_all();
+        }
+        let (cx, cy) = rt_act.find("act-clear-cache").expect("act-clear-cache");
+        rt_act.pointer_down(cx, cy);
+        rt_act.pointer_up(cx, cy);
+        for _ in 0..3 {
+            rt_act.frame(0.016);
+            rt_act.settle_all();
+        }
+        assert!(rt_act.state.clearing_cache);
+
+        // Settings -> Projects detail shows watch_prs, deploy_refs, watch_tags, cache, and Clear project cache.
+        let rt_pform = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Projects,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_pform.find("field-project[0].watch_prs").is_some());
+        assert!(rt_pform.find("field-project[0].deploy_refs").is_some());
+        assert!(rt_pform.find("field-project[0].watch_tags").is_some());
+        assert!(rt_pform.find("field-project[0].cache").is_some());
+        assert!(rt_pform.find("project-clear-cache").is_some());
+    }
+
+    #[test]
+    fn stepped_surface_hierarchy_across_dark_light_and_oled() {
+        let dark = theme::kit_mode(theme::ThemeMode::Dark, true, false);
+        assert_eq!(dark.c.bg_deep.hex(), "#0b0d12ff");
+        assert_eq!(dark.c.page.hex(), "#11141bff");
+        assert_eq!(dark.c.layer_01.hex(), "#171b26ff");
+        assert_eq!(dark.c.layer_02.hex(), "#1e2331ff");
+        assert_eq!(dark.c.border_strong.hex(), "#525e7aff");
+
+        let light = theme::kit_mode(theme::ThemeMode::Light, false, false);
+        assert_eq!(light.c.page.hex(), "#f4f6faff");
+        assert_eq!(light.c.layer_01.hex(), "#e9edf5ff");
+        assert_eq!(light.c.layer_02.hex(), "#ffffffff");
+        assert_eq!(light.c.border_strong.hex(), "#8f9db5ff");
+
+        let oled = theme::kit_mode(theme::ThemeMode::Oled, true, false);
+        assert_eq!(oled.c.page.hex(), "#000000ff");
+        assert_eq!(oled.c.bg_deep.hex(), "#000000ff");
+        assert_eq!(oled.c.layer_01.hex(), "#0b0d12ff");
+        assert_eq!(oled.c.layer_02.hex(), "#131620ff");
+        assert_eq!(oled.c.border_strong.hex(), "#5d6985ff");
     }
 }

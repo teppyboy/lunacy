@@ -8,7 +8,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Field, Kit, TextArea, TextInp
 
 use crate::state::{SettingsPage, State};
 use crate::theme;
-use crate::views::{diagnostics, steps};
+use crate::views::{deploy, diagnostics, steps};
 use crate::widgets;
 
 pub fn view(
@@ -18,6 +18,7 @@ pub fn view(
     cx: &mut Cx<State>,
     hair: f32,
     compact: bool,
+    layout_w: f32,
 ) -> El {
     let page_key = match page {
         SettingsPage::Projects if s.editor.project.is_some() => {
@@ -26,6 +27,7 @@ pub fn view(
         _ => format!("settings-page-{}", page.title()),
     };
     let inner_page = match page {
+        SettingsPage::Deploy => deploy::view(s, k, cx, compact),
         SettingsPage::Diagnostics => diagnostics::view(s, k, cx, compact),
         SettingsPage::Connection => connection_page(s, k, compact),
         SettingsPage::Appearance => appearance_page(s, k, cx, compact),
@@ -72,7 +74,7 @@ pub fn view(
                     .pt(8.0)
                     .pb(18.0)
                     .fill(k.c.layer_01)
-                    .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+                    .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
                     .scroll_x()
                     .scroll_edge_fade(14.0)
                     .child(strip),
@@ -102,13 +104,14 @@ pub fn view(
         for p in SettingsPage::WINDOW {
             pages_list = pages_list.child(page_row(k, s, p));
         }
+        let pages_w = if layout_w < 960.0 { 172.0 } else { 212.0 };
         let pages = col()
-            .w(212.0)
+            .w(pages_w)
             .shrink()
             .h_full()
             .min_h(0.0)
             .fill(k.c.layer_01)
-            .border_sides([0.0, 0.0, 0.0, hair], k.c.border_base)
+            .border_sides([0.0, theme::SECTION_BORDER, 0.0, 0.0], k.c.border_strong)
             .child(widgets::scroll_bar(
                 col()
                     .key("settings-pages-scroll")
@@ -230,6 +233,7 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) ->
         .build(k)
         .key("settings-save");
 
+    let _ = hair;
     if compact {
         let mut bar = col()
             .key("settings-bar")
@@ -237,7 +241,8 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) ->
             .px(14.0)
             .py(12.0)
             .gap(10.0)
-            .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+            .fill(k.c.layer_01)
+            .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
             .child(
                 col().w_full().gap(2.0).child(title_row).child(
                     text(page.blurb())
@@ -266,7 +271,8 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) ->
         .py(12.0)
         .gap(10.0)
         .center_y()
-        .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
+        .fill(k.c.layer_01)
+        .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
         .child(
             col().gap(1.0).grow(1.0).min_w(0.0).child(title_row).child(
                 text(page.blurb())
@@ -317,7 +323,7 @@ fn config_page(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>, compa
         SettingsPage::Server => server(s, k),
         SettingsPage::Github => github(s, k, compact),
         SettingsPage::Discord => discord(s, k, compact),
-        SettingsPage::Act => act(s, k),
+        SettingsPage::Act => act(s, k, compact),
         _ => col(),
     });
     body
@@ -345,6 +351,14 @@ fn general(s: &State, k: &Kit) -> El {
         "Poll interval (seconds)",
         Some("How often each project's remote is fetched. A project may override it."),
         true,
+    ));
+    c = c.child(u64_field(
+        s,
+        k,
+        "general.step_timeout",
+        "Default step timeout (seconds)",
+        Some("Used when a project or step leaves timeout empty. Defaults to 3600s."),
+        false,
     ));
     c = c.child(argv_field(
         s,
@@ -490,7 +504,7 @@ fn discord(s: &State, k: &Kit, compact: bool) -> El {
     c
 }
 
-fn act(s: &State, k: &Kit) -> El {
+fn act(s: &State, k: &Kit, compact: bool) -> El {
     let e = &s.editor;
     let mut c = col().w_full().gap(18.0);
     c = c.child(widgets::section(k, "act", Some("The runner for GitHub Actions steps: how it is invoked and which image each `runs-on` maps to.")));
@@ -525,7 +539,47 @@ fn act(s: &State, k: &Kit) -> El {
              Defaults to `act.lock` in the state dir; `~/` is expanded.",
         ),
     ));
-    let _ = e;
+
+    c = c.child(widgets::divider(k));
+    c = c.child(widgets::section(
+        k,
+        "Build cache",
+        Some("Persist language and package caches (Cargo, npm, Flutter, Go, pip, Gradle, etc.) across act runs."),
+    ));
+    c = c.child(toggle_row(
+        k,
+        compact,
+        "field-act.cache",
+        "Aggressive build cache",
+        Some("Mount persistent per-project caches and enable act's action cache server. Defaults on when unset."),
+        crate::paths::get_bool_or(&e.draft, "act.cache", true),
+        |s: &mut State, _tx: &mut Tx| {
+            let on = crate::paths::get_bool_or(&s.editor.draft, "act.cache", true);
+            crate::paths::set_bool(&mut s.editor.draft, "act.cache", !on);
+        },
+    ));
+    c = c.child(text_field(
+        s,
+        k,
+        "act.cache_dir",
+        "Cache directory",
+        Some("Where persistent build caches are stored. Empty uses `cache` inside the state dir."),
+    ));
+    c = c.child(
+        row().w_full().gap(8.0).flex_wrap().child(
+            Button::new(if s.clearing_cache {
+                "Clearing caches…"
+            } else {
+                "Clear all build caches"
+            })
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .disabled(s.clearing_cache)
+            .on_press_tx(|s: &mut State, tx: &mut Tx| s.clear_cache(None, tx))
+            .build(k)
+            .key("act-clear-cache"),
+        ),
+    );
     c
 }
 
@@ -878,7 +932,7 @@ fn toggle_row(
     label: &str,
     help: Option<&str>,
     on: bool,
-    flip: fn(&mut State, &mut Tx),
+    flip: impl Fn(&mut State, &mut Tx) + 'static,
 ) -> El {
     let mut col_body = col().gap(2.0).min_w(0.0).grow(1.0).child(
         text(label.to_string())
@@ -1045,7 +1099,7 @@ fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
             if invalid {
                 theme::status(k).failure
             } else {
-                k.c.border_muted
+                k.c.border_base
             },
         )
         .child(info)
@@ -1277,6 +1331,27 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
             false,
         ),
     ));
+    c = c.child(widgets::pair_for(
+        compact,
+        u64_field(
+            s,
+            k,
+            &format!("{base}.step_timeout"),
+            "Default step timeout (seconds)",
+            Some("Overrides the global step timeout for this project's steps."),
+            false,
+        ),
+        u64_field(
+            s,
+            k,
+            &format!("{base}.timeout"),
+            "Total pipeline timeout (seconds)",
+            Some(
+                "Maximum total duration across checkout, CI, and deploy. Empty means no overall cap.",
+            ),
+            false,
+        ),
+    ));
     c = c.child(secret_field(
         s,
         k,
@@ -1291,6 +1366,84 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
         "Environment",
         Some("`KEY=value`, one per line, for every step in this project."),
     ));
+
+    c = c.child(widgets::divider(k));
+    c = c.child(widgets::section(
+        k,
+        "Pull requests, deploys & cache",
+        Some("Control which branches and tags deploy, whether PRs run CI, and per-project build caching."),
+    ));
+    let watch_prs_path = format!("{base}.watch_prs");
+    c = c.child(toggle_row(
+        k,
+        compact,
+        &format!("field-{watch_prs_path}"),
+        "Build pull requests (CI only)",
+        Some("Automatically run CI steps on open GitHub pull requests. Deploy steps are always skipped for PRs."),
+        crate::paths::get_bool(&e.draft, &watch_prs_path),
+        move |s: &mut State, _tx: &mut Tx| {
+            let on = crate::paths::get_bool(&s.editor.draft, &watch_prs_path);
+            crate::paths::set_bool(&mut s.editor.draft, &watch_prs_path, !on);
+        },
+    ));
+    c = c.child(list_field(
+        s,
+        k,
+        &format!("{base}.deploy_refs"),
+        "Deploy branches / tags",
+        Some("One branch or tag pattern per line (e.g. master, release/*, tags/v*). Empty deploys only the watched branch; PRs never deploy."),
+    ));
+    let watch_tags_path = format!("{base}.watch_tags");
+    c = c.child(toggle_row(
+        k,
+        compact,
+        &format!("field-{watch_tags_path}"),
+        "Watch matching tags",
+        Some("Automatically build and deploy new git tags that match `deploy_refs`."),
+        crate::paths::get_bool(&e.draft, &watch_tags_path),
+        move |s: &mut State, _tx: &mut Tx| {
+            let on = crate::paths::get_bool(&s.editor.draft, &watch_tags_path);
+            crate::paths::set_bool(&mut s.editor.draft, &watch_tags_path, !on);
+        },
+    ));
+    let cache_path = format!("{base}.cache");
+    let cache_default = crate::paths::get_bool_or(&e.draft, "act.cache", true);
+    c = c.child(toggle_row(
+        k,
+        compact,
+        &format!("field-{cache_path}"),
+        "Aggressive build cache",
+        Some("Persist compiler and package manager caches across runs for this project."),
+        crate::paths::get_bool_or(&e.draft, &cache_path, cache_default),
+        move |s: &mut State, _tx: &mut Tx| {
+            let def = crate::paths::get_bool_or(&s.editor.draft, "act.cache", true);
+            let on = crate::paths::get_bool_or(&s.editor.draft, &cache_path, def);
+            crate::paths::set_bool(&mut s.editor.draft, &cache_path, !on);
+        },
+    ));
+    let project_name = e.s(&format!("{base}.name"));
+    let unsaved_project = e.new_project || project_name.trim().is_empty();
+    let can_clear = !s.clearing_cache && !unsaved_project;
+    c = c.child(
+        row().w_full().gap(8.0).flex_wrap().child(
+            Button::new(if s.clearing_cache {
+                "Clearing cache…"
+            } else {
+                "Clear project cache"
+            })
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .disabled(!can_clear)
+            .help(if unsaved_project {
+                "Save this project before clearing its cache"
+            } else {
+                "Remove cached build artifacts for this project"
+            })
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.clear_cache(Some(&project_name), tx))
+            .build(k)
+            .key("project-clear-cache"),
+        ),
+    );
 
     c = c.child(widgets::divider(k));
     c = c.child(steps::phase(s, k, i, false, compact));
@@ -1622,5 +1775,176 @@ fn appearance_page(s: &State, k: &Kit, cx: &Cx<State>, compact: bool) -> El {
         s.log_wrap,
         |s: &mut State, tx: &mut Tx| s.toggle_log_wrap(tx),
     ));
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        c = c.child(widgets::divider(k));
+        c = c.child(desktop_updates_section(s, k, compact));
+    }
+
+    c
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn desktop_updates_section(s: &State, k: &Kit, compact: bool) -> El {
+    use crate::updater::{self, UpdateStatus};
+
+    let build_str = format!(
+        "v{} · {} · {}",
+        updater::BUILD_VERSION,
+        updater::BUILD_SHORT_SHA,
+        updater::BUILD_TARGET
+    );
+
+    let mut c = col()
+        .key("desktop-updates")
+        .w_full()
+        .gap(14.0)
+        .child(widgets::section(
+            k,
+            "Desktop Updates",
+            Some("Check GitHub prereleases and update lunacy-ui in place."),
+        ))
+        .child(widgets::kv_for(
+            k,
+            compact,
+            "Current build",
+            widgets::value_for(k, compact, &build_str),
+        ))
+        .child(toggle_row(
+            k,
+            compact,
+            "appearance-auto-update",
+            "Check for updates on startup",
+            Some("Automatically check for a newer desktop build shortly after launch."),
+            s.auto_update_check,
+            |s: &mut State, tx: &mut Tx| s.toggle_auto_update_check(tx),
+        ));
+
+    let busy = s.update_status.is_busy();
+    let check_btn = Button::new(if matches!(s.update_status, UpdateStatus::Checking) {
+        "Checking…"
+    } else {
+        "Check now"
+    })
+    .variant(ButtonVariant::Outline)
+    .control_size(ControlSize::Small)
+    .disabled(busy)
+    .on_press_tx(|s: &mut State, tx: &mut Tx| s.check_for_updates(tx))
+    .build(k)
+    .key("update-check-now");
+
+    let mut actions = row()
+        .w_full()
+        .gap(8.0)
+        .flex_wrap()
+        .center_y()
+        .child(check_btn);
+
+    match &s.update_status {
+        UpdateStatus::Available(info) => {
+            if info.asset_url.is_some() {
+                actions = actions.child(
+                    Button::new("Install update")
+                        .variant(ButtonVariant::Submit)
+                        .control_size(ControlSize::Small)
+                        .on_press_tx(|s: &mut State, tx: &mut Tx| s.install_update(tx))
+                        .build(k)
+                        .key("update-install-now"),
+                );
+            }
+            if !info.html_url.is_empty() {
+                let url = info.html_url.clone();
+                actions = actions.child(
+                    Button::new("View on GitHub")
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Small)
+                        .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+                            let _ = tx.open_url(&url);
+                        })
+                        .build(k)
+                        .key("update-view-github"),
+                );
+            }
+        }
+        UpdateStatus::ReadyToRestart(info) => {
+            actions = actions.child(
+                Button::new("Restart to apply")
+                    .variant(ButtonVariant::Submit)
+                    .control_size(ControlSize::Small)
+                    .on_press_tx(|s: &mut State, tx: &mut Tx| s.restart_for_update(tx))
+                    .build(k)
+                    .key("update-restart-now"),
+            );
+            if !info.html_url.is_empty() {
+                let url = info.html_url.clone();
+                actions = actions.child(
+                    Button::new("View on GitHub")
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Small)
+                        .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+                            let _ = tx.open_url(&url);
+                        })
+                        .build(k)
+                        .key("update-view-github"),
+                );
+            }
+        }
+        _ => {}
+    }
+
+    c = c.child(actions);
+
+    let status_el = match &s.update_status {
+        UpdateStatus::Idle => text("Not checked yet in this session.")
+            .font(k.ty.small)
+            .color(k.c.text_faint)
+            .wrap(),
+        UpdateStatus::Checking => text("Checking GitHub prerelease…")
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .wrap(),
+        UpdateStatus::UpToDate { checked_sha } => text(format!(
+            "Up to date with the latest prerelease ({checked_sha})."
+        ))
+        .font(k.ty.small)
+        .color(theme::status(k).success)
+        .wrap(),
+        UpdateStatus::Available(info) => {
+            let suffix = if info.asset_url.is_none() {
+                " (no automatic download for this target — open on GitHub)"
+            } else {
+                ""
+            };
+            let published = if info.published_at.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", info.published_at)
+            };
+            widgets::notice(
+                k,
+                theme::status(k).running,
+                &format!(
+                    "Update available: {} ({}){published}{suffix}",
+                    info.title, info.short_sha
+                ),
+            )
+        }
+        UpdateStatus::Installing { info, stage } => widgets::notice(
+            k,
+            theme::status(k).running,
+            &format!("Installing {}: {stage}", info.short_sha),
+        ),
+        UpdateStatus::ReadyToRestart(info) => widgets::notice(
+            k,
+            theme::status(k).success,
+            &format!(
+                "Update {} installed. Click \"Restart to apply\" to launch the new version.",
+                info.short_sha
+            ),
+        ),
+        UpdateStatus::Error(err) => widgets::notice(k, theme::status(k).failure, err),
+    };
+    c = c.child(status_el);
     c
 }

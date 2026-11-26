@@ -128,10 +128,15 @@ pub fn get_u64(v: &Value, path: &str) -> Option<u64> {
 }
 
 pub fn get_bool(v: &Value, path: &str) -> bool {
+    get_bool_or(v, path, false)
+}
+
+pub fn get_bool_or(v: &Value, path: &str, default: bool) -> bool {
     match get(v, path) {
         Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => s == "true",
-        _ => false,
+        Some(Value::String(s)) if s == "true" => true,
+        Some(Value::String(s)) if s == "false" => false,
+        _ => default,
     }
 }
 

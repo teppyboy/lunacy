@@ -1,5 +1,6 @@
 //! One module per screen.
 
+pub mod deploy;
 pub mod diagnostics;
 pub mod project;
 pub mod projects;

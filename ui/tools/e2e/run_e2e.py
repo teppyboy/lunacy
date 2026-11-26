@@ -251,7 +251,9 @@ class Sandbox:
         e = dict(os.environ)
         e["TMPDIR"] = "/tmp"
         e["RUNE_DIRS_ROOT"] = str(self.dir / "rune-dirs")
-        e.setdefault("VK_ICD_FILENAMES", "/home/tretrauit/Android/Sdk/emulator/lib64/vulkan/lvp_icd.json")
+        lvp_icd = "/home/tretrauit/Android/Sdk/emulator/lib64/vulkan/lvp_icd.json"
+        if not e.get("VK_ICD_FILENAMES") and pathlib.Path(lvp_icd).is_file():
+            e["VK_ICD_FILENAMES"] = lvp_icd
         return e
 
     def setup(self) -> None:
@@ -416,7 +418,7 @@ poll_interval = 300
 [[project.ci]]
 name = "Slow step"
 kind = "shell"
-run = "echo slow-start; sleep 10; echo slow-done"
+run = "echo slow-start; sleep 25; echo slow-done"
 timeout = 60
 '''
         self.config_path.write_text(cfg)
@@ -560,6 +562,11 @@ def test_contract(sb: Sandbox) -> str:
     assert st == 200 and isinstance(sysinfo, dict)
     assert sysinfo.get("state_dir") and sysinfo.get("config_path")
 
+    st, deploy_checks = api_call(sb.port, "/api/deploy/checks")
+    assert st == 200 and isinstance(deploy_checks, dict)
+    assert deploy_checks.get("os") and isinstance(deploy_checks.get("projects"), list)
+    assert [p["name"] for p in deploy_checks["projects"]] == ["alpha", "beta", "slow"]
+
     st, wf1 = api_call(sb.port, "/api/projects/alpha/workflows")
     assert st == 200 and isinstance(wf1, list)
     assert {w["file"] for w in wf1} == {".github/workflows/ci.yml", ".github/workflows/release.yml"}
@@ -607,7 +614,7 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
     wait_project_idle(sb.port, "alpha")
 
     print("[e2e] T3: 409 already running toast & live slow run log...")
-    wait_project_idle(sb.port, "slow")
+    wait_project_idle(sb.port, "slow", timeout=40.0)
 
     def on_mark_slow(name: str) -> None:
         if name == "fire-slow":
@@ -618,17 +625,61 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
     t_409 = sb.run_ui("slow_409", sc.events, at=sc.t + 0.3, on_mark=on_mark_slow)
     assert "Already running" in " ".join(subtree_texts(t_409, "toast-layer"))
 
-    wait_until(
-        lambda: api_call(sb.port, "/api/projects/slow")[1].get("running") is True,
-        timeout=5,
-        desc="slow marked running",
-    )
-    slow_id = api_call(sb.port, "/api/projects/slow")[1]["current_run"]["id"]
+    def slow_running_project() -> dict | None:
+        st, p = api_call(sb.port, "/api/projects/slow")
+        if (
+            st == 200
+            and isinstance(p, dict)
+            and p.get("running") is True
+            and isinstance(p.get("current_run"), dict)
+            and p["current_run"].get("id")
+        ):
+            return p
+        return None
+
+    slow_p = wait_until(slow_running_project, timeout=10, desc="slow marked running")
+    slow_id = slow_p["current_run"]["id"]
     sc = Script(1.0).tap("project-slow", 0.7).tap(f"run-{slow_id}", 0.7).tap("step-0", 0.7)
     t_slow_live = sb.run_ui("slow_live", sc.events, at=sc.t + 0.3)
     slow_log_text = " ".join(subtree_texts(t_slow_live, "log"))
     assert "slow-start" in slow_log_text, f"expected slow-start in live log, got: {slow_log_text[:200]}"
-    wait_project_idle(sb.port, "slow")
+    assert has_key(t_slow_live, "run-cancel"), "Cancel button must appear on running run"
+
+    print("[e2e] T3b: Cancel running slow workflow from run screen...")
+    st_slow, slow_p = api_call(sb.port, "/api/projects/slow")
+    cur_run = slow_p.get("current_run") if st_slow == 200 and isinstance(slow_p, dict) else None
+    remaining = (
+        25.0 - (time.time() - float(cur_run["started_at"]))
+        if isinstance(cur_run, dict) and cur_run.get("started_at") is not None
+        else 0.0
+    )
+    if not (
+        isinstance(slow_p, dict)
+        and slow_p.get("running") is True
+        and isinstance(cur_run, dict)
+        and cur_run.get("id")
+        and remaining >= 12.0
+    ):
+        if isinstance(slow_p, dict) and slow_p.get("running"):
+            wait_project_idle(sb.port, "slow", timeout=40.0)
+        st_trig, _ = api_call(
+            sb.port,
+            "/api/projects/slow/trigger",
+            method="POST",
+            json_body={"force": True},
+        )
+        assert st_trig == 202, f"expected 202 triggering fresh slow run, got {st_trig}"
+        slow_p = wait_until(slow_running_project, timeout=10, desc="fresh slow run marked running")
+        slow_id = slow_p["current_run"]["id"]
+    else:
+        slow_id = cur_run["id"]
+
+    sc_cancel = Script(1.0).tap("project-slow", 0.6).tap(f"run-{slow_id}", 0.6).tap("run-cancel", 0.8)
+    t_cancel = sb.run_ui("slow_cancel", sc_cancel.events, at=sc_cancel.t + 0.3)
+    assert "Cancelling" in " ".join(subtree_texts(t_cancel, "toast-layer"))
+    slow_done = wait_project_idle(sb.port, "slow")
+    assert slow_done["last_run"]["id"] == slow_id
+    assert slow_done["last_run"]["status"] == "cancelled", slow_done["last_run"]
 
     print("[e2e] T4: History -> Run -> Tail/Full log -> act substeps -> skipped -> Back/Esc/Cmd+R...")
     sc = (
@@ -642,12 +693,28 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
     full_txt = " ".join(subtree_texts(t_full, "log"))
     assert "1\n2\n" in full_txt and "2500" in full_txt, "Full toggle did not load line 1..2500"
 
-    sc = Script(1.0).tap("project-alpha", 0.7).tap(f"run-{latest_alpha_run_id}", 0.7).tap("step-1", 0.7)
+    sc = (
+        Script(1.0)
+        .tap("project-alpha", 0.7)
+        .tap(f"run-{latest_alpha_run_id}", 0.7)
+        .tap("step-1", 0.7)
+        .tap("substep-toggle-0", 0.4)
+    )
     t_act = sb.run_ui("alpha_act_and_skipped", sc.events, at=sc.t + 0.3)
     subs = " ".join(subtree_texts(t_act, "substeps-job-0"))
     assert "Say hi" in subs and "Second check" in subs, subs
-    assert "hello from act web" in " ".join(subtree_texts(t_act, "log"))
+    assert "hello from act web" in " ".join(subtree_texts(t_act, "substeps")), subs
     assert "Skipped" in " ".join(subtree_texts(t_act, "step-2"))
+
+    sc_raw = (
+        Script(1.0)
+        .tap("project-alpha", 0.7)
+        .tap(f"run-{latest_alpha_run_id}", 0.7)
+        .tap("step-1", 0.7)
+        .tap("run-log-view/segment1", 0.4)
+    )
+    t_act_raw = sb.run_ui("alpha_act_raw", sc_raw.events, at=sc_raw.t + 0.3)
+    assert "hello from act web" in " ".join(subtree_texts(t_act_raw, "log"))
 
     sc = (
         Script(1.0)
@@ -678,6 +745,7 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
         Script(1.0)
         .tap("titlebar-settings", 0.7)
         .replace("field-general.poll_interval", "120", 0.25)
+        .replace("field-general.step_timeout", "1800", 0.25)
         .replace("field-general.shell", "bash -lc", 0.25)
         .tap("settings-nav-Server", 0.35)
         .replace("field-server.public_url", f"http://127.0.0.1:{sb.port}", 0.25)
@@ -690,16 +758,28 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
         .replace("field-act.args", f"--pull=false\n--artifact-server-port={sb.act_port}\n--verbose", 0.25)
         .replace("field-act.platforms", "ubuntu-latest=-self-hosted\nubuntu-22.04=-self-hosted", 0.25)
         .key("s", cmd=True, after=0.9)
+        .tap("settings-nav-Deploy", 0.6)
+        .tap("deploy-refresh", 0.6)
+    )
+    t_deploy = sb.run_ui("settings_save_and_deploy", sc.events, at=sc.t + 0.4)
+    dep_txt = " ".join(subtree_texts(t_deploy, "deploy-checks"))
+    assert "alpha" in dep_txt and "1800s" in dep_txt, dep_txt
+    assert has_key(t_deploy, "deploy-project-alpha")
+
+    sc_diag = (
+        Script(1.0)
+        .tap("titlebar-settings", 0.7)
         .tap("settings-nav-Diagnostics", 0.5)
         .tap("diagnostics-refresh", 0.6)
     )
-    t_save = sb.run_ui("settings_save_all_pages", sc.events, at=sc.t + 0.4)
+    t_save = sb.run_ui("settings_diagnostics", sc_diag.events, at=sc_diag.t + 0.4)
     diag = " ".join(subtree_texts(t_save, "diagnostics"))
     assert "Linux" in diag and "Available" in diag and str(sb.config_path) in diag, diag
     assert str(sb.dir / "state") in diag, diag
 
     disk = tomllib.loads(sb.config_path.read_text())
     assert disk["general"]["poll_interval"] == 120
+    assert disk["general"]["step_timeout"] == 1800
     assert disk["general"]["shell"] == ["bash", "-lc"]
     assert disk["server"]["token"] == TOKEN, "masked server.token was clobbered!"
     assert disk["server"]["public_url"] == f"http://127.0.0.1:{sb.port}"
@@ -719,6 +799,9 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
         .tap("project-edit-0", 0.4)
         .replace("field-project[0].github_repo", "acme/alpha", 0.25)
         .replace("field-project[0].poll_interval", "90", 0.25)
+        .replace("field-project[0].step_timeout", "600", 0.25)
+        .replace("field-project[0].timeout", "3600", 0.25)
+        .wheel("settings-body", -350.0, 0.3)
         .replace("field-project[0].env", "ALPHA_ENV=hello\nFOO=bar", 0.25)
         .tap("settings-save", 0.8)
     )
@@ -726,6 +809,8 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
     disk = tomllib.loads(sb.config_path.read_text())
     assert disk["project"][0]["github_repo"] == "acme/alpha"
     assert disk["project"][0]["poll_interval"] == 90
+    assert disk["project"][0]["step_timeout"] == 600
+    assert disk["project"][0]["timeout"] == 3600
     assert disk["project"][0]["env"]["FOO"] == "bar"
 
     sc = Script(1.0).tap("project-alpha", 0.6).tap(f"run-{latest_alpha_run_id}", 0.6).tap("run-github", 0.3)
@@ -770,7 +855,7 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
         .replace("field-project[3].name", "delta", 0.25)
         .replace("field-project[3].branch", "master", 0.25)
         .replace("field-project[3].repo_path", str(sb.dir / "repos" / "alpha"), 0.25)
-        .wheel("settings-body", -450.0, 0.3)
+        .wheel("settings-body", -800.0, 0.3)
         .tap("add-shell-ci", 0.4)
         .wheel("settings-body", -450.0, 0.3)
         .replace("field-project[3].ci[0].name", "Smoke", 0.25)
@@ -792,7 +877,7 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
         .replace("field-project[3].name", "delta", 0.25)
         .replace("field-project[3].branch", "master", 0.25)
         .replace("field-project[3].repo_path", str(sb.dir / "repos" / "alpha"), 0.25)
-        .wheel("settings-body", -450.0, 0.3)
+        .wheel("settings-body", -800.0, 0.3)
         .tap("add-shell-ci", 0.4)
         .wheel("settings-body", -350.0, 0.3)
         .replace("field-project[3].ci[0].name", "Smoke", 0.25)
@@ -938,10 +1023,12 @@ def test_responsive_layouts(sb: Sandbox, alpha_run_id: str) -> None:
         if win_w <= 420.0:
             sc = sc.wheel("settings-nav-strip", dx=-240.0, after=0.35)
         sc = sc.tap("settings-nav-Projects", 0.5).tap("project-edit-0", 0.4)
-        if compact:
-            sc = sc.wheel("settings-body", -450.0, 0.35).wheel("settings-body", -400.0, 0.35)
+        if win_w <= 420.0:
+            sc = sc.wheel("settings-body", -700.0, 0.35).wheel("settings-body", -700.0, 0.35)
+        elif compact:
+            sc = sc.wheel("settings-body", -850.0, 0.35).wheel("settings-body", -850.0, 0.35)
         else:
-            sc = sc.wheel("settings-body", -350.0, 0.35)
+            sc = sc.wheel("settings-body", -900.0, 0.35)
         sc = sc.tap("step-row-ci-0", 0.4)
         t_step = sb.run_ui(f"resp_{tag}_step_editor", sc.events, at=sc.t + 0.3, size=size)
         assert has_key(t_step, "step-form") and has_key(t_step, "step-kind")

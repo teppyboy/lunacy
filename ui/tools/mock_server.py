@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 Json = dict[str, Any]
 
-DONE = ("success", "failure", "timeout", "skipped")
+DONE = ("success", "failure", "timeout", "skipped", "cancelled")
 OS_NAMES = ("linux", "windows", "macos")
 
 
@@ -147,6 +147,36 @@ class Store:
             if project["name"] == name:
                 return project
         return None
+
+    def cancel_run(self, run_id: str) -> tuple[int, Json]:
+        with self.lock:
+            run = self.run_by_id(run_id)
+            if run is None:
+                return 404, {"error": "unknown run", "field": None}
+            if run.get("status") != "running":
+                return 409, {"error": "run is not running", "field": None}
+            now = int(time.time())
+            run["status"] = "cancelled"
+            run["finished_at"] = now
+            for step in run.get("steps") or []:
+                if step.get("status") in ("running", "pending"):
+                    step["status"] = "cancelled"
+                for sub in step.get("substeps") or []:
+                    if sub.get("status") in ("running", "pending"):
+                        sub["status"] = "cancelled"
+            if self.live is not None and self.live.get("id") == run_id:
+                self.live = None
+            proj = self.project(run.get("project", ""))
+            if proj is not None:
+                proj["running"] = False
+                if (proj.get("current_run") or {}).get("id") == run_id:
+                    proj["current_run"] = None
+                proj["last_run"] = copy.deepcopy(run)
+            return 202, {
+                "cancelling": True,
+                "run_id": run["id"],
+                "project": run.get("project", ""),
+            }
 
 
 class MockServer(ThreadingHTTPServer):
@@ -302,6 +332,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/system":
             self._send(200, store.data["system"])
             return
+        if path == "/api/deploy/checks":
+            self._send(200, store.data.get("deploy_checks", {}))
+            return
+        if path == "/api/cache/clear":
+            if method != "POST":
+                self._error(405, "POST only")
+                return
+            names = ["act-cache"] + [p["name"] for p in store.data.get("projects") or []]
+            self._send(200, {"cleared": True, "removed": names})
+            return
 
         m = re.fullmatch(r"/api/projects/([^/]+)/runs", path)
         if m:
@@ -334,6 +374,48 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(202, {"queued": True})
             return
+        m = re.fullmatch(r"/api/projects/([^/]+)/deploy", path)
+        if m:
+            if method != "POST":
+                self._error(405, "POST only")
+                return
+            project = store.project(m.group(1))
+            if project is None:
+                self._error(404, "unknown project")
+                return
+            if project.get("running"):
+                self._error(409, "already running")
+                return
+            sha = project.get("upstream_sha") or project.get("last_sha") or ""
+            self._send(202, {"queued": True, "sha": sha, "deploy_only": True})
+            return
+        m = re.fullmatch(r"/api/projects/([^/]+)/cache/clear", path)
+        if m:
+            if method != "POST":
+                self._error(405, "POST only")
+                return
+            project = store.project(m.group(1))
+            if project is None:
+                self._error(404, "unknown project")
+                return
+            self._send(200, {"cleared": True, "removed": [project["name"]]})
+            return
+        m = re.fullmatch(r"/api/projects/([^/]+)/cancel", path)
+        if m:
+            if method != "POST":
+                self._error(405, "POST only")
+                return
+            project = store.project(m.group(1))
+            if project is None:
+                self._error(404, "unknown project")
+                return
+            cur = project.get("current_run")
+            if not project.get("running") or not cur:
+                self._error(409, "project is not running")
+                return
+            status, payload = store.cancel_run(cur["id"])
+            self._send(status, payload)
+            return
         m = re.fullmatch(r"/api/projects/([^/]+)", path)
         if m:
             project = store.project(m.group(1))
@@ -360,6 +442,32 @@ class Handler(BaseHTTPRequestHandler):
                     text = "\n".join(text.splitlines()[-lines:]) + "\n"
             self._send(200, text, "text/plain; charset=utf-8")
             return
+        m = re.fullmatch(r"/api/runs/([^/]+)/cancel", path)
+        if m:
+            if method != "POST":
+                self._error(405, "POST only")
+                return
+            status, payload = store.cancel_run(m.group(1))
+            self._send(status, payload)
+            return
+        m = re.fullmatch(r"/api/runs/([^/]+)/deploy", path)
+        if m:
+            if method != "POST":
+                self._error(405, "POST only")
+                return
+            run = store.run_by_id(m.group(1))
+            if run is None:
+                self._error(404, "unknown run")
+                return
+            if run.get("pr_number") is not None:
+                self._error(400, "cannot force deploy a pull request run")
+                return
+            project = store.project(run.get("project", ""))
+            if project and project.get("running"):
+                self._error(409, "already running")
+                return
+            self._send(202, {"queued": True, "sha": run.get("sha", ""), "deploy_only": True})
+            return
         m = re.fullmatch(r"/api/runs/([^/]+)", path)
         if m:
             run = store.run_by_id(m.group(1))
@@ -378,6 +486,9 @@ class Handler(BaseHTTPRequestHandler):
         general = body.get("general") or {}
         if general.get("poll_interval", 300) == 0:
             self._error(400, "must be at least 1 second", "general.poll_interval")
+            return
+        if general.get("step_timeout") == 0:
+            self._error(400, "must be at least 1 second", "general.step_timeout")
             return
         server = body.get("server")
         if server is not None and not (server.get("listen") or "").strip():
@@ -399,6 +510,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not (project.get("branch") or "").strip():
                 self._error(400, "must not be empty", f"project[{i}].branch")
+                return
+            if project.get("step_timeout") == 0:
+                self._error(400, "must be at least 1", f"project[{i}].step_timeout")
+                return
+            if project.get("timeout") == 0:
+                self._error(400, "must be at least 1", f"project[{i}].timeout")
                 return
             ci_steps: list[Json] = project.get("ci") or []
             deploy_steps: list[Json] = project.get("deploy") or []

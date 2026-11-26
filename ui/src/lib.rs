@@ -13,6 +13,7 @@ pub mod net;
 pub mod paths;
 pub mod state;
 pub mod theme;
+pub mod updater;
 pub mod views;
 pub mod widgets;
 

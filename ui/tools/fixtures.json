@@ -18,6 +18,154 @@
       "version": "git version 2.47.1"
     }
   },
+  "deploy_checks": {
+    "os": "linux",
+    "default_step_timeout": 3600,
+    "github_enabled": true,
+    "github_mode": "checks",
+    "discord_global": true,
+    "cache_enabled": true,
+    "cache_dir": "/home/you/.local/state/lunacy/cache",
+    "projects": [
+      {
+        "name": "lunarum",
+        "repo_path": "/home/you/src/lunarum",
+        "remote": "origin",
+        "branch": "master",
+        "checkout": "worktree",
+        "github_repo": "teppyboy/lunarum",
+        "poll_interval": 60,
+        "pipeline_timeout": 7200,
+        "step_timeout": 3600,
+        "overall": "ok",
+        "watch_prs": true,
+        "deploy_refs": ["master", "tags/v*"],
+        "cache_enabled": true,
+        "git": {
+          "repo_exists": true,
+          "is_git_repo": true,
+          "remote_ok": true,
+          "remote_url": "https://github.com/teppyboy/lunarum.git",
+          "dirty": false,
+          "head_sha": "4f1c2b9e8a7d6c5b4a39281706f5e4d3c2b1a090",
+          "upstream_sha": "4f1c2b9e8a7d6c5b4a39281706f5e4d3c2b1a090",
+          "last_sha": "9a8b7c6d5e4f30211f2e3d4c5b6a7988a7b6c5d4"
+        },
+        "reporting": {
+          "github_enabled": true,
+          "ci_context": "lunacy/ci",
+          "deploy_context": "lunacy/deploy",
+          "discord_source": "project"
+        },
+        "ci_active_steps": 2,
+        "ci_total_steps": 3,
+        "deploy_active_steps": 1,
+        "deploy_total_steps": 1,
+        "deploy_steps": [
+          {
+            "name": "Sync to the edge",
+            "kind": "shell",
+            "applies_to_host": true,
+            "only_on": [],
+            "effective_timeout": 300,
+            "command_summary": "rsync -az --delete ui/dist/ edge:/srv/lunarum/",
+            "checks": [
+              {
+                "level": "ok",
+                "label": "Host match",
+                "detail": "Runs on linux (every host)."
+              }
+            ]
+          }
+        ],
+        "checks": [
+          {
+            "level": "ok",
+            "label": "Repository ready",
+            "detail": "Git worktree checkout is isolated from local working tree changes."
+          },
+          {
+            "level": "ok",
+            "label": "Remote reachable",
+            "detail": "origin points to https://github.com/teppyboy/lunarum.git"
+          }
+        ],
+        "last_deploy": {
+          "run_id": "lunarum-1764064800-9a8b7c6",
+          "sha": "9a8b7c6d5e4f30211f2e3d4c5b6a7988a7b6c5d4",
+          "status": "success",
+          "finished_at": 1764065005,
+          "steps": [
+            {
+              "name": "Sync to the edge",
+              "status": "success",
+              "duration_ms": 4210
+            }
+          ]
+        }
+      },
+      {
+        "name": "dotfiles",
+        "repo_path": "/home/you/src/dotfiles",
+        "remote": "origin",
+        "branch": "main",
+        "checkout": "none",
+        "github_repo": "teppyboy/dotfiles",
+        "poll_interval": 300,
+        "pipeline_timeout": null,
+        "step_timeout": 1800,
+        "overall": "warn",
+        "watch_prs": false,
+        "deploy_refs": [],
+        "cache_enabled": true,
+        "git": {
+          "repo_exists": true,
+          "is_git_repo": true,
+          "remote_ok": true,
+          "remote_url": "https://github.com/teppyboy/dotfiles.git",
+          "dirty": true,
+          "head_sha": "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+          "upstream_sha": "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4",
+          "last_sha": "1a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4"
+        },
+        "reporting": {
+          "github_enabled": true,
+          "ci_context": "lunacy/ci",
+          "deploy_context": "lunacy/deploy",
+          "discord_source": "global"
+        },
+        "ci_active_steps": 1,
+        "ci_total_steps": 1,
+        "deploy_active_steps": 1,
+        "deploy_total_steps": 1,
+        "deploy_steps": [
+          {
+            "name": "Install dotfiles",
+            "kind": "shell",
+            "applies_to_host": true,
+            "only_on": ["linux", "macos"],
+            "effective_timeout": 120,
+            "command_summary": "./install.sh --force",
+            "checks": [
+              {
+                "level": "ok",
+                "label": "Host match",
+                "detail": "Matches only_on [linux, macos] on linux."
+              }
+            ]
+          }
+        ],
+        "checks": [
+          {
+            "level": "warn",
+            "label": "Uncommitted changes",
+            "detail": "Working tree is dirty; checkout = none builds directly in the repo directory."
+          }
+        ],
+        "last_deploy": null
+      }
+    ]
+  },
   "workflows": [
     {
       "file": ".github/workflows/ci.yml",
@@ -100,7 +248,18 @@
         "github_url": "https://github.com/teppyboy/lunarum/runs/5838441203",
         "trigger": "poll",
         "steps": []
-      }
+      },
+      "open_prs": [
+        {
+          "number": 42,
+          "title": "feat(ui): expandable summary steps in run log",
+          "head_ref": "feat/accordion-logs",
+          "base_ref": "master",
+          "head_sha": "deadbeef1234567890abcdef1234567890abcdef",
+          "last_tested_sha": "deadbeef1234567890abcdef1234567890abcdef",
+          "status": "success"
+        }
+      ]
     },
     {
       "name": "dotfiles",
@@ -527,11 +686,11 @@
   ],
   "logs": {
     "lunarum-1764067434-4f1c2b9/0": "npm warn deprecated inflight@1.0.6: This module is not supported\nadded 812 packages, and audited 813 packages in 8s\n\n164 packages are looking for funding\n  run `npm fund` for details\n\nfound 0 vulnerabilities\n",
-    "lunarum-1764067434-4f1c2b9/1": "[web] 🚀  Start image=catthehacker/ubuntu:act-latest\n[web]   🐳  docker pull image=catthehacker/ubuntu:act-latest platform= username= forcePull=true\n[web]   🐳  docker create image=catthehacker/ubuntu:act-latest platform= entrypoint=[\"tail\" \"-f\" \"/dev/null\"] cmd=[] network=\"container:act-CI-web-2f8c1a\"\n[web] [command]/usr/bin/git version\n[web] git version 2.43.0\n[web] [command]/usr/bin/node --version\n[web] v20.11.0\n[web] ⚙  ::group::Install dependencies\n[web] [command]npm ci\n[web] added 812 packages, and audited 813 packages in 19s\n[web] ⚙  ::endgroup::\n[web] ⚙  ::group::Lint\n[web] [command]npm run lint\n[web] > lunarum-web@0.1.0 lint\n[web] > eslint src --max-warnings 0\n[web] ⚙  ::endgroup::\n[web] ⚙  ::group::Test\n[web] [command]npm test\n[web] > lunarum-web@0.1.0 test\n[web] > vitest run\n[web] \n[web]  RUN  v2.1.8 /home/runner/work/lunarum/lunarum\n[web] \n[web]  ✓ src/api.test.ts (14 tests) 62ms\n[web]  ✓ src/poll.test.ts (6 tests) 41ms\n[web]  ❯ src/list.test.ts (9 tests | 1 failed) 88ms\n[web]    × ProjectList keeps the selection when a poll reorders rows\n[web]      → expected element list to equal [a, b, c]\n[web] \n[web]  Test Files  1 failed | 2 passed (3)\n[web]       Tests  1 failed | 28 passed (29)\n",
+    "lunarum-1764067434-4f1c2b9/1": "[web] 🚀  Start image=catthehacker/ubuntu:act-latest\n[web]   🐳  docker pull image=catthehacker/ubuntu:act-latest platform= username= forcePull=true\n[web]   🐳  docker create image=catthehacker/ubuntu:act-latest platform= entrypoint=[\"tail\" \"-f\" \"/dev/null\"] cmd=[] network=\"container:act-CI-web-2f8c1a\"\n[web] ⭐ Run Set up job\n[web]   ✅  Success - Set up job\n[web] ⭐ Run Main Run actions/checkout@v4\n[web] [command]/usr/bin/git version\n[web] git version 2.43.0\n[web]   ✅  Success - Main Run actions/checkout@v4\n[web] ⭐ Run Main Run actions/setup-node@v4\n[web] [command]/usr/bin/node --version\n[web] v20.11.0\n[web]   ✅  Success - Main Run actions/setup-node@v4\n[web] ⭐ Run Main Install dependencies\n[web] [command]npm ci\n[web] added 812 packages, and audited 813 packages in 19s\n[web]   ✅  Success - Main Install dependencies\n[web] ⭐ Run Main Lint\n[web] [command]npm run lint\n[web] > lunarum-web@0.1.0 lint\n[web] > eslint src --max-warnings 0\n[web]   ✅  Success - Main Lint\n[web] ⭐ Run Main Test\n[web] [command]npm test\n[web] > lunarum-web@0.1.0 test\n[web] > vitest run\n[web] \n[web]  RUN  v2.1.8 /home/runner/work/lunarum/lunarum\n[web] \n[web]  ✓ src/api.test.ts (14 tests) 62ms\n[web]  ✓ src/poll.test.ts (6 tests) 41ms\n[web]  ❯ src/list.test.ts (9 tests | 1 failed) 88ms\n[web]    × ProjectList keeps the selection when a poll reorders rows\n[web]      → expected element list to equal [a, b, c]\n[web] \n[web]  Test Files  1 failed | 2 passed (3)\n[web]       Tests  1 failed | 28 passed (29)\n",
     "lunarum-1764064800-9a8b7c6/0": "added 812 packages, and audited 813 packages in 8s\n\n164 packages are looking for funding\nfound 0 vulnerabilities\n",
     "lunarum-1764800/1": "no output\n",
-    "lunarum-1764064800-9a8b7c6/1": "[web] 🚀  Start image=catthehacker/ubuntu:act-latest\n[web] [command]npm ci\n[web] added 812 packages, and audited 813 packages in 18s\n[web] [command]npm test\n[web]  Test Files  3 passed (3)\n[web]       Tests  29 passed (29)\n[web] [command]npm run build\n[web] vite v6.0.7 building for production...\n[web] ✓ 812 modules transformed.\n[web] dist/index.html                   0.61 kB │ gzip:  0.36 kB\n[web] dist/assets/index-D7f3a1b2.js     142.08 kB │ gzip: 45.81 kB\n[web] ✓ built in 6.41s\n[web] ⭐ Run Complete job\n[web]   ✅  Success - Main Complete job\n[server] 🚀  Start image=catthehacker/ubuntu:act-latest\n[server] [command]cargo test --all\n[server] running 62 tests\n[server] test result: ok. 62 passed; 0 failed\n[server]   ✅  Success - Main Complete job\n",
-    "lunarum-1764057600-3c4d5e6/1": "[web] [command]npm test\n[web]  ❯ src/list.test.ts (9 tests | 1 failed) 88ms\n[web]    × ProjectList keeps the selection when a poll reorders rows\n[web]      → expected element list to equal [a, b, c]\n[web] Error: Process completed with exit code 1.\n",
+    "lunarum-1764064800-9a8b7c6/1": "[web] 🚀  Start image=catthehacker/ubuntu:act-latest\n[web] ⭐ Run Set up job\n[web]   ✅  Success - Set up job\n[web] ⭐ Run Main Run actions/checkout@v4\n[web] Checked out commit 9a8b7c6\n[web]   ✅  Success - Main Run actions/checkout@v4\n[web] ⭐ Run Main Install dependencies\n[web] [command]npm ci\n[web] added 812 packages, and audited 813 packages in 18s\n[web]   ✅  Success - Main Install dependencies\n[web] ⭐ Run Main Test\n[web] [command]npm test\n[web]  Test Files  3 passed (3)\n[web]       Tests  29 passed (29)\n[web]   ✅  Success - Main Test\n[web] ⭐ Run Main Build\n[web] [command]npm run build\n[web] vite v6.0.7 building for production...\n[web] ✓ 812 modules transformed.\n[web] dist/index.html                   0.61 kB │ gzip:  0.36 kB\n[web] dist/assets/index-D7f3a1b2.js     142.08 kB │ gzip: 45.81 kB\n[web] ✓ built in 6.41s\n[web]   ✅  Success - Main Build\n[web] ⭐ Run Complete job\n[web]   ✅  Success - Main Complete job\n[server] 🚀  Start image=catthehacker/ubuntu:act-latest\n[server] ⭐ Run Set up job\n[server]   ✅  Success - Set up job\n[server] ⭐ Run Main Test\n[server] [command]cargo test --all\n[server] running 62 tests\n[server] test result: ok. 62 passed; 0 failed\n[server]   ✅  Success - Main Test\n[server] ⭐ Run Complete job\n[server]   ✅  Success - Main Complete job\n",
+    "lunarum-1764057600-3c4d5e6/1": "[web] ⭐ Run Set up job\n[web]   ✅  Success - Set up job\n[web] ⭐ Run Main Install dependencies\n[web] [command]npm ci\n[web] added 812 packages in 19s\n[web]   ✅  Success - Main Install dependencies\n[web] ⭐ Run Main Test\n[web] [command]npm test\n[web]  ❯ src/list.test.ts (9 tests | 1 failed) 88ms\n[web]    × ProjectList keeps the selection when a poll reorders rows\n[web]      → expected element list to equal [a, b, c]\n[web] Error: Process completed with exit code 1.\n[web]   ❌  Failure - Main Test\n[web] ⭐ Run Complete job\n[web]   ✅  Success - Main Complete job\n",
     "dotfiles-1764059000-1a2b3c4/0": "zsh -n zsh/.zshrc\nzsh/.zshrc:42: parse error near `\\n'\n",
     "playground-1764040000-77aa66b/0": "[act] exec: \"act\": executable file not found in $PATH\n"
   },
@@ -575,7 +734,8 @@
       },
       "args": [
         "--pull=false"
-      ]
+      ],
+      "cache": true
     },
     "project": [
       {
@@ -586,6 +746,13 @@
         "github_repo": "teppyboy/lunarum",
         "checkout": "worktree",
         "poll_interval": 60,
+        "watch_prs": true,
+        "deploy_refs": [
+          "master",
+          "tags/v*"
+        ],
+        "watch_tags": true,
+        "cache": true,
         "env": {
           "NODE_OPTIONS": "--max-old-space-size=4096"
         },

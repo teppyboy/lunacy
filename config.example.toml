@@ -191,9 +191,11 @@ timeout = 5400
 # cannot pin per project, so update the digest here when you bump it.
 platforms = { "ubuntu-latest" = "catthehacker/ubuntu@sha256:1d8114fb9c1fa5de85c79a31dc6d24d2128753486e46e1cbad0de98d3f9ae966" }
 args = ["--pull=false"]
-vars = { "VCRAFT_CI_PG_PORT" = "5432", "VCRAFT_CI_REDIS_PORT" = "6379", "VCRAFT_CI_RUSTFS_PORT" = "9000" }
+# "auto-port": a free 127.0.0.1 port picked per run, as scripts/ci-act.sh does. A fixed
+# port fails with "address already in use" whenever anything else holds it (another run,
+# a manual `make ci`, a container still shutting down).
+vars = { "VCRAFT_CI_PG_PORT" = "auto-port", "VCRAFT_CI_REDIS_PORT" = "auto-port", "VCRAFT_CI_RUSTFS_PORT" = "auto-port" }
 # What scripts/ci-act.sh does that Lunacy does not:
-#  - picks free loopback ports per run (the vars above are the fixed defaults);
 #  - builds event.json with pull_request base/head (Lunacy writes a push-shaped
 #    event, which works for this job);
 #  - sweeps leftover act-Rust-CI-* containers and fails on leftovers;

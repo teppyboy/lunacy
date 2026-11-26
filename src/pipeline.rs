@@ -1025,13 +1025,6 @@ fn run_act_step(
         write_kv_file(&path, &step.secrets)?;
         Some(path)
     };
-    let var_file = if step.vars.is_empty() {
-        None
-    } else {
-        let path = tmp.path().join("vars");
-        write_kv_file(&path, &step.vars)?;
-        Some(path)
-    };
     let artifact_dir = ctx
         .state_dir
         .join("artifacts")
@@ -1069,6 +1062,22 @@ fn run_act_step(
         ));
         return Ok((Outcome::Timeout, Vec::new()));
     }
+
+    // Free ports are picked while holding the act slot, right before act starts, so a
+    // service container from this run never races another run for a fixed host port.
+    let vars = resolve_auto_ports(&step.vars, act::allocate_ephemeral_port);
+    for (k, v) in &vars {
+        if step.vars.get(k).is_some_and(|raw| raw == AUTO_PORT) {
+            emit_human_line(&format!("[lunacy] {k}={v} (auto-port)"));
+        }
+    }
+    let var_file = if vars.is_empty() {
+        None
+    } else {
+        let path = tmp.path().join("vars");
+        write_kv_file(&path, &vars)?;
+        Some(path)
+    };
 
     let cache_plan = if cache_enabled(ctx, project) {
         let cache_root = act_cfg.effective_cache_dir(ctx.state_dir);
@@ -1446,6 +1455,28 @@ fn push_event(
     )
 }
 
+/// A step var with this value gets a free 127.0.0.1 port, chosen per act run.
+pub const AUTO_PORT: &str = "auto-port";
+
+/// Replace every `auto-port` var with a distinct free port from `pick`. A var the picker
+/// cannot fill keeps `auto-port`, so the workflow fails loudly instead of binding port 0.
+fn resolve_auto_ports(
+    vars: &BTreeMap<String, String>,
+    mut pick: impl FnMut() -> Option<u16>,
+) -> BTreeMap<String, String> {
+    let mut taken = std::collections::BTreeSet::new();
+    vars.iter()
+        .map(|(k, v)| {
+            if v != AUTO_PORT {
+                return (k.clone(), v.clone());
+            }
+            // The OS may hand back a port it just gave out; never use one twice in a run.
+            let port = (0..16).filter_map(|_| pick()).find(|p| taken.insert(*p));
+            (k.clone(), port.map_or_else(|| v.clone(), |p| p.to_string()))
+        })
+        .collect()
+}
+
 fn write_kv_file(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
     let mut text = String::new();
     for (k, v) in map {
@@ -1604,6 +1635,30 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_port_vars_get_distinct_free_ports() {
+        let vars: BTreeMap<String, String> =
+            [("PG", AUTO_PORT), ("REDIS", AUTO_PORT), ("FIXED", "9000")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        // The picker repeats 40001 to prove one run never reuses a port.
+        let mut ports = [40001, 40001, 40002].into_iter();
+        let out = resolve_auto_ports(&vars, || ports.next());
+        assert_eq!(out["PG"], "40001");
+        assert_eq!(out["REDIS"], "40002");
+        assert_eq!(out["FIXED"], "9000");
+
+        // No port available: the value stays visible instead of becoming port 0.
+        let none = resolve_auto_ports(&vars, || None);
+        assert_eq!(none["PG"], AUTO_PORT);
+
+        // Real picker: two real, different ports.
+        let real = resolve_auto_ports(&vars, act::allocate_ephemeral_port);
+        assert_ne!(real["PG"], real["REDIS"]);
+        assert!(real["PG"].parse::<u16>().is_ok_and(|p| p > 0));
+    }
 
     #[test]
     fn act_lock_slot_paths_and_concurrent_pool() {

@@ -55,4 +55,7 @@ workflow = ".github/workflows/local-deploy-ci.yml"
 job = "web"
 event = "push"
 timeout = 3600
+# `${{ vars.NAME }}` for the workflow. "auto-port" becomes a free 127.0.0.1 port picked
+# for this run (while it holds its act slot), so service `ports:` never collide.
+vars = { "PG_PORT" = "auto-port" }
 ```

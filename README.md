@@ -370,37 +370,38 @@ See [`apps/lunacy-ui/README.md`](apps/lunacy-ui/README.md) for full UI build, mo
 
 ## Project Layout
 
+One Cargo workspace (`Cargo.toml`, one `Cargo.lock`): shared libraries in `crates/`, binaries in `apps/`.
+
 ```text
 .
-├── src/
-│   ├── bin/lunacy.rs     CLI entrypoint (`check`, `once`, `run`)
-│   ├── api.rs            Axum HTTP API, GitHub webhooks, Discord test & static UI
-│   ├── ws.rs             Real-time WebSocket broadcaster & client session handler
-│   ├── daemon.rs         Per-project worker threads, polling, PR/tag watchers, reload
-│   ├── pipeline.rs       Checkout/worktree isolation, step execution, env & hooks
-│   ├── act.rs            act invocation, platform maps, WSL translation, caching, --json parser
-│   ├── exec.rs           Cross-platform process-tree spawning, streaming & timeouts
-│   ├── git.rs            git fetch, rev-parse, worktree & clone helpers
-│   ├── config.rs         Strict TOML schema, validation, secret masking & defaults
-│   ├── configfile.rs     Comment-preserving TOML writes (`toml_edit` + atomic rename)
-│   ├── deploy_check.rs   Offline pre-flight deploy readiness diagnostics
-│   ├── report.rs         GitHub Check Runs (with retry actions) & commit statuses
-│   ├── github_app.rs     RS256 JWT signing & installation-token cache
-│   ├── discord.rs        Discord embed formatting & webhook delivery
-│   └── model.rs          Run/Step/Substep models, state persistence & log tailing
-├── ui/                   Rune native & WebGPU WASM client (`lunacy-ui`)
-├── assets/               Brand SVGs (`logo*.svg`, `favicon.svg`) & platform icons
+├── crates/
+│   ├── lunacy-core/      The engine: config (schema, validation, masking), configfile
+│   │                     (comment-preserving writes), git, exec (process trees, timeouts),
+│   │                     act (invocation, --json parser, caching), pipeline (checkout, steps),
+│   │                     model (runs, state, logs), report (GitHub checks/statuses),
+│   │                     github_app (JWT), discord, deploy_check
+│   └── lunacy-client/    The daemon's HTTP API for clients: wire types (model), the config
+│                         document, one call per endpoint (api), transport (native ureq, wasm fetch)
+├── apps/
+│   ├── lunacy/           Daemon binary (`run`, `check`, `once`): worker loop (daemon.rs),
+│   │                     Axum HTTP API + webhooks (api.rs), WebSocket hub (ws.rs); tests/
+│   ├── lunacy-cli/       Command-line client for scripts and agents (docs/cli.md)
+│   └── lunacy-ui/        Rune desktop + WebGPU web UI; tools/ has the mock server and e2e suite
+├── assets/               Brand SVGs and platform icons (shared by daemon and UI builds)
 ├── contrib/              systemd unit, launchd plist, Linux `.desktop`, macOS `Info.plist`
-├── docs/                 API contract & `act` integration notes
-├── scripts/              Daemon/UI CI scripts, icon generator & pre-release packager
-└── tests/                Daemon pipeline, API & `act` integration tests
+├── docs/                 API contract, CLI guide, `act` notes
+└── scripts/              CI scripts, icon generator, pre-release packager
 ```
+
+The daemon and every client share `lunacy-client`'s types: `apps/lunacy/tests/api.rs` decodes each
+daemon response with them and fails on any field a client would drop.
 
 ## Documentation
 
 | Document | Description |
 | --- | --- |
 | [`docs/api.md`](docs/api.md) | Complete HTTP API v1 and WebSocket (`/api/ws`) protocol reference |
+| [`docs/cli.md`](docs/cli.md) | `lunacy-cli` for scripts and agents: commands, JSON output, exit codes, recipes |
 | [`docs/act.md`](docs/act.md) | How Lunacy drives `nektos/act`, `--json` parsing, locking, and OS notes |
 | [`config.example.toml`](config.example.toml) | Annotated configuration reference with all global and per-project options |
 | [`apps/lunacy-ui/README.md`](apps/lunacy-ui/README.md) | Building, developing, screenshotting, and testing `lunacy-ui` (desktop & web) |

@@ -2178,6 +2178,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lunacy-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "lunacy",
+ "lunacy-client",
+ "lunacy-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "lunacy-client"
 version = "0.1.0"
 dependencies = [

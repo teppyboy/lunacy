@@ -1,0 +1,22 @@
+[package]
+name = "lunacy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line client for the Lunacy daemon, built for scripts and AI agents (JSON output, stable exit codes)"
+
+[dependencies]
+lunacy-client.workspace = true
+lunacy-core.workspace = true
+clap = { workspace = true, features = ["env"] }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+lunacy.path = "../lunacy"
+tempfile.workspace = true
+
+[[bin]]
+name = "lunacy-cli"
+path = "src/main.rs"

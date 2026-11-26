@@ -2778,11 +2778,25 @@ mod tests {
             let _ = serve(state, &listen);
         });
 
+        // Wait for *our* server: the probed port can be taken by another test in between, and a
+        // bare TCP connect would then succeed against the wrong listener.
+        let ours = || -> bool {
+            let Ok(mut s) = TcpStream::connect(addr) else {
+                return false;
+            };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let req = "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+            let mut body = String::new();
+            s.write_all(req.as_bytes()).is_ok()
+                && std::io::Read::read_to_string(&mut s, &mut body).is_ok()
+                && body.contains(VERSION)
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if TcpStream::connect(addr).is_ok() {
-                break;
-            }
+        while !ours() {
+            assert!(
+                Instant::now() < deadline,
+                "API server did not start on {addr}"
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
 

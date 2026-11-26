@@ -9,24 +9,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-RUNE=${RUNE_DIR:-}
-if [ -z "$RUNE" ]; then
-  # The pinned Rune checkout: reuse a local clone at the locked rev, else fetch it.
-  rev=$(sed -n 's/.*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml | head -1)
-  # A cargo git checkout keeps the repo under <name>/<hash>/, so look for the script itself.
-  for base in "${RUNE_CACHE:-$HOME/.cargo/git/checkouts}" "${TMPDIR:-/tmp}"; do
-    [ -d "$base" ] || continue
-    RUNE=$(find "$base" -maxdepth 8 -path '*/scripts/web-build.sh' -printf '%h\n' 2>/dev/null | head -1)
-    [ -n "$RUNE" ] && break
-  done
-  RUNE=${RUNE%/scripts}
-  if [ -z "$RUNE" ] || [ ! -x "$RUNE/scripts/web-build.sh" ]; then
-    echo "No Rune checkout found. Set RUNE_DIR to a checkout of github.com/anomalyco/rune at $rev." >&2
-    exit 1
-  fi
-fi
+# The pinned Rune checkout (RUNE_DIR, else cloned once into ~/.cache/lunacy/rune).
+RUNE=$(tools/find-rune.sh)
 
-args=(lunacy-ui --out dist)
+# Absolute: Rune's script runs some steps from another directory (wasm-opt failed on "dist/.next").
+args=(lunacy-ui --out "$PWD/dist")
 [ "${1:-}" = "--dev" ] && args+=(--dev) || args+=(--opt)
 "$RUNE/scripts/web-build.sh" "${args[@]}"
 # Our own page: absolute asset paths (deep links), a /runs/{id} redirect, readable errors.

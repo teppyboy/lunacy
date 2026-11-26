@@ -19,15 +19,17 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 DAEMON_BIN = ROOT / "target" / "debug" / "lunacy"
 UI_BIN = ROOT / "ui" / "target" / "debug" / "lunacy-ui"
 WEB_CHECK = ROOT / "ui" / "tools" / "e2e" / "web_check.mjs"
 RUNE_DIR = pathlib.Path(
+    # e2e.sh exports it from tools/find-rune.sh.
     os.environ.get(
         "RUNE_DIR",
-        "/tmp/pi-github-repos/runtime-vsiOuE/c8125861ff163c50577a9cb425c53259a4411a18295dcf09b24a2d2066406eb9",
+        str(pathlib.Path.home() / ".cache" / "lunacy" / "rune"),
     )
 )
 TOKEN = "e2e-token"
@@ -76,7 +78,8 @@ def api_call(
     method: str = "GET",
     token: str | None = TOKEN,
     json_body: object | None = None,
-) -> tuple[int, object]:
+) -> tuple[int, Any]:
+    # Any: callers index the decoded JSON directly; a wrong shape fails the assert anyway.
     url = f"http://127.0.0.1:{port}{path}"
     data = None if json_body is None else json.dumps(json_body).encode()
     headers: dict[str, str] = {}
@@ -131,7 +134,7 @@ def find_els(tree: dict, key: str) -> list[dict]:
 def find_el(tree: dict, key: str) -> dict:
     matches = find_els(tree, key)
     if not matches:
-        keys = sorted({el.get("key") for el in elems(tree) if el.get("key")})
+        keys = sorted({str(el["key"]) for el in elems(tree) if el.get("key")})
         raise AssertionError(f"element key {key!r} not found in tree; known keys={keys[:60]}")
     return matches[0]
 
@@ -178,15 +181,15 @@ class Script:
         self.t = t0
         self.events: list[dict] = []
 
-    def wait(self, dt: float) -> "Script":
+    def wait(self, dt: float) -> Script:
         self.t = round(self.t + dt, 3)
         return self
 
-    def tap(self, key: str, after: float = 0.40) -> "Script":
+    def tap(self, key: str, after: float = 0.40) -> Script:
         self.events.append({"t": self.t, "type": "tap", "key": key})
         return self.wait(after)
 
-    def key(self, name: str, *, cmd: bool = False, shift: bool = False, after: float = 0.30) -> "Script":
+    def key(self, name: str, *, cmd: bool = False, shift: bool = False, after: float = 0.30) -> Script:
         ev: dict[str, object] = {"t": self.t, "type": "key", "name": name}
         if cmd:
             ev["cmd"] = True
@@ -195,19 +198,19 @@ class Script:
         self.events.append(ev)
         return self.wait(after)
 
-    def paste(self, text: str, after: float = 0.30) -> "Script":
+    def paste(self, text: str, after: float = 0.30) -> Script:
         self.events.append({"t": self.t, "paste": text})
         return self.wait(after)
 
-    def wheel(self, key: str, dy: float = 0.0, after: float = 0.35, dx: float = 0.0) -> "Script":
+    def wheel(self, key: str, dy: float = 0.0, after: float = 0.35, dx: float = 0.0) -> Script:
         self.events.append({"t": self.t, "type": "wheel", "key": key, "dx": dx, "dy": dy})
         return self.wait(after)
 
-    def mark(self, name: str, after: float = 0.10) -> "Script":
+    def mark(self, name: str, after: float = 0.10) -> Script:
         self.events.append({"t": self.t, "type": "mark", "name": name})
         return self.wait(after)
 
-    def replace(self, field_key: str, value: str, after: float = 0.30) -> "Script":
+    def replace(self, field_key: str, value: str, after: float = 0.30) -> Script:
         self.tap(f"{field_key}/control", after=0.30)
         self.key("a", cmd=True, after=0.25)
         self.key("Backspace", after=0.25)

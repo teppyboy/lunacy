@@ -4,19 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-if [ -z "${RUNE_DIR:-}" ] || [ ! -x "${RUNE_DIR}/scripts/web-build.sh" ]; then
-  found=""
-  for base in "${RUNE_CACHE:-$HOME/.cargo/git/checkouts}" "${TMPDIR:-/tmp}"; do
-    [ -d "$base" ] || continue
-    found=$(find "$base" -maxdepth 8 -path '*/scripts/web-build.sh' -printf '%h\n' 2>/dev/null | head -1)
-    [ -n "$found" ] && break
-  done
-  RUNE_DIR="${found%/scripts}"
-fi
-if [ -z "${RUNE_DIR:-}" ] || [ ! -x "${RUNE_DIR}/scripts/web-build.sh" ]; then
-  echo "[e2e] No Rune checkout found. Set RUNE_DIR to a Rune checkout." >&2
-  exit 1
-fi
+RUNE_DIR=$("$ROOT/ui/tools/find-rune.sh")
 export RUNE_DIR
 if [ -z "${VK_ICD_FILENAMES:-}" ] && [ -f "/home/tretrauit/Android/Sdk/emulator/lib64/vulkan/lvp_icd.json" ]; then
   export VK_ICD_FILENAMES="/home/tretrauit/Android/Sdk/emulator/lib64/vulkan/lvp_icd.json"

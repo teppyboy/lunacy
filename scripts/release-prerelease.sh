@@ -51,6 +51,7 @@ is_dry_run() {
 REPO="${LUNACY_GITHUB_REPO:-teppyboy/lunacy}"
 TAG="${LUNACY_RELEASE_TAG:-prerelease}"
 SHA="${LUNACY_SHA:-$(git rev-parse HEAD)}"
+export LUNACY_SHA="$SHA"
 SHORT_SHA="${SHA:0:7}"
 TARGET_ROOT="${LUNACY_CARGO_TARGET_ROOT:-$HOME/.local/share/lunacy/cargo-target}"
 DAEMON_TARGET="$TARGET_ROOT/lunacy"
@@ -70,9 +71,17 @@ fi
 COMMIT_SUBJECT="$(git log -1 --pretty=%s "$SHA")"
 TIMESTAMP_UTC="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
 
+NATIVE_RUSTFLAGS="${RUSTFLAGS:-}"
+if [ "$(uname -s)" = "Linux" ] && command -v ld.lld >/dev/null 2>&1 && command -v clang >/dev/null 2>&1; then
+  case " $NATIVE_RUSTFLAGS " in
+    *"-fuse-ld=lld"*) ;;
+    *) NATIVE_RUSTFLAGS="${NATIVE_RUSTFLAGS:+$NATIVE_RUSTFLAGS }-C linker=clang -C link-arg=-fuse-ld=lld" ;;
+  esac
+fi
+
 echo "==> [release] Building Linux x86_64 binaries"
-CARGO_TARGET_DIR="$DAEMON_TARGET" cargo build --release --locked --bin lunacy
-CARGO_TARGET_DIR="$UI_TARGET" cargo build --manifest-path ui/Cargo.toml --release --locked --bin lunacy-ui
+RUSTFLAGS="$NATIVE_RUSTFLAGS" CARGO_TARGET_DIR="$DAEMON_TARGET" cargo build --release --locked --bin lunacy
+RUSTFLAGS="$NATIVE_RUSTFLAGS" CARGO_TARGET_DIR="$UI_TARGET" cargo build --manifest-path ui/Cargo.toml --release --locked --bin lunacy-ui
 
 LINUX_DAEMON_BIN="$DAEMON_TARGET/release/lunacy"
 LINUX_UI_BIN="$UI_TARGET/release/lunacy-ui"
@@ -253,6 +262,7 @@ if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
 fi
 if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
   gh release edit "$TAG" -R "$REPO" \
+    --target "$SHA" \
     --prerelease \
     --title "Pre-release ($SHORT_SHA)" \
     --notes-file "$notes"

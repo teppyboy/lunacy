@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Lunacy
+GenericName=CI/Deploy Monitor
+Comment=Local CI and deployment daemon UI
+Exec=lunacy-ui
+Icon=lunacy
+Terminal=false
+Categories=Development;
+StartupWMClass=lunacy

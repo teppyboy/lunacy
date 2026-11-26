@@ -143,7 +143,7 @@ await waitFor(
       expression: "document.querySelector('#status')?.textContent || 'GONE'",
     });
     const txt = r.result?.value;
-    if (txt && txt.startsWith('lunacy could not start:')) {
+    if (txt && txt.startsWith('Lunacy could not start:')) {
       throw new Error(`web boot failed: ${txt}`);
     }
     const got401 = responses.some((x) => x.url.includes('/api/') && x.status === 401);

@@ -1,4 +1,4 @@
-# lunacy — local CI/deploy daemon
+# Lunacy — local CI/deploy daemon
 #
 # Copy to config.toml and fill in the secrets. `lunacy check -c config.toml`
 # validates it (unknown keys are rejected, so typos fail loudly).
@@ -66,13 +66,13 @@ notify_on_start = false
 # Global act defaults. `kind = "act"` steps use these unless they override.
 # command = ["act"]
 # On Windows, act running natively can mangle paths for some JS actions
-# (nektos/act#2645); then run it in WSL and lunacy translates the paths:
+# (nektos/act#2645); then run it in WSL and Lunacy translates the paths:
 # command = ["wsl.exe", "-e", "act"]
 # Self-hosted jobs always use this instead, because WSL is Linux:
 # native_command = ["act"]
 platforms = { "ubuntu-latest" = "catthehacker/ubuntu:act-latest" }
 # args = ["--pull=false"]
-# One act run at a time per machine: lunacy takes `flock(2)` on this file.
+# One act run at a time per machine: Lunacy takes `flock(2)` on this file.
 # Point it at the same file a manual `make ci` uses (lunarum's
 # scripts/with-act-lock.sh locks ~/.local/state/act-gate.lock with `flock`), so
 # the two never run act concurrently. Default: <state_dir>/act.lock. `~/` expands.
@@ -126,7 +126,7 @@ job = "web"
 event = "push"
 timeout = 5400
 # scripts/local-ci.sh runs `with-act-lock.sh`, which serializes act across
-# lunarum and frostedge. lunacy replaces that with its own machine-wide lock,
+# lunarum and frostedge. Lunacy replaces that with its own machine-wide lock,
 # so the lock is not taken twice.
 args = ["--pull=false"]
 
@@ -146,7 +146,7 @@ only_on = ["windows"]
 name = "Publish web"
 # CI above already ran the `web` job in act, so this step publishes what that
 # job built instead of running act a second time. The job runs with `--bind`,
-# so `build/web` is in lunacy's clone, whose path is `LUNACY_CI_DIR`:
+# so `build/web` is in Lunacy's clone, whose path is `LUNACY_CI_DIR`:
 #
 #   test -s "$LUNACY_CI_DIR/build/web/index.html"
 #   rsync -a --delete "$LUNACY_CI_DIR/build/web/" build/web/
@@ -181,19 +181,19 @@ workflow = ".github/workflows/rust.yml"
 job = "validate"
 event = "pull_request"
 timeout = 5400
-# scripts/ci-act.sh pins this image by digest for reproducibility; lunacy
+# scripts/ci-act.sh pins this image by digest for reproducibility; Lunacy
 # cannot pin per project, so update the digest here when you bump it.
 platforms = { "ubuntu-latest" = "catthehacker/ubuntu@sha256:1d8114fb9c1fa5de85c79a31dc6d24d2128753486e46e1cbad0de98d3f9ae966" }
 args = ["--pull=false"]
 vars = { "VCRAFT_CI_PG_PORT" = "5432", "VCRAFT_CI_REDIS_PORT" = "6379", "VCRAFT_CI_RUSTFS_PORT" = "9000" }
-# What scripts/ci-act.sh does that lunacy does not:
+# What scripts/ci-act.sh does that Lunacy does not:
 #  - picks free loopback ports per run (the vars above are the fixed defaults);
-#  - builds event.json with pull_request base/head (lunacy writes a push-shaped
+#  - builds event.json with pull_request base/head (Lunacy writes a push-shaped
 #    event, which works for this job);
 #  - sweeps leftover act-Rust-CI-* containers and fails on leftovers;
 #  - injects RUST_TEST_NOCAPTURE and tees the log to a kept file;
-#  - applies CI_TIMEOUT (lunacy uses `timeout` above).
-# The commit-message step needs origin/master, which lunacy fetches on each poll.
+#  - applies CI_TIMEOUT (Lunacy uses `timeout` above).
+# The commit-message step needs origin/master, which Lunacy fetches on each poll.
 
 [[project.deploy]]
 name = "Deploy stack"
@@ -204,7 +204,7 @@ run = "bash scripts/deploy-local.sh"
 timeout = 3600
 
 # ---------------------------------------------------------------------------
-# lunacy (self-CI + rolling GitHub pre-release). Uncomment to let lunacy test
+# Lunacy (self-CI + rolling GitHub pre-release). Uncomment to let Lunacy test
 # itself in an isolated git worktree and publish Linux, Windows (via
 # cargo-xwin), and Web WASM artifacts to the `prerelease` GitHub release.
 # ---------------------------------------------------------------------------

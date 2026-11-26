@@ -1,4 +1,4 @@
-//! `lunacy-ui`: a Rune client for the lunacy local CI daemon.
+//! `lunacy-ui`: a Rune client for the Lunacy local CI daemon.
 //!
 //! The UI only ever talks HTTP (`docs/api.md`), so it runs against a daemon on this machine, a
 //! daemon on another one, or a mock. It builds natively (`cargo run`) and for the web

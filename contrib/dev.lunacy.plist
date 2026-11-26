@@ -50,7 +50,7 @@
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
-    <!-- launchd starts agents before the network; lunacy retries polls anyway. -->
+    <!-- launchd starts agents before the network; Lunacy retries polls anyway. -->
     <key>ProcessType</key>
     <string>Background</string>
 </dict>

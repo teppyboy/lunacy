@@ -24,7 +24,7 @@ pub fn build() -> rune::App<State> {
         on_key: Some(on_key),
         scenes: SCENES,
         min_size: Some((320.0, 480.0)),
-        ..AppSpec::new("lunacy", (1180.0, 760.0), init, view)
+        ..AppSpec::new("Lunacy", (1180.0, 760.0), init, view)
     })
     .titlebar(rune::Titlebar::new(38.0).controls(true))
     .chrome(rune::Chrome::DEFAULT)
@@ -396,7 +396,7 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
                         s.drawer_open = !s.drawer_open;
                     }),
             )
-            .child(widgets::brand_logo(k, 16.0))
+            .child(widgets::brand_logo(k, 18.0))
             .child(
                 text(title)
                     .key("titlebar-title")
@@ -411,10 +411,10 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
             .child(
                 row()
                     .key("brand")
-                    .gap(7.0)
+                    .gap(8.0)
                     .center_y()
-                    .child(widgets::brand_logo(k, 16.0))
-                    .child(text("lunacy").font(k.ty.ui_medium).color(k.c.text_base)),
+                    .child(widgets::brand_logo(k, 18.0))
+                    .child(text("Lunacy").font(k.ty.ui_medium).color(k.c.text_base)),
             )
             .child(text("/").font(k.ty.ui).color(k.c.text_faint).a11y_hidden())
             .child(
@@ -900,9 +900,9 @@ fn drawer_overlays(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4])
         .gap(8.0)
         .center_y()
         .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
-        .child(widgets::brand_logo(k, 16.0))
+        .child(widgets::brand_logo(k, 18.0))
         .child(
-            text("lunacy")
+            text("Lunacy")
                 .font(k.ty.ui_medium)
                 .color(k.c.text_base)
                 .grow(1.0),
@@ -3588,17 +3588,34 @@ mod tests {
             "expected lunacy-logo in compact drawer header"
         );
 
-        // Embedded desktop app icon is a valid 256x256 RGBA PNG accepted by rune::set_app_icon.
-        let png = include_bytes!("../assets/lunacy-icon.png");
-        assert!(png.len() > 32 && &png[..8] == b"\x89PNG\r\n\x1a\n");
-        let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
-        let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
-        assert_eq!((w, h), (256, 256), "app icon must be 256x256");
-        assert_eq!(png[25], 6, "app icon color type must be RGBA (6)");
-        #[cfg(not(target_arch = "wasm32"))]
-        assert!(
-            rune::set_app_icon(png.to_vec()).is_ok(),
-            "rune::set_app_icon should accept ui/assets/lunacy-icon.png"
-        );
+        // Embedded desktop app icons are valid 256x256 RGBA PNGs accepted by rune::set_app_icon.
+        for (label, png) in [
+            (
+                "assets/icons/lunacy-256.png",
+                include_bytes!("../../assets/icons/lunacy-256.png").as_slice(),
+            ),
+            (
+                "assets/icons/lunacy-macos-light-256.png",
+                include_bytes!("../../assets/icons/lunacy-macos-light-256.png").as_slice(),
+            ),
+            (
+                "assets/icons/lunacy-macos-dark-256.png",
+                include_bytes!("../../assets/icons/lunacy-macos-dark-256.png").as_slice(),
+            ),
+        ] {
+            assert!(
+                png.len() > 32 && &png[..8] == b"\x89PNG\r\n\x1a\n",
+                "{label}"
+            );
+            let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+            let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+            assert_eq!((w, h), (256, 256), "{label} must be 256x256");
+            assert_eq!(png[25], 6, "{label} color type must be RGBA (6)");
+            #[cfg(not(target_arch = "wasm32"))]
+            assert!(
+                rune::set_app_icon(png.to_vec()).is_ok(),
+                "rune::set_app_icon should accept {label}"
+            );
+        }
     }
 }

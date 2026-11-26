@@ -1,6 +1,6 @@
-# lunacy-ui
+# Lunacy UI
 
-A Rune client for the [lunacy](../) local CI/deploy daemon: the project list, run history, run
+A Rune client (`lunacy-ui`) for the [Lunacy](../) local CI/deploy daemon: the project list, run history, run
 detail with act job trees and live logs, and the full config editor.
 
 It talks to the daemon over HTTP only (`docs/api.md`), so it runs against a daemon on this

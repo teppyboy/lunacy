@@ -1,4 +1,4 @@
-# lunacy HTTP API (v1)
+# Lunacy HTTP API (v1)
 
 Contract between the daemon (`lunacy run`) and the Rune UI (`ui/`, native + web).
 JSON everywhere except logs. Times are unix seconds (u64). Unknown fields must be ignored by clients.

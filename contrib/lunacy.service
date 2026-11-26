@@ -6,7 +6,7 @@
 # For a system-wide unit, put it in /etc/systemd/system/, set User=, and drop
 # the `%h` paths.
 [Unit]
-Description=lunacy local CI/deploy daemon
+Description=Lunacy local CI/deploy daemon
 Documentation=https://github.com/teppyboy/lunacy
 After=network-online.target docker.service
 Wants=network-online.target

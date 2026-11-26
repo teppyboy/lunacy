@@ -95,7 +95,16 @@ done
 echo "==> [release] Building Web WASM bundle"
 CARGO_TARGET_DIR="$UI_TARGET" ./ui/build-web.sh
 
-for web_file in ui/dist/index.html ui/dist/app.js ui/dist/app_bg.wasm; do
+for web_file in \
+  ui/dist/index.html \
+  ui/dist/app.js \
+  ui/dist/app_bg.wasm \
+  ui/dist/favicon.svg \
+  ui/dist/favicon.ico \
+  ui/dist/apple-touch-icon.png \
+  ui/dist/icon-192.png \
+  ui/dist/icon-512.png \
+  ui/dist/site.webmanifest; do
   if [ ! -s "$web_file" ]; then
     echo "error: expected Web bundle file missing or empty: $web_file" >&2
     exit 1
@@ -125,13 +134,19 @@ mkdir -p "$pkg_root" "$out"
 
 # 1. Linux x86_64 tarball
 linux_dir="$pkg_root/lunacy-linux-x86_64"
-mkdir -p "$linux_dir/web" "$linux_dir/contrib"
+mkdir -p "$linux_dir/web" "$linux_dir/contrib" "$linux_dir/icons/hicolor/scalable/apps"
 install -m 0755 "$LINUX_DAEMON_BIN" "$linux_dir/lunacy"
 install -m 0755 "$LINUX_UI_BIN" "$linux_dir/lunacy-ui"
 cp -a ui/dist/. "$linux_dir/web/"
 install -m 0644 config.example.toml "$linux_dir/config.example.toml"
 install -m 0644 README.md "$linux_dir/README.md"
 install -m 0644 contrib/lunacy.service "$linux_dir/contrib/lunacy.service"
+install -m 0644 contrib/lunacy.desktop "$linux_dir/contrib/lunacy.desktop"
+install -m 0644 assets/icons/lunacy.svg "$linux_dir/icons/hicolor/scalable/apps/lunacy.svg"
+for sz in 16 32 48 64 128 256 512; do
+  mkdir -p "$linux_dir/icons/hicolor/${sz}x${sz}/apps"
+  install -m 0644 "assets/icons/lunacy-${sz}.png" "$linux_dir/icons/hicolor/${sz}x${sz}/apps/lunacy.png"
+done
 tar -czf "$out/lunacy-linux-x86_64.tar.gz" -C "$pkg_root" lunacy-linux-x86_64
 
 # 2. Windows x86_64 zip (via Python stdlib zipfile — no `zip` CLI needed)
@@ -171,6 +186,12 @@ with zipfile.ZipFile(zip_path, "r") as zf:
         f"{top_dir}/web/index.html",
         f"{top_dir}/web/app.js",
         f"{top_dir}/web/app_bg.wasm",
+        f"{top_dir}/web/favicon.svg",
+        f"{top_dir}/web/favicon.ico",
+        f"{top_dir}/web/apple-touch-icon.png",
+        f"{top_dir}/web/icon-192.png",
+        f"{top_dir}/web/icon-512.png",
+        f"{top_dir}/web/site.webmanifest",
         f"{top_dir}/config.example.toml",
         f"{top_dir}/README.md",
     }
@@ -212,7 +233,7 @@ Rolling pre-release build from \`${SHORT_SHA}\`.
 
 | Platform | Target | Archive | Contents |
 | --- | --- | --- | --- |
-| Linux | \`x86_64-unknown-linux-gnu\` | \`lunacy-linux-x86_64.tar.gz\` | \`lunacy\`, \`lunacy-ui\`, \`web/\`, \`config.example.toml\`, \`README.md\`, \`contrib/lunacy.service\` |
+| Linux | \`x86_64-unknown-linux-gnu\` | \`lunacy-linux-x86_64.tar.gz\` | \`lunacy\`, \`lunacy-ui\`, \`web/\`, \`config.example.toml\`, \`README.md\`, \`contrib/lunacy.service\`, \`contrib/lunacy.desktop\`, \`icons/\` |
 | Windows | \`x86_64-pc-windows-msvc\` | \`lunacy-windows-x86_64.zip\` | \`lunacy.exe\`, \`lunacy-ui.exe\`, \`web/\`, \`config.example.toml\`, \`README.md\` |
 | Web | \`wasm32\` static bundle | \`lunacy-web.tar.gz\` | \`ui/dist/\` static web UI |
 

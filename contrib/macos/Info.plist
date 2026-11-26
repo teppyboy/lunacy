@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS .app bundle Info.plist template for Lunacy UI.
+
+  Assemble Lunacy.app:
+    mkdir -p Lunacy.app/Contents/MacOS Lunacy.app/Contents/Resources
+    cp target/release/lunacy-ui Lunacy.app/Contents/MacOS/lunacy-ui
+    cp assets/icons/lunacy.icns Lunacy.app/Contents/Resources/lunacy.icns
+    cp contrib/macos/Info.plist Lunacy.app/Contents/Info.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Lunacy</string>
+    <key>CFBundleDisplayName</key>
+    <string>Lunacy</string>
+    <key>CFBundleExecutable</key>
+    <string>lunacy-ui</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.lunacy.ui</string>
+    <key>CFBundleIconFile</key>
+    <string>lunacy</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>

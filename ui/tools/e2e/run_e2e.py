@@ -322,6 +322,11 @@ class Sandbox:
             env=self.env(),
         )
         shutil.copyfile(ROOT / "ui" / "web" / "index.html", self.web_dist / "index.html")
+        shutil.copyfile(ROOT / "ui" / "web" / "site.webmanifest", self.web_dist / "site.webmanifest")
+        shutil.copyfile(ROOT / "assets" / "favicon.svg", self.web_dist / "favicon.svg")
+        shutil.copyfile(ROOT / "assets" / "logo.svg", self.web_dist / "logo.svg")
+        for icon_name in ("favicon.ico", "apple-touch-icon.png", "icon-192.png", "icon-512.png"):
+            shutil.copyfile(ROOT / "assets" / "icons" / icon_name, self.web_dist / icon_name)
 
         self.config_path = self.dir / "config.toml"
         self.write_initial_config()

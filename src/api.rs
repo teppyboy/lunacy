@@ -2332,6 +2332,7 @@ fn serve_static(state: &Arc<ApiState>, path: &str) -> Response {
         Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("json") => "application/json",
+        Some("webmanifest") => "application/manifest+json",
         Some("wasm") => "application/wasm",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
@@ -2407,6 +2408,10 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), b"<html>root</html>").unwrap();
         std::fs::write(dir.path().join("Inter-Regular.ttf"), b"font-bytes").unwrap();
         std::fs::write(dir.path().join("app.js"), b"console.log(1);").unwrap();
+        std::fs::write(dir.path().join("site.webmanifest"), br#"{"name":"Lunacy"}"#).unwrap();
+        std::fs::write(dir.path().join("favicon.ico"), b"ico-bytes").unwrap();
+        std::fs::write(dir.path().join("favicon.svg"), b"<svg/>").unwrap();
+        std::fs::write(dir.path().join("icon-192.png"), b"png-bytes").unwrap();
 
         let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
         let addr = probe.local_addr().expect("addr");
@@ -2508,6 +2513,31 @@ mod tests {
             Some("text/javascript; charset=utf-8")
         );
         assert!(!js_hdrs.contains_key("cache-control"));
+
+        let manifest_hdrs = fetch_headers("/site.webmanifest");
+        assert_eq!(
+            manifest_hdrs.get("content-type").map(String::as_str),
+            Some("application/manifest+json")
+        );
+        assert!(!manifest_hdrs.contains_key("cache-control"));
+
+        let ico_hdrs = fetch_headers("/favicon.ico");
+        assert_eq!(
+            ico_hdrs.get("content-type").map(String::as_str),
+            Some("image/x-icon")
+        );
+
+        let svg_hdrs = fetch_headers("/favicon.svg");
+        assert_eq!(
+            svg_hdrs.get("content-type").map(String::as_str),
+            Some("image/svg+xml")
+        );
+
+        let png_hdrs = fetch_headers("/icon-192.png");
+        assert_eq!(
+            png_hdrs.get("content-type").map(String::as_str),
+            Some("image/png")
+        );
 
         shared.lock().unwrap().shutdown = true;
         thread.join().expect("server thread");

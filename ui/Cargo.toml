@@ -3,7 +3,7 @@ name = "lunacy-ui"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Rune UI for the lunacy local CI/deploy daemon"
+description = "Rune UI for the Lunacy local CI/deploy daemon"
 
 # Own workspace root: the daemon's package is separate, and the patch block below must apply here.
 [workspace]

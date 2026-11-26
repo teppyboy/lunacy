@@ -1,4 +1,10 @@
-# lunacy
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+  <img alt="Lunacy" src="assets/logo-light.svg" width="64">
+</picture>
+
+# Lunacy
 
 A small local CI/deploy daemon. It polls a git remote, runs a pipeline for each
 new commit, and reports the result to GitHub and Discord. It replaces per-repo
@@ -27,7 +33,7 @@ Two kinds of step:
 
 - `kind = "shell"` (default) — your own command, e.g. the repo's deploy script.
 - `kind = "act"` — a job from a GitHub Actions workflow, run by
-  [nektos/act](https://github.com/nektos/act). lunacy clones the commit into
+  [nektos/act](https://github.com/nektos/act). Lunacy clones the commit into
   `state_dir/checkouts/<run id>/repo`, writes `event.json`, streams act's
   `--json` output into per-step substeps (visible in the API, the GitHub summary
   and Discord), and serialises act across projects with a machine-wide lock.
@@ -41,7 +47,7 @@ cleanup then only logs a warning, and you remove the directory with `sudo rm -rf
 
 `[act] lock_file` points the act lock at the file a manual `make ci` also uses.
 `fs2`'s `lock_exclusive` is `flock(2)`, the same lock the `flock` CLI takes, so
-lunacy and lunarum's `scripts/with-act-lock.sh` never run act at the same time.
+Lunacy and lunarum's `scripts/with-act-lock.sh` never run act at the same time.
 
 ## Install
 
@@ -61,7 +67,18 @@ lunacy run    -c config.toml                # the daemon
 
 `lunacy run` serves the HTTP API when `[server]` is present (see
 [`docs/api.md`](docs/api.md)); the optional Rune UI in `ui/` is served from
-`web_root`.
+`web_root` or built natively as `lunacy-ui`.
+
+For desktop app launchers and bundles:
+
+- Linux: install [`contrib/lunacy.desktop`](contrib/lunacy.desktop) into
+  `~/.local/share/applications/` and copy `icons/hicolor/` from a release archive
+  into `~/.local/share/icons/hicolor/` (or from source, install
+  `assets/icons/lunacy.svg` to `~/.local/share/icons/hicolor/scalable/apps/lunacy.svg`
+  and `assets/icons/lunacy-<size>.png` to
+  `~/.local/share/icons/hicolor/<size>x<size>/apps/lunacy.png`).
+- macOS: assemble `Lunacy.app` with [`contrib/macos/Info.plist`](contrib/macos/Info.plist),
+  `lunacy-ui`, and [`assets/icons/lunacy.icns`](assets/icons/lunacy.icns).
 
 Config is strict: unknown keys are a hard error, so a typo fails `lunacy check`
 instead of being silently ignored. Secrets may live in the file; the API masks
@@ -75,7 +92,7 @@ the API's Config JSON — the values never do.
 
 ## Windows host
 
-act is a Linux-first tool, so a Windows host needs a little care. lunacy handles
+act is a Linux-first tool, so a Windows host needs a little care. Lunacy handles
 the common cases:
 
 - **Self-hosted jobs run natively.** On Windows, `windows-latest`,
@@ -88,9 +105,9 @@ the common cases:
 - **`[act] native_command` for self-hosted jobs.** If `[act] command` is the WSL
   form (`["wsl.exe", "-e", "act"]`), self-hosted jobs still use
   `native_command` (default `["act"]`), because WSL is Linux and cannot be
-  self-hosted. lunacy decides per step by reading the workflow YAML and the
+  self-hosted. Lunacy decides per step by reading the workflow YAML and the
   job's `runs-on`.
-- **WSL path translation.** In WSL mode, lunacy rewrites `C:\...` to
+- **WSL path translation.** In WSL mode, Lunacy rewrites `C:\...` to
   `/mnt/c/...` for `-W`, `-e`, `--secret-file`, `--var-file`,
   `--artifact-server-path`, `-C` and `--flag=<path>` forms.
 - **`only_on`** marks a step as host-specific:
@@ -146,7 +163,7 @@ Setting up the App once:
 5. Install the App on the repositories, then put `app_id` in the config.
    `installation_id` is looked up automatically when omitted.
 
-The webhook is what makes GitHub's **Re-run** button work: lunacy verifies
+The webhook is what makes GitHub's **Re-run** button work: Lunacy verifies
 `X-Hub-Signature-256`, then queues the run for every project whose
 `github_repo` matches. `public_url` is used for the check run's `details_url`,
 which can link back into the UI (`#/runs/{id}`).
@@ -170,7 +187,7 @@ failures are logged and never fail the pipeline.
   instead of running act again. Deploy runs `scripts/local-web-deploy.sh`,
   which still keeps its own fetch/act/health-check logic and health endpoint
   `127.0.0.1:47831`. Set `[act] lock_file = "~/.local/state/act-gate.lock"` so
-  lunacy and the script's `with-act-lock.sh` share one lock.
+  Lunacy and the script's `with-act-lock.sh` share one lock.
 - **frostedge** — CI is the `validate` job of `.github/workflows/rust.yml`
   under act, with the runner image pinned by digest exactly like
   `scripts/ci-act.sh`. Its commit-message check walks `before..after`, so
@@ -182,16 +199,16 @@ failures are logged and never fail the pipeline.
 
 Both use `checkout = "none"`: the deploy scripts operate on the live checkout
 themselves, and act steps clone the commit into a temporary directory, so
-lunacy must not move `HEAD` under them. Use `checkout = "worktree"` for a
+Lunacy must not move `HEAD` under them. Use `checkout = "worktree"` for a
 throwaway checkout at the commit, or `"in-place"` to check the commit out in
 `repo_path` (it refuses to touch a dirty worktree).
 
-Notes on what lunacy does *not* take over from the old scripts:
+Notes on what Lunacy does *not* take over from the old scripts:
 `scripts/ci-act.sh` additionally picks free loopback ports per run, sweeps
 leftover `act-Rust-CI-*` containers, injects `RUST_TEST_NOCAPTURE`, and tees a
-kept log; lunacy uses the fixed `vars` in the example plus its own `timeout`.
+kept log; Lunacy uses the fixed `vars` in the example plus its own `timeout`.
 Both repos' deploy scripts send their own Discord notification, so set
-`discord_webhook_url = ""` if you want only lunacy's message.
+`discord_webhook_url = ""` if you want only Lunacy's message.
 
 ## Layout
 
@@ -209,5 +226,5 @@ src/daemon.rs      per-project workers, polling, config reload
 src/api.rs         tiny_http JSON API + static UI
 src/model.rs       Run/Step model, state files, log tailing
 docs/api.md        HTTP API contract
-docs/act.md        the act --json lines lunacy parses
+docs/act.md        the act --json lines Lunacy parses
 ```

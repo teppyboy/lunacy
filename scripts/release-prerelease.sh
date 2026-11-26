@@ -29,7 +29,7 @@ Environment:
   LUNACY_SHA                    Commit SHA to tag/describe (default: git HEAD)
   LUNACY_CARGO_TARGET_ROOT      Persistent Cargo target root
                                 (default: ~/.local/share/lunacy/cargo-target)
-  LUNACY_SYNC_LOCAL_WEB_DIR     Optional local dir to sync ui/dist/ into
+  LUNACY_SYNC_LOCAL_WEB_DIR     Optional local dir to sync apps/lunacy-ui/dist/ into
 EOF
       exit 0
       ;;
@@ -80,8 +80,8 @@ if [ "$(uname -s)" = "Linux" ] && command -v ld.lld >/dev/null 2>&1 && command -
 fi
 
 echo "==> [release] Building Linux x86_64 binaries"
-RUSTFLAGS="$NATIVE_RUSTFLAGS" CARGO_TARGET_DIR="$DAEMON_TARGET" cargo build --release --locked --bin lunacy
-RUSTFLAGS="$NATIVE_RUSTFLAGS" CARGO_TARGET_DIR="$UI_TARGET" cargo build --manifest-path ui/Cargo.toml --release --locked --bin lunacy-ui
+RUSTFLAGS="$NATIVE_RUSTFLAGS" CARGO_TARGET_DIR="$DAEMON_TARGET" cargo build -p lunacy --release --locked --bin lunacy
+RUSTFLAGS="$NATIVE_RUSTFLAGS" CARGO_TARGET_DIR="$UI_TARGET" cargo build -p lunacy-ui --release --locked --bin lunacy-ui
 
 LINUX_DAEMON_BIN="$DAEMON_TARGET/release/lunacy"
 LINUX_UI_BIN="$UI_TARGET/release/lunacy-ui"
@@ -93,18 +93,18 @@ for bin in "$LINUX_DAEMON_BIN" "$LINUX_UI_BIN"; do
 done
 
 echo "==> [release] Building Web WASM bundle"
-CARGO_TARGET_DIR="$UI_TARGET" ./ui/build-web.sh
+CARGO_TARGET_DIR="$UI_TARGET" ./apps/lunacy-ui/build-web.sh
 
 for web_file in \
-  ui/dist/index.html \
-  ui/dist/app.js \
-  ui/dist/app_bg.wasm \
-  ui/dist/favicon.svg \
-  ui/dist/favicon.ico \
-  ui/dist/apple-touch-icon.png \
-  ui/dist/icon-192.png \
-  ui/dist/icon-512.png \
-  ui/dist/site.webmanifest; do
+  apps/lunacy-ui/dist/index.html \
+  apps/lunacy-ui/dist/app.js \
+  apps/lunacy-ui/dist/app_bg.wasm \
+  apps/lunacy-ui/dist/favicon.svg \
+  apps/lunacy-ui/dist/favicon.ico \
+  apps/lunacy-ui/dist/apple-touch-icon.png \
+  apps/lunacy-ui/dist/icon-192.png \
+  apps/lunacy-ui/dist/icon-512.png \
+  apps/lunacy-ui/dist/site.webmanifest; do
   if [ ! -s "$web_file" ]; then
     echo "error: expected Web bundle file missing or empty: $web_file" >&2
     exit 1
@@ -112,8 +112,8 @@ for web_file in \
 done
 
 echo "==> [release] Building Windows x86_64 binaries via cargo-xwin"
-CARGO_TARGET_DIR="$DAEMON_TARGET" cargo xwin build --release --locked --target x86_64-pc-windows-msvc --bin lunacy
-CARGO_TARGET_DIR="$UI_TARGET" cargo xwin build --manifest-path ui/Cargo.toml --release --locked --target x86_64-pc-windows-msvc --bin lunacy-ui
+CARGO_TARGET_DIR="$DAEMON_TARGET" cargo xwin build -p lunacy --release --locked --target x86_64-pc-windows-msvc --bin lunacy
+CARGO_TARGET_DIR="$UI_TARGET" cargo xwin build -p lunacy-ui --release --locked --target x86_64-pc-windows-msvc --bin lunacy-ui
 
 WIN_DAEMON_BIN="$DAEMON_TARGET/x86_64-pc-windows-msvc/release/lunacy.exe"
 WIN_UI_BIN="$UI_TARGET/x86_64-pc-windows-msvc/release/lunacy-ui.exe"
@@ -137,7 +137,7 @@ linux_dir="$pkg_root/lunacy-linux-x86_64"
 mkdir -p "$linux_dir/web" "$linux_dir/contrib" "$linux_dir/icons/hicolor/scalable/apps"
 install -m 0755 "$LINUX_DAEMON_BIN" "$linux_dir/lunacy"
 install -m 0755 "$LINUX_UI_BIN" "$linux_dir/lunacy-ui"
-cp -a ui/dist/. "$linux_dir/web/"
+cp -a apps/lunacy-ui/dist/. "$linux_dir/web/"
 install -m 0644 config.example.toml "$linux_dir/config.example.toml"
 install -m 0644 README.md "$linux_dir/README.md"
 install -m 0644 contrib/lunacy.service "$linux_dir/contrib/lunacy.service"
@@ -154,7 +154,7 @@ win_dir="$pkg_root/lunacy-windows-x86_64"
 mkdir -p "$win_dir/web"
 install -m 0755 "$WIN_DAEMON_BIN" "$win_dir/lunacy.exe"
 install -m 0755 "$WIN_UI_BIN" "$win_dir/lunacy-ui.exe"
-cp -a ui/dist/. "$win_dir/web/"
+cp -a apps/lunacy-ui/dist/. "$win_dir/web/"
 install -m 0644 config.example.toml "$win_dir/config.example.toml"
 install -m 0644 README.md "$win_dir/README.md"
 
@@ -203,7 +203,7 @@ PY
 # 3. Web WASM bundle tarball
 web_dir="$pkg_root/lunacy-web"
 mkdir -p "$web_dir"
-cp -a ui/dist/. "$web_dir/"
+cp -a apps/lunacy-ui/dist/. "$web_dir/"
 tar -czf "$out/lunacy-web.tar.gz" -C "$pkg_root" lunacy-web
 
 # Validate tarballs
@@ -235,7 +235,7 @@ Rolling pre-release build from \`${SHORT_SHA}\`.
 | --- | --- | --- | --- |
 | Linux | \`x86_64-unknown-linux-gnu\` | \`lunacy-linux-x86_64.tar.gz\` | \`lunacy\`, \`lunacy-ui\`, \`web/\`, \`config.example.toml\`, \`README.md\`, \`contrib/lunacy.service\`, \`contrib/lunacy.desktop\`, \`icons/\` |
 | Windows | \`x86_64-pc-windows-msvc\` | \`lunacy-windows-x86_64.zip\` | \`lunacy.exe\`, \`lunacy-ui.exe\`, \`web/\`, \`config.example.toml\`, \`README.md\` |
-| Web | \`wasm32\` static bundle | \`lunacy-web.tar.gz\` | \`ui/dist/\` static web UI |
+| Web | \`wasm32\` static bundle | \`lunacy-web.tar.gz\` | \`apps/lunacy-ui/dist/\` static web UI |
 
 > Note: macOS builds are not included yet.
 
@@ -311,16 +311,16 @@ if [ -n "${LUNACY_SYNC_LOCAL_WEB_DIR:-}" ]; then
   if [ -n "$sync_dir" ]; then
     sync_parent="$(dirname "$sync_dir")"
     if [ -d "$sync_parent" ]; then
-      src_real="$(realpath ./ui/dist)"
+      src_real="$(realpath ./apps/lunacy-apps/lunacy-ui/dist)"
       dst_real="$(realpath -m "$sync_dir")"
       if [ "$src_real" != "$dst_real" ]; then
         echo "==> [release] Syncing web UI bundle to $sync_dir"
         if command -v rsync >/dev/null 2>&1; then
           mkdir -p "$sync_dir"
-          rsync -a --delete --delay-updates ./ui/dist/ "$sync_dir/"
+          rsync -a --delete --delay-updates ./apps/lunacy-apps/lunacy-ui/dist/ "$sync_dir/"
         else
           tmp_sync="$(mktemp -d "$sync_parent/.lunacy-web-sync.XXXXXX")"
-          cp -a ./ui/dist/. "$tmp_sync/"
+          cp -a ./apps/lunacy-apps/lunacy-ui/dist/. "$tmp_sync/"
           if [ -e "$sync_dir" ]; then
             old_sync="$sync_parent/.lunacy-web-old.$$"
             rm -rf "$old_sync"

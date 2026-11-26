@@ -21,10 +21,13 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-ROOT = pathlib.Path(__file__).resolve().parents[3]
-DAEMON_BIN = ROOT / "target" / "debug" / "lunacy"
-UI_BIN = ROOT / "ui" / "target" / "debug" / "lunacy-ui"
-WEB_CHECK = ROOT / "ui" / "tools" / "e2e" / "web_check.mjs"
+ROOT = pathlib.Path(__file__).resolve().parents[4]
+UI = ROOT / "apps" / "lunacy-ui"
+# One workspace target dir for every binary; e2e.sh exports CARGO_TARGET_DIR when it sets one.
+TARGET = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")))
+DAEMON_BIN = TARGET / "debug" / "lunacy"
+UI_BIN = TARGET / "debug" / "lunacy-ui"
+WEB_CHECK = UI / "tools" / "e2e" / "web_check.mjs"
 RUNE_DIR = pathlib.Path(
     # e2e.sh exports it from tools/find-rune.sh.
     os.environ.get(
@@ -355,11 +358,11 @@ class Sandbox:
         web_build = RUNE_DIR / "scripts" / "web-build.sh"
         run_cmd(
             [str(web_build), "lunacy-ui", "--out", str(self.web_dist), "--dev"],
-            cwd=ROOT / "ui",
+            cwd=UI,
             env=self.env(),
         )
-        shutil.copyfile(ROOT / "ui" / "web" / "index.html", self.web_dist / "index.html")
-        shutil.copyfile(ROOT / "ui" / "web" / "site.webmanifest", self.web_dist / "site.webmanifest")
+        shutil.copyfile(UI / "web" / "index.html", self.web_dist / "index.html")
+        shutil.copyfile(UI / "web" / "site.webmanifest", self.web_dist / "site.webmanifest")
         shutil.copyfile(ROOT / "assets" / "favicon.svg", self.web_dist / "favicon.svg")
         shutil.copyfile(ROOT / "assets" / "logo.svg", self.web_dist / "logo.svg")
         for icon_name in ("favicon.ico", "apple-touch-icon.png", "icon-192.png", "icon-512.png"):

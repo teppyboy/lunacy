@@ -24,7 +24,7 @@ log_level = "info"       # trace | debug | info | warn | error
 listen = "127.0.0.1:7878"
 # token = ""             # optional bearer token for every /api request
 # token_file = "~/.config/lunacy/api-token"   # or read it from a file
-# web_root = "ui/dist"   # serve the Rune web build at `/`
+# web_root = "apps/lunacy-ui/dist"   # serve the Rune web build at `/`
 # public_url = "http://127.0.0.1:7878"  # makes GitHub check runs link back here
 
 [github]
@@ -226,7 +226,7 @@ timeout = 3600
 # poll_interval = 300
 # # Optional: override persistent target dir or sync the built web bundle into
 # # the live checkout served by [server].web_root.
-# # env = { "LUNACY_SYNC_LOCAL_WEB_DIR" = "/home/tretrauit/workspace/lunacy/ui/dist" }
+# # env = { "LUNACY_SYNC_LOCAL_WEB_DIR" = "/home/tretrauit/workspace/lunacy/apps/lunacy-ui/dist" }
 #
 # [[project.ci]]
 # name = "Daemon CI"

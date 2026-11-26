@@ -103,25 +103,25 @@ Rolling builds for **Linux (`x86_64`)**, **Windows (`x86_64`)**, and the **Web W
 | --- | --- | --- |
 | Linux `x86_64` | `lunacy-linux-x86_64.tar.gz` | `lunacy`, `lunacy-ui`, `web/`, `config.example.toml`, `README.md`, `contrib/lunacy.service`, `contrib/lunacy.desktop`, `icons/` |
 | Windows `x86_64` | `lunacy-windows-x86_64.zip` | `lunacy.exe`, `lunacy-ui.exe`, `web/`, `config.example.toml`, `README.md` |
-| Web (`wasm32`) | `lunacy-web.tar.gz` | Static WebGPU UI files (`ui/dist/`) for `[server] web_root` |
+| Web (`wasm32`) | `lunacy-web.tar.gz` | Static WebGPU UI files (`apps/lunacy-ui/dist/`) for `[server] web_root` |
 
 > macOS pre-built archives are not published yet; build from source below.
 
 ### Option 2: Build from Source
 
 ```bash
-# 1. Build the daemon binary -> target/release/lunacy
-cargo build --release --locked
-cargo test --locked
+# 1. Build the daemon binary -> target/release/lunacy (or install it: cargo install --path apps/lunacy --locked)
+cargo build -p lunacy --release --locked
+cargo test --workspace --locked
 
-# 2. (Optional) Build the native desktop UI -> ui/target/release/lunacy-ui
-cargo build --manifest-path ui/Cargo.toml --release --locked --bin lunacy-ui
+# 2. (Optional) Build the native desktop UI -> target/release/lunacy-ui
+cargo build -p lunacy-ui --release --locked --bin lunacy-ui
 
-# 3. (Optional) Build the static WebGPU WASM UI -> ui/dist/
-./ui/build-web.sh
+# 3. (Optional) Build the static WebGPU WASM UI -> apps/lunacy-ui/dist/
+./apps/lunacy-ui/build-web.sh
 ```
 
-See [`ui/README.md`](ui/README.md) for Rune and `wasm-bindgen-cli` prerequisites.
+See [`apps/lunacy-ui/README.md`](apps/lunacy-ui/README.md) for Rune and `wasm-bindgen-cli` prerequisites.
 
 ### Configure & Run
 
@@ -171,7 +171,7 @@ log_level = "info"
 [server]
 listen = "127.0.0.1:7878"
 token_file = "~/.config/lunacy/api-token"
-web_root = "ui/dist"
+web_root = "apps/lunacy-ui/dist"
 public_url = "https://ci.example.com"
 
 [github]
@@ -299,7 +299,7 @@ On macOS, `macos-latest`, `macos-14`, and `macos-15` default to `act`'s `-self-h
 
 ```bash
 mkdir -p Lunacy.app/Contents/MacOS Lunacy.app/Contents/Resources
-cp ui/target/release/lunacy-ui Lunacy.app/Contents/MacOS/lunacy-ui
+cp target/release/lunacy-ui Lunacy.app/Contents/MacOS/lunacy-ui
 cp assets/icons/lunacy.icns Lunacy.app/Contents/Resources/lunacy.icns
 cp contrib/macos/Info.plist Lunacy.app/Contents/Info.plist
 ```
@@ -351,7 +351,7 @@ When a CI or deploy phase fails, times out, or is cancelled, Lunacy attaches nat
 
 ## Desktop & Web UI
 
-`lunacy-ui` is a Rune client that compiles from a single view tree to native desktop binaries (Linux, macOS, Windows) and a static WebGPU WASM web app (`ui/dist/`).
+`lunacy-ui` is a Rune client that compiles from a single view tree to native desktop binaries (Linux, macOS, Windows) and a static WebGPU WASM web app (`apps/lunacy-ui/dist/`).
 
 - **Screens:** **Projects** overview (live status, PR indicators, paused badges, Run now / Cancel), **Project** detail (current run steps, trigger source & reason badges, Force deploy, open PRs, run history with Retry), **Run** detail (trigger source & reason header, expandable `Steps | Raw` `act` substep accordion, live streaming logs, Cancel / Retry / Force deploy, GitHub links), and **Settings** (live `config.toml` editor across General / Server / GitHub / Discord / act / Projects, offline pre-flight **Deploy Checks**, **Diagnostics**, **Connection**, and **Appearance**).
 - **Themes & Zoom:** Neutral **System**, **Light**, **Dark**, and pure-black **OLED** themes plus discrete UI zoom stops (`90%`, `100%`, `110%`, `125%`, `150%`, or responsive auto).
@@ -366,7 +366,7 @@ When a CI or deploy phase fails, times out, or is cancelled, Lunacy attaches nat
   - **Connection precedence:** `LUNACY_SERVER` / `LUNACY_TOKEN` env vars &gt; `--server` / `--token` CLI flags &gt; saved local settings &gt; defaults (`http://127.0.0.1:7878` on desktop, page origin on web).
 - **Desktop Auto-Updater:** On Linux (`x86_64`) and Windows (`x86_64`), checks the rolling GitHub `prerelease` tag on startup (configurable in **Settings → Appearance**), verifies downloads against `SHA256SUMS.txt`, atomically swaps the binary, and prompts to relaunch.
 
-See [`ui/README.md`](ui/README.md) for full UI build, mock server, screenshot, and E2E testing instructions.
+See [`apps/lunacy-ui/README.md`](apps/lunacy-ui/README.md) for full UI build, mock server, screenshot, and E2E testing instructions.
 
 ## Project Layout
 
@@ -403,8 +403,8 @@ See [`ui/README.md`](ui/README.md) for full UI build, mock server, screenshot, a
 | [`docs/api.md`](docs/api.md) | Complete HTTP API v1 and WebSocket (`/api/ws`) protocol reference |
 | [`docs/act.md`](docs/act.md) | How Lunacy drives `nektos/act`, `--json` parsing, locking, and OS notes |
 | [`config.example.toml`](config.example.toml) | Annotated configuration reference with all global and per-project options |
-| [`ui/README.md`](ui/README.md) | Building, developing, screenshotting, and testing `lunacy-ui` (desktop & web) |
+| [`apps/lunacy-ui/README.md`](apps/lunacy-ui/README.md) | Building, developing, screenshotting, and testing `lunacy-ui` (desktop & web) |
 
 ## License
 
-Licensed under the **MIT License** (see package metadata in [`Cargo.toml`](Cargo.toml) and [`ui/Cargo.toml`](ui/Cargo.toml)).
+Licensed under the **MIT License** (see `[workspace.package]` in [`Cargo.toml`](Cargo.toml)).

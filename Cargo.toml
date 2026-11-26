@@ -1,19 +1,25 @@
-[package]
-name = "lunacy"
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Small local CI/deploy daemon: poll a git remote, run shell/act steps, report to GitHub and Discord"
 license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+lunacy-core = { path = "crates/lunacy-core" }
+
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
+clap = { version = "4", features = ["derive"] }
 directories = "6"
 env_logger = "0.11"
 fs2 = "0.4"
 futures-util = "0.3"
 hmac = "0.13"
+libc = "0.2"
 log = "0.4"
 rsa = { version = "0.10", features = ["pkcs1v15"] }
 serde = { version = "1", features = ["derive"] }
@@ -21,16 +27,12 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.11"
 tempfile = "3"
+tiny_http = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
 toml = "1"
 toml_edit = "0.25"
+tungstenite = "0.30"
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
-clap = { version = "4", features = ["derive"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -38,11 +40,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-[dev-dependencies]
-tempfile = "3"
-tiny_http = "0.12"
-tungstenite = "0.30"
-
-[[bin]]
-name = "lunacy"
-path = "src/bin/lunacy.rs"
+# Rune (the UI framework) patches these crates; Cargo only honours patches at the workspace
+# root. Keep every rev equal to the rune/rune-kit rev in apps/lunacy-ui/Cargo.toml.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }
+naga = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }
+accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5" }

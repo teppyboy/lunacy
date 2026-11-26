@@ -2,28 +2,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=LUNACY_SHA");
-    emit_git_rerun_hints();
-
-    let sha = std::env::var("LUNACY_SHA")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(git_head_sha)
-        .unwrap_or_else(|| "dev".to_string());
-
-    let short_sha: String = if sha == "dev" {
-        "dev".to_string()
-    } else {
-        sha.chars().take(7).collect()
-    };
-
-    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
-
-    println!("cargo:rustc-env=LUNACY_BUILD_SHA={sha}");
-    println!("cargo:rustc-env=LUNACY_BUILD_SHORT_SHA={short_sha}");
-    println!("cargo:rustc-env=LUNACY_BUILD_TARGET={target}");
-
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_resources();
     }
@@ -39,7 +17,7 @@ enum ResourceCompiler {
 }
 
 fn embed_windows_resources() {
-    println!("cargo:rerun-if-changed=../assets/icons/lunacy.ico");
+    println!("cargo:rerun-if-changed=../../assets/icons/lunacy.ico");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
     println!("cargo:rerun-if-env-changed=RC");
     println!("cargo:rerun-if-env-changed=WINDRES");
@@ -47,12 +25,8 @@ fn embed_windows_resources() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set by Cargo"),
     );
-    let ico_path = manifest_dir
-        .parent()
-        .expect("ui/ manifest directory should have a workspace parent")
-        .join("assets")
-        .join("icons")
-        .join("lunacy.ico");
+    // `assets/` sits at the workspace root, shared with the UI.
+    let ico_path = manifest_dir.join("../../assets/icons/lunacy.ico");
     assert!(
         ico_path.is_file(),
         "Windows icon asset missing at {}",
@@ -88,9 +62,9 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "ProductName", "Lunacy\0"
-      VALUE "FileDescription", "Lunacy\0"
-      VALUE "InternalName", "lunacy-ui\0"
-      VALUE "OriginalFilename", "lunacy-ui.exe\0"
+      VALUE "FileDescription", "Lunacy local CI/deploy daemon\0"
+      VALUE "InternalName", "lunacy\0"
+      VALUE "OriginalFilename", "lunacy.exe\0"
       VALUE "FileVersion", "{pkg_version}\0"
       VALUE "ProductVersion", "{pkg_version}\0"
     END
@@ -150,7 +124,7 @@ END
         );
     }
 
-    println!("cargo:rustc-link-arg-bin=lunacy-ui={}", res_path.display());
+    println!("cargo:rustc-link-arg-bin=lunacy={}", res_path.display());
 }
 
 fn parse_pkg_version(version: &str) -> (u16, u16, u16, u16) {
@@ -234,7 +208,7 @@ fn find_resource_compiler(target_env: &str, target_arch: &str) -> ResourceCompil
     }
 
     panic!(
-        "failed to embed Windows icon/version resources for `lunacy-ui`: \
+        "failed to embed Windows icon/version resources for `lunacy`: \
          no resource compiler found (target_env=`{target_env}`). \
          Install `llvm-rc` (e.g. via LLVM for cross-compilation), the Windows SDK `rc.exe`, \
          or MinGW `windres`, or set the `RC` environment variable."
@@ -321,67 +295,4 @@ fn version_dir_key(path: &Path) -> Vec<u32> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn emit_git_rerun_hints() {
-    let mut emitted: Vec<PathBuf> = Vec::new();
-    let mut watch = |rel: &str| {
-        if let Some(path) = git_path(rel) {
-            if path.exists() {
-                let resolved = std::fs::canonicalize(&path).unwrap_or(path);
-                if !emitted.contains(&resolved) {
-                    println!("cargo:rerun-if-changed={}", resolved.display());
-                    emitted.push(resolved);
-                }
-            }
-        }
-    };
-
-    watch("HEAD");
-    watch("logs/HEAD");
-    watch("packed-refs");
-
-    // Also watch the active branch ref file so commits trigger rebuilds even when reflogs are off.
-    if let Some(head_path) = git_path("HEAD") {
-        if let Ok(head_contents) = std::fs::read_to_string(head_path) {
-            if let Some(ref_name) = head_contents.trim().strip_prefix("ref:") {
-                let ref_name = ref_name.trim();
-                if !ref_name.is_empty() {
-                    watch(ref_name);
-                }
-            }
-        }
-    }
-}
-
-fn git_path(rel: &str) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--git-path", rel])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if raw.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(raw))
-    }
-}
-
-fn git_head_sha() -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(sha)
-    } else {
-        None
-    }
 }

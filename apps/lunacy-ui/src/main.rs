@@ -16,14 +16,14 @@ fn configure_app_icon() {
     #[cfg(target_os = "macos")]
     {
         let _ = rune::set_app_icon_choice(rune::AppIcon::Pair {
-            light: include_bytes!("../../assets/icons/lunacy-macos-light-256.png").to_vec(),
-            dark: include_bytes!("../../assets/icons/lunacy-macos-dark-256.png").to_vec(),
+            light: include_bytes!("../../../assets/icons/lunacy-macos-light-256.png").to_vec(),
+            dark: include_bytes!("../../../assets/icons/lunacy-macos-dark-256.png").to_vec(),
         });
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         rune::set_app_id("lunacy");
-        let _ = rune::set_app_icon(include_bytes!("../../assets/icons/lunacy-256.png"));
+        let _ = rune::set_app_icon(include_bytes!("../../../assets/icons/lunacy-256.png"));
     }
 }

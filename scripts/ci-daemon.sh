@@ -13,11 +13,11 @@ if [ "$(uname -s)" = "Linux" ] && command -v ld.lld >/dev/null 2>&1 && command -
   esac
 fi
 
-echo "==> [ci-daemon] cargo fmt --check"
-cargo fmt --check
+echo "==> [ci-daemon] cargo fmt --check (daemon + core)"
+cargo fmt -p lunacy -p lunacy-core --check
 
-echo "==> [ci-daemon] cargo clippy --all-targets -- -D warnings"
-cargo clippy --all-targets -- -D warnings
+echo "==> [ci-daemon] cargo clippy -p lunacy -p lunacy-core --all-targets -- -D warnings"
+cargo clippy -p lunacy -p lunacy-core --all-targets -- -D warnings
 
-echo "==> [ci-daemon] cargo test --locked"
-cargo test --locked
+echo "==> [ci-daemon] cargo test -p lunacy -p lunacy-core --locked"
+cargo test -p lunacy -p lunacy-core --locked

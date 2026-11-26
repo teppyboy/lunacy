@@ -481,6 +481,11 @@ pub fn run_pipeline_spec(ctx: &Ctx<'_>, project: &ProjectCfg, spec: &RunSpec) ->
     run
 }
 
+/// The project's `owner/name` on GitHub: `github_repo`, else parsed from the remote URL.
+pub fn resolve_github_repo(project: &ProjectCfg) -> Option<String> {
+    project.github_repo.clone().or_else(|| derive_repo(project))
+}
+
 fn derive_repo(project: &ProjectCfg) -> Option<String> {
     git::remote_url(&project.repo_path, &project.remote)
         .as_deref()

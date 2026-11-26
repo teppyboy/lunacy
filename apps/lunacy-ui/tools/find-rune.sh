@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prints a Rune checkout with scripts/web-build.sh at the rev ui/Cargo.toml pins.
+# Prints a Rune checkout with scripts/web-build.sh at the rev apps/lunacy-ui/Cargo.toml pins.
 # RUNE_DIR wins; else ~/.cache/lunacy/rune (cloned there on first use, outside /tmp so it
 # survives reboots). Sourced by build-web.sh and e2e.sh.
 set -euo pipefail

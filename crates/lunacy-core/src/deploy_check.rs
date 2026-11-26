@@ -7,7 +7,6 @@ use crate::config::{
     self, Checkout, Config, GithubMode, Os, ProjectCfg, StepCfg, StepKind, TriggerMode,
     DEFAULT_STEP_TIMEOUT,
 };
-use crate::daemon::ProjectState;
 use crate::exec;
 use crate::git;
 use crate::model::{self, Phase, RunStatus, StepStatus};
@@ -145,18 +144,6 @@ pub struct ProjectSnapshot {
     pub last_sha: Option<String>,
     pub current_run: Option<model::Run>,
     pub last_run: Option<model::Run>,
-}
-
-impl From<&ProjectState> for ProjectSnapshot {
-    fn from(p: &ProjectState) -> Self {
-        ProjectSnapshot {
-            name: p.name.clone(),
-            upstream_sha: p.upstream_sha.clone(),
-            last_sha: p.last_sha.clone(),
-            current_run: p.current_run.clone(),
-            last_run: p.last_run.clone(),
-        }
-    }
 }
 
 pub fn build_deploy_checks(
@@ -416,7 +403,7 @@ fn check_project(
             .as_ref()
             .and_then(|g| g.webhook_secret_value())
             .is_some();
-        let resolved_repo = crate::daemon::resolve_github_repo(project);
+        let resolved_repo = crate::pipeline::resolve_github_repo(project);
         if !has_secret {
             checks.push(CheckItem::error(
                 "Webhook",

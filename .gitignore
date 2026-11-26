@@ -1,2 +1,8 @@
 config.toml
 /target
+# Rust build output of nested tools that set their own target dir.
+target/
+# The UI's generated web bundle (apps/lunacy-ui/build-web.sh); screenshots are checked in.
+/apps/lunacy-ui/dist/
+# Python bytecode from the UI's mock server and e2e tools.
+__pycache__/

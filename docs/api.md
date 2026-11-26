@@ -1,6 +1,6 @@
 # Lunacy HTTP API (v1)
 
-Contract between the daemon (`lunacy run`) and the Rune UI (`ui/`, native + web).
+Contract between the daemon (`lunacy run`) and its clients: the Rune UI (`apps/lunacy-ui/`, native + web) and `lunacy-cli` (`apps/lunacy-cli/`).
 JSON everywhere except logs. Times are unix seconds (u64). Unknown fields must be ignored by clients.
 
 ## Server config (`config.toml`)
@@ -10,7 +10,7 @@ JSON everywhere except logs. Times are unix seconds (u64). Unknown fields must b
 listen = "127.0.0.1:7878"   # omit [server] to disable the API
 token = ""                  # optional; if set, every /api request needs `Authorization: Bearer <token>`
 token_file = "~/.config/lunacy/api-token"   # or read the token from a file
-web_root = "ui/dist"        # optional; static files (Rune web build) served at `/`
+web_root = "apps/lunacy-ui/dist" # optional; static files (Rune web build) served at `/`
 ```
 
 The daemon adds `Access-Control-Allow-Origin: *` plus `Access-Control-Allow-Headers: Authorization, Content-Type`

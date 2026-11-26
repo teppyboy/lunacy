@@ -3659,15 +3659,15 @@ mod tests {
         for (label, png) in [
             (
                 "assets/icons/lunacy-256.png",
-                include_bytes!("../../assets/icons/lunacy-256.png").as_slice(),
+                include_bytes!("../../../assets/icons/lunacy-256.png").as_slice(),
             ),
             (
                 "assets/icons/lunacy-macos-light-256.png",
-                include_bytes!("../../assets/icons/lunacy-macos-light-256.png").as_slice(),
+                include_bytes!("../../../assets/icons/lunacy-macos-light-256.png").as_slice(),
             ),
             (
                 "assets/icons/lunacy-macos-dark-256.png",
-                include_bytes!("../../assets/icons/lunacy-macos-dark-256.png").as_slice(),
+                include_bytes!("../../../assets/icons/lunacy-macos-dark-256.png").as_slice(),
             ),
         ] {
             assert!(

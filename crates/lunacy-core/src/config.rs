@@ -1510,7 +1510,7 @@ mod tests {
     use super::*;
 
     fn example() -> Config {
-        Config::load(Path::new("config.example.toml")).expect("example config parses")
+        Config::load(&crate::example_config_path()).expect("example config parses")
     }
 
     #[test]

@@ -1622,12 +1622,18 @@ fn github_client(cfg: &Config, project_name: &str) -> Option<Github> {
     })
 }
 
-pub(crate) fn resolve_github_repo(project: &ProjectCfg) -> Option<String> {
-    project.github_repo.clone().or_else(|| {
-        git::remote_url(&project.repo_path, &project.remote)
-            .as_deref()
-            .and_then(config::repo_from_remote)
-    })
+pub(crate) use crate::pipeline::resolve_github_repo;
+
+impl From<&ProjectState> for crate::deploy_check::ProjectSnapshot {
+    fn from(p: &ProjectState) -> Self {
+        crate::deploy_check::ProjectSnapshot {
+            name: p.name.clone(),
+            upstream_sha: p.upstream_sha.clone(),
+            last_sha: p.last_sha.clone(),
+            current_run: p.current_run.clone(),
+            last_run: p.last_run.clone(),
+        }
+    }
 }
 
 fn poll_open_prs(

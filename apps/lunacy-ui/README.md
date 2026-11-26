@@ -1,8 +1,8 @@
 # Lunacy UI (`lunacy-ui`)
 
-A [Rune](https://github.com/anomalyco/rune) client for the [Lunacy](../README.md) local CI/deploy daemon: real-time project overview, run history, inspectable `act` substep accordions with live logs, pre-flight deploy checks, and a full comment-preserving `config.toml` editor.
+A [Rune](https://github.com/anomalyco/rune) client for the [Lunacy](../../README.md) local CI/deploy daemon: real-time project overview, run history, inspectable `act` substep accordions with live logs, pre-flight deploy checks, and a full comment-preserving `config.toml` editor.
 
-One Rust view tree builds natively for Linux, macOS, and Windows (GUI subsystem with embedded platform icons) and compiles to a static WebGPU WASM app for the browser. It streams live state and step logs over WebSockets (`GET /api/ws`) with automatic HTTP polling fallback ([`docs/api.md`](../docs/api.md)), so it works against a local daemon, a remote host, or `tools/mock_server.py`.
+One Rust view tree builds natively for Linux, macOS, and Windows (GUI subsystem with embedded platform icons) and compiles to a static WebGPU WASM app for the browser. It streams live state and step logs over WebSockets (`GET /api/ws`) with automatic HTTP polling fallback ([`docs/api.md`](../../docs/api.md)), so it works against a local daemon, a remote host, or `tools/mock_server.py`.
 
 - **Native:** `cargo run` — desktop window with embedded app icons and System / Light / Dark / OLED themes.
 - **Web:** `./build-web.sh` → `dist/` — static bundle served by `lunacy` via `[server] web_root` or any HTTP(S) server. WebGPU requires a secure context (`http://localhost` works; LAN IPs need HTTPS).
@@ -21,7 +21,7 @@ For the WebGPU WASM build additionally:
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.130 --locked   # must match ui/Cargo.lock
+cargo install wasm-bindgen-cli --version 0.2.130 --locked   # must match the workspace Cargo.lock
 # `wasm-opt` from binaryen (`pacman -S binaryen`, `brew install binaryen`, or `apt install binaryen`)
 ```
 
@@ -118,7 +118,7 @@ cargo check --target wasm32-unknown-unknown --locked
 ./tools/e2e.sh
 ```
 
-`./tools/e2e.sh` runs in an isolated temporary directory on a free port and never touches port `7878`, `~/.config/lunacy`, `~/.local/share/lunacy`, or `ui/dist/`.
+`./tools/e2e.sh` runs in an isolated temporary directory on a free port and never touches port `7878`, `~/.config/lunacy`, `~/.local/share/lunacy`, or `apps/lunacy-ui/dist/`.
 
 ## Layout
 

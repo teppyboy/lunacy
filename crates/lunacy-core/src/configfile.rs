@@ -193,7 +193,6 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn comments_survive_a_write() {
@@ -211,7 +210,7 @@ name = "fmt"
 run = "true"
 timeout = 60
 "#;
-        let mut cfg = Config::load(Path::new("config.example.toml")).expect("example");
+        let mut cfg = Config::load(&crate::example_config_path()).expect("example");
         cfg.projects.truncate(1);
         cfg.projects[0].name = "a".into();
         cfg.projects[0].repo_path = "/tmp/a".into();
@@ -233,7 +232,7 @@ timeout = 60
     #[test]
     fn new_sections_are_appended() {
         let existing = "[general]\npoll_interval = 60\n";
-        let mut cfg = Config::load(Path::new("config.example.toml")).expect("example");
+        let mut cfg = Config::load(&crate::example_config_path()).expect("example");
         cfg.general.poll_interval = 60;
         cfg.server = Some(crate::config::ServerCfg {
             listen: "127.0.0.1:9999".into(),
@@ -253,7 +252,7 @@ timeout = 60
     #[test]
     fn the_config_value_wins_over_the_stale_file() {
         let existing = "[general]\npoll_interval = 60\nlog_level = \"debug\"\n";
-        let mut cfg = Config::load(Path::new("config.example.toml")).expect("example");
+        let mut cfg = Config::load(&crate::example_config_path()).expect("example");
         cfg.general.poll_interval = 120;
         let text = render(existing, &cfg).unwrap();
         assert!(text.contains("poll_interval = 120"), "{text}");
@@ -275,8 +274,8 @@ timeout = 60
 
     #[test]
     fn roundtrip_of_the_example_config() {
-        let existing = std::fs::read_to_string("config.example.toml").unwrap();
-        let mut cfg = Config::load(Path::new("config.example.toml")).unwrap();
+        let existing = std::fs::read_to_string(crate::example_config_path()).unwrap();
+        let mut cfg = Config::load(&crate::example_config_path()).unwrap();
         cfg.general.poll_interval = 120;
         let back = render_and_parse(&existing, &cfg).unwrap();
         assert_eq!(back.general.poll_interval, 120);
@@ -285,8 +284,8 @@ timeout = 60
 
     #[test]
     fn roundtrip_preserves_concurrency_fields() {
-        let existing = std::fs::read_to_string("config.example.toml").unwrap();
-        let mut cfg = Config::load(Path::new("config.example.toml")).unwrap();
+        let existing = std::fs::read_to_string(crate::example_config_path()).unwrap();
+        let mut cfg = Config::load(&crate::example_config_path()).unwrap();
         cfg.general.max_concurrent_runs = 4;
         cfg.act.as_mut().unwrap().max_concurrent = Some(2);
         cfg.projects[0].max_concurrent_runs = Some(2);

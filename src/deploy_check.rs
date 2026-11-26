@@ -4,7 +4,8 @@
 
 use crate::act;
 use crate::config::{
-    self, Checkout, Config, GithubMode, Os, ProjectCfg, StepCfg, StepKind, DEFAULT_STEP_TIMEOUT,
+    self, Checkout, Config, GithubMode, Os, ProjectCfg, StepCfg, StepKind, TriggerMode,
+    DEFAULT_STEP_TIMEOUT,
 };
 use crate::daemon::ProjectState;
 use crate::exec;
@@ -36,6 +37,7 @@ pub struct ProjectDeployCheck {
     pub checkout: String,
     pub github_repo: Option<String>,
     pub poll_interval: u64,
+    pub trigger_mode: String,
     pub pipeline_timeout: Option<u64>,
     pub step_timeout: u64,
     pub watch_prs: bool,
@@ -391,6 +393,35 @@ fn check_project(
         ));
     }
 
+    // 6. Webhook readiness when trigger_mode = "webhook".
+    if project.effective_trigger_mode(&cfg.general) == TriggerMode::Webhook {
+        let has_secret = cfg
+            .github
+            .as_ref()
+            .and_then(|g| g.webhook_secret_value())
+            .is_some();
+        let resolved_repo = crate::daemon::resolve_github_repo(project);
+        if !has_secret {
+            checks.push(CheckItem::error(
+                "Webhook",
+                "webhook secret is not configured",
+            ));
+        } else if resolved_repo.is_none() {
+            checks.push(CheckItem::error(
+                "Webhook",
+                "cannot determine GitHub repo for webhook matching",
+            ));
+        } else {
+            checks.push(CheckItem::ok(
+                "Webhook",
+                format!(
+                    "webhook secret configured for {}",
+                    resolved_repo.as_deref().unwrap_or("")
+                ),
+            ));
+        }
+    }
+
     // Per-deploy-step checks.
     let deploy_steps: Vec<DeployStepCheck> = project
         .deploy
@@ -430,6 +461,10 @@ fn check_project(
         checkout: checkout_str.to_string(),
         github_repo,
         poll_interval: project.poll_interval(&cfg.general),
+        trigger_mode: project
+            .effective_trigger_mode(&cfg.general)
+            .as_str()
+            .to_string(),
         pipeline_timeout: project.timeout,
         step_timeout: project.effective_step_timeout(&cfg.general),
         watch_prs: project.watch_prs,
@@ -977,6 +1012,7 @@ mod tests {
             github_repo: None,
             checkout: Checkout::None,
             poll_interval: None,
+            trigger_mode: None,
             step_timeout: None,
             timeout: None,
             env: Default::default(),
@@ -1074,6 +1110,8 @@ mod tests {
             token: Some("tok".into()),
             token_file: None,
             api_url: None,
+            webhook_secret: None,
+            webhook_secret_file: None,
             app: None,
         });
         cfg.discord = Some(DiscordCfg {
@@ -1184,5 +1222,78 @@ mod tests {
         assert_eq!(summary.steps.len(), 1);
         assert_eq!(summary.steps[0].name, "Publish");
         assert_eq!(summary.steps[0].duration_ms, Some(250));
+    }
+
+    #[test]
+    fn webhook_mode_emits_webhook_readiness_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo, None);
+        let state_dir = dir.path().join("state");
+
+        // Non-webhook mode -> no "Webhook" check item.
+        let mut proj = base_project(repo.clone());
+        let mut cfg = Config {
+            projects: vec![proj.clone()],
+            ..Config::default()
+        };
+        let res = build_deploy_checks(&cfg, &[], &state_dir, Os::Linux);
+        assert!(!res.projects[0].checks.iter().any(|c| c.label == "Webhook"));
+
+        // Webhook mode without secret -> error("webhook secret is not configured").
+        proj.trigger_mode = Some(TriggerMode::Webhook);
+        cfg.projects = vec![proj.clone()];
+        let res = build_deploy_checks(&cfg, &[], &state_dir, Os::Linux);
+        let wh = res.projects[0]
+            .checks
+            .iter()
+            .find(|c| c.label == "Webhook")
+            .expect("Webhook check");
+        assert_eq!(wh.level, "error");
+        assert_eq!(wh.detail, "webhook secret is not configured");
+
+        // Secret configured, but no remote/github_repo -> error("cannot determine GitHub repo for webhook matching").
+        cfg.github = Some(GithubCfg {
+            mode: None,
+            token: None,
+            token_file: None,
+            api_url: None,
+            webhook_secret: Some("wh-secret".into()),
+            webhook_secret_file: None,
+            app: None,
+        });
+        let res = build_deploy_checks(&cfg, &[], &state_dir, Os::Linux);
+        let wh = res.projects[0]
+            .checks
+            .iter()
+            .find(|c| c.label == "Webhook")
+            .expect("Webhook check");
+        assert_eq!(wh.level, "error");
+        assert_eq!(
+            wh.detail,
+            "cannot determine GitHub repo for webhook matching"
+        );
+
+        // Add GitHub remote -> Webhook check becomes ok!
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/demo.git",
+            ])
+            .output()
+            .expect("git");
+        assert!(out.status.success());
+        let res = build_deploy_checks(&cfg, &[], &state_dir, Os::Linux);
+        let wh = res.projects[0]
+            .checks
+            .iter()
+            .find(|c| c.label == "Webhook")
+            .expect("Webhook check");
+        assert_eq!(wh.level, "ok");
+        assert!(wh.detail.contains("owner/demo"), "{}", wh.detail);
     }
 }

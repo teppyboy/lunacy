@@ -40,6 +40,7 @@ fn project(fx: &common::Fixture, state_dir: &std::path::Path, ci_run: &str) -> P
         github_repo: None,
         checkout: Checkout::None,
         poll_interval: None,
+        trigger_mode: None,
         step_timeout: None,
         timeout: None,
         env: Default::default(),
@@ -96,6 +97,7 @@ fn run_pipeline(
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
     let run = pipeline::run_pipeline(&ctx, p, sha, Trigger::Manual);
     assert!(
@@ -312,6 +314,7 @@ fn reporting_is_disabled_without_token_or_webhook() {
         github_repo: None,
         checkout: Checkout::None,
         poll_interval: None,
+        trigger_mode: None,
         step_timeout: None,
         timeout: None,
         env: Default::default(),
@@ -335,6 +338,8 @@ fn reporting_is_disabled_without_token_or_webhook() {
             token: None,
             token_file: None,
             api_url: None,
+            webhook_secret: None,
+            webhook_secret_file: None,
             app: None,
         }),
         ..Config::default()
@@ -559,6 +564,7 @@ fn cancelling_running_step_kills_process_and_skips_remaining() {
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: Some(&cancel),
+        on_log_chunk: None,
     };
 
     let started = Instant::now();
@@ -684,6 +690,7 @@ fn act_lock_wait_is_cancellable() {
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: Some(&cancel),
+        on_log_chunk: None,
     };
     let started = Instant::now();
     let run = pipeline::run_pipeline(&ctx, &p, &sha, Trigger::Manual);
@@ -765,6 +772,8 @@ fn pr_run_is_ci_only_uses_worktree_and_skips_deploy_github_check() {
         token: Some("test-token".into()),
         token_file: None,
         api_url: Some(format!("http://{gh_addr}")),
+        webhook_secret: None,
+        webhook_secret_file: None,
         app: None,
     };
     let gh = Github::new(&gh_cfg).expect("gh client");
@@ -793,6 +802,7 @@ fn pr_run_is_ci_only_uses_worktree_and_skips_deploy_github_check() {
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
     let spec = RunSpec {
         sha: pr_sha.clone(),
@@ -889,6 +899,7 @@ fn force_deploy_skips_ci_standalone_and_runs_act_when_ci_dir_referenced() {
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
     let spec = RunSpec {
         sha: sha.clone(),
@@ -954,6 +965,7 @@ fn force_deploy_skips_ci_standalone_and_runs_act_when_ci_dir_referenced() {
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
     let run2 = pipeline::run_pipeline_spec(&ctx2, &p2, &spec);
     assert_eq!(run2.status, RunStatus::Success, "steps: {:?}", run2.steps);
@@ -1012,6 +1024,7 @@ fn remote_tags_and_deploy_refs_gating() {
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
 
     // master does NOT match tags/v* -> deploy skipped with reason.
@@ -1084,6 +1097,7 @@ fn startup_emits_on_update_before_checkout_and_pr_base_sha_falls_back() {
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
     // Valid hex SHA that does not exist in git -> prepare_checkout fails.
     let missing_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
@@ -1151,6 +1165,7 @@ fn startup_emits_on_update_before_checkout_and_pr_base_sha_falls_back() {
         on_update: &noop,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
     let pr_spec = RunSpec {
         sha: base_sha.clone(),
@@ -1173,5 +1188,66 @@ fn startup_emits_on_update_before_checkout_and_pr_base_sha_falls_back() {
     assert_eq!(
         captured["pull_request"]["base"]["sha"], base_sha,
         "base_sha fallback should resolve origin/master: {captured}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn on_log_chunk_streams_shell_output_matching_log_file() {
+    use std::sync::Mutex;
+
+    let fx = common::Fixture::new();
+    let state = tempfile::tempdir().expect("state");
+    let state_dir = state.path().to_path_buf();
+    let sha = fx.commit("stream.txt", "hi\n", "feat: stream logs");
+    lunacy::git::fetch(&fx.work, "origin", "master").expect("fetch");
+
+    let cfg = config(&fx, &state_dir);
+    let mut p = project(
+        &fx,
+        &state_dir,
+        "echo line-one; echo line-two; echo err-three >&2",
+    );
+    p.ci = vec![shell_step(
+        "Stream",
+        "echo line-one; echo line-two; echo err-three >&2",
+    )];
+    p.deploy.clear();
+
+    let chunks: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let chunks_cb = chunks.clone();
+    let on_log_chunk: lunacy::pipeline::LogChunkCallback = Arc::new(move |step, chunk| {
+        chunks_cb.lock().unwrap().push((step, chunk.to_string()));
+    });
+    let on_update = |_run: &lunacy::model::Run| {};
+    let act_lock = state_dir.join("act.lock");
+    let ctx = Ctx {
+        cfg: &cfg,
+        state_dir: &state_dir,
+        os: Os::current(),
+        github: None,
+        on_update: &on_update,
+        act_lock: &act_lock,
+        cancel: None,
+        on_log_chunk: Some(on_log_chunk),
+    };
+
+    let run = pipeline::run_pipeline(&ctx, &p, &sha, Trigger::Manual);
+    assert_eq!(run.status, RunStatus::Success);
+
+    let captured = chunks.lock().unwrap();
+    assert!(!captured.is_empty());
+    assert!(captured.iter().all(|(idx, _)| *idx == 0));
+    let joined: String = captured.iter().map(|(_, c)| c.as_str()).collect();
+    assert!(joined.contains("line-one\n"), "{joined:?}");
+    assert!(joined.contains("line-two\n"), "{joined:?}");
+    assert!(joined.contains("err-three\n"), "{joined:?}");
+
+    let log_path = lunacy::model::run_log_path(&state_dir, &run.project, &run.id, 0);
+    let on_disk = std::fs::read_to_string(&log_path).expect("log file");
+    assert_eq!(
+        joined.len(),
+        on_disk.len(),
+        "streamed bytes match file length"
     );
 }

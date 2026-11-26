@@ -1,12 +1,22 @@
-//! HTTP API for the Rune UI (see `docs/api.md`) plus the GitHub App webhook.
+//! HTTP API & WebSocket server for the Rune UI (see `docs/api.md`) plus GitHub webhooks.
 
-use crate::config::{self, Config, MASK};
+use crate::config::{self, Config, TriggerMode, MASK};
 use crate::daemon::{Command, Shared};
 use crate::git;
 use crate::model::{self, Run, Trigger};
 use crate::pipeline::PrContext;
 
 use anyhow::{Context, Result};
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE,
+};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -15,9 +25,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use tiny_http::{Header, Method, Response, Server};
+use std::time::Duration;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// One project's command channel plus its worker generation.
 pub type Commands = Arc<Mutex<BTreeMap<String, Sender<Command>>>>;
@@ -30,30 +42,77 @@ pub struct ApiState {
     pub reloads: Arc<Mutex<u32>>,
 }
 
+pub fn build_router(state: Arc<ApiState>) -> Router {
+    Router::new()
+        .route(
+            "/api/ws",
+            get(crate::ws::ws_handler).options(options_response),
+        )
+        .fallback(dispatch_http)
+        .with_state(state)
+}
+
 pub fn serve(state: Arc<ApiState>, listen: &str) -> Result<()> {
-    let server = Server::http(listen).map_err(|e| anyhow::anyhow!("binding {listen}: {e}"))?;
-    log::info!("API listening on http://{listen}");
-    let mut last_reloads = 0u32;
-    loop {
-        let request = match server.recv_timeout(std::time::Duration::from_millis(250)) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                let now = *state.reloads.lock().expect("reloads");
+    let std_listener =
+        std::net::TcpListener::bind(listen).with_context(|| format!("binding {listen}"))?;
+    std_listener
+        .set_nonblocking(true)
+        .with_context(|| format!("setting nonblocking on {listen}"))?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .thread_name("lunacy-api")
+        .build()
+        .context("building Tokio runtime for API server")?;
+
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .with_context(|| format!("converting TCP listener for {listen}"))?;
+        log::info!("API listening on http://{listen}");
+
+        let reload_state = state.clone();
+        let reload_task = tokio::spawn(async move {
+            let mut last_reloads = *reload_state.reloads.lock().expect("reloads");
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            loop {
+                interval.tick().await;
+                let shutdown = reload_state
+                    .shared
+                    .lock()
+                    .map(|s| s.shutdown)
+                    .unwrap_or(true);
+                if shutdown {
+                    break;
+                }
+                let now = *reload_state.reloads.lock().expect("reloads");
                 if now != last_reloads {
                     last_reloads = now;
-                    state.apply_config_changes();
+                    reload_state.apply_config_changes();
                 }
-                continue;
             }
-            Err(e) => {
-                log::warn!("API accept error: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = handle(&state, request) {
-            log::warn!("API request failed: {e:#}");
-        }
-    }
+        });
+
+        let shutdown_shared = state.shared.clone();
+        let app = build_router(state);
+        let serve_res = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                loop {
+                    let stop = shutdown_shared.lock().map(|s| s.shutdown).unwrap_or(true);
+                    if stop {
+                        if let Ok(s) = shutdown_shared.lock() {
+                            s.ws.notify_shutdown();
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+
+        reload_task.abort();
+        serve_res.map_err(|e| anyhow::anyhow!("API server error: {e}"))
+    })
 }
 
 impl ApiState {
@@ -125,83 +184,158 @@ fn percent_decode_path_segment(s: &str) -> String {
     percent_decode_impl(s, false)
 }
 
-fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
-    let text = body.to_string();
-    let mut response = Response::from_string(text).with_status_code(status);
-    for (k, v) in [
-        ("Content-Type", "application/json"),
-        ("Access-Control-Allow-Origin", "*"),
-        (
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type",
-        ),
-        ("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS"),
-    ] {
-        if let Ok(h) = Header::from_bytes(k, v) {
-            response.add_header(h);
-        }
-    }
-    response
+async fn options_response() -> Response {
+    cors_options_response()
 }
 
-fn error_response(status: u16, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+fn cors_options_response() -> Response {
+    let mut res = StatusCode::NO_CONTENT.into_response();
+    let headers = res.headers_mut();
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Authorization, Content-Type"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, PUT, POST, OPTIONS"),
+    );
+    res
+}
+
+fn json_response(status: u16, body: &Value) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut res = (code, body.to_string()).into_response();
+    let headers = res.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Authorization, Content-Type"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, PUT, POST, OPTIONS"),
+    );
+    res
+}
+
+pub fn error_response(status: u16, message: &str) -> Response {
     json_response(status, &json!({ "error": message }))
 }
 
-fn text_response(content_type: &str, body: String) -> Response<std::io::Cursor<Vec<u8>>> {
-    let mut response = Response::from_string(body).with_status_code(200);
-    if let Ok(h) = Header::from_bytes("Content-Type", content_type) {
-        response.add_header(h);
-    }
-    if let Ok(h) = Header::from_bytes("Access-Control-Allow-Origin", "*") {
-        response.add_header(h);
-    }
-    response
+fn text_response(content_type: &'static str, body: String) -> Response {
+    let mut res = (StatusCode::OK, body).into_response();
+    let headers = res.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    res
 }
 
-fn handle(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
-    let url = request.url().to_string();
-    let method = request.method().clone();
-    let (path, params) = split_path(&url);
+pub(crate) fn is_valid_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && !s.contains("..")
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.chars().any(|c| c.is_ascii_control())
+}
 
-    if method == Method::Options {
-        let mut response = Response::empty(204);
-        for (k, v) in [
-            ("Access-Control-Allow-Origin", "*"),
-            (
-                "Access-Control-Allow-Headers",
-                "Authorization, Content-Type",
-            ),
-            ("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS"),
-        ] {
-            if let Ok(h) = Header::from_bytes(k, v) {
-                response.add_header(h);
-            }
-        }
-        return request.respond(response).map_err(Into::into);
+async fn dispatch_http(State(state): State<Arc<ApiState>>, req: Request<Body>) -> Response {
+    let method = req.method().clone();
+    if method == Method::OPTIONS {
+        return cors_options_response();
     }
 
+    let url = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let path = req.uri().path().to_string();
+    let headers = req.headers().clone();
+
+    if path == "/api/health" {
+        let body = json!({"ok": true, "version": VERSION});
+        return json_response(200, &body);
+    }
+
+    let is_static_get = !path.starts_with("/api") && method == Method::GET;
+    let is_webhook_post = path == "/api/github/webhook" && method == Method::POST;
+
+    if is_webhook_post {
+        let has_secret = state
+            .shared
+            .lock()
+            .expect("shared")
+            .config
+            .github
+            .as_ref()
+            .and_then(|g| g.webhook_secret_value())
+            .filter(|s| !s.is_empty() && s != MASK)
+            .is_some();
+        if !has_secret {
+            return error_response(404, "no webhook secret configured");
+        }
+        let has_sig_prefix = headers
+            .get("x-hub-signature-256")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.starts_with("sha256="));
+        if !has_sig_prefix {
+            return error_response(401, "invalid signature");
+        }
+    } else if !is_static_get {
+        if let Err((status, message)) = authorize(&state, &headers) {
+            return error_response(status, &message);
+        }
+    }
+
+    let body_bytes = if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+        match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("failed reading request body: {e}");
+                return error_response(400, "failed reading request body");
+            }
+        }
+    } else {
+        axum::body::Bytes::new()
+    };
+
+    tokio::task::spawn_blocking(move || handle_sync(&state, method, &url, &headers, &body_bytes))
+        .await
+        .unwrap_or_else(|e| {
+            log::error!("API worker task panicked: {e}");
+            error_response(500, "internal server error")
+        })
+}
+
+fn handle_sync(
+    state: &Arc<ApiState>,
+    method: Method,
+    url: &str,
+    headers: &HeaderMap,
+    body_bytes: &[u8],
+) -> Response {
+    let (path, params) = split_path(url);
+
     // Static UI files at `/`.
-    if !path.starts_with("/api") && method == Method::Get {
-        return serve_static(state, request, &path);
+    if !path.starts_with("/api") && method == Method::GET {
+        return serve_static(state, &path);
     }
 
     if path == "/api/health" {
         let body = json!({"ok": true, "version": VERSION});
-        return request
-            .respond(json_response(200, &body))
-            .map_err(Into::into);
+        return json_response(200, &body);
     }
 
     // The webhook authenticates with its own HMAC, not the bearer token.
-    if path == "/api/github/webhook" && method == Method::Post {
-        return handle_webhook(state, request);
+    if path == "/api/github/webhook" && method == Method::POST {
+        return handle_webhook(state, headers, body_bytes);
     }
 
-    if let Err((status, message)) = authorize(state, &request) {
-        return request
-            .respond(error_response(status, &message))
-            .map_err(Into::into);
+    if let Err((status, message)) = authorize(state, headers) {
+        return error_response(status, &message);
     }
 
     let segments_owned: Vec<String> = path
@@ -209,38 +343,31 @@ fn handle(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
         .split('/')
         .map(percent_decode_path_segment)
         .collect();
-    if segments_owned.iter().any(|s| {
-        s == "."
-            || s.contains("..")
-            || s.contains('/')
-            || s.contains('\\')
-            || s.chars().any(|c| c.is_ascii_control())
-    }) {
-        return request
-            .respond(error_response(400, "invalid path segment"))
-            .map_err(Into::into);
+    if segments_owned
+        .iter()
+        .any(|s| !s.is_empty() && !is_valid_segment(s))
+    {
+        return error_response(400, "invalid path segment");
     }
     let segments: Vec<&str> = segments_owned.iter().map(String::as_str).collect();
+    let body_str = String::from_utf8_lossy(body_bytes);
+
     match (method, segments.as_slice()) {
-        (Method::Get, ["api", "projects"]) => {
+        (Method::GET, ["api", "projects"]) => {
             let body = projects_json(state);
-            request
-                .respond(json_response(200, &body))
-                .map_err(Into::into)
+            json_response(200, &body)
         }
-        (Method::Get, ["api", "projects", name]) => {
+        (Method::GET, ["api", "projects", name]) => {
             let body = projects_json(state);
             match body
                 .as_array()
                 .and_then(|a| a.iter().find(|p| p["name"] == *name).cloned())
             {
-                Some(p) => request.respond(json_response(200, &p)).map_err(Into::into),
-                None => request
-                    .respond(error_response(404, "unknown project"))
-                    .map_err(Into::into),
+                Some(p) => json_response(200, &p),
+                None => error_response(404, "unknown project"),
             }
         }
-        (Method::Get, ["api", "projects", name, "runs"]) => {
+        (Method::GET, ["api", "projects", name, "runs"]) => {
             let limit = params
                 .get("limit")
                 .and_then(|v| v.parse::<usize>().ok())
@@ -249,64 +376,52 @@ fn handle(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
             let state_dir = state.shared.lock().expect("shared").state_dir.clone();
             let runs = model::list_runs(&state_dir, name, limit);
             let body: Vec<Value> = runs.iter().map(run_json).collect();
-            request
-                .respond(json_response(200, &Value::Array(body)))
-                .map_err(Into::into)
+            json_response(200, &Value::Array(body))
         }
-        (Method::Get, ["api", "projects", name, "workflows"]) => {
-            handle_workflows(state, request, name, &params)
+        (Method::GET, ["api", "projects", name, "workflows"]) => {
+            handle_workflows(state, name, &params)
         }
-        (Method::Post, ["api", "projects", name, "trigger"]) => {
-            handle_trigger(state, request, name)
+        (Method::POST, ["api", "projects", name, "trigger"]) => {
+            handle_trigger(state, &body_str, name)
         }
-        (Method::Post, ["api", "projects", name, "deploy"]) => {
-            handle_deploy_project(state, request, name)
+        (Method::POST, ["api", "projects", name, "deploy"]) => {
+            handle_deploy_project(state, &body_str, name)
         }
-        (Method::Post, ["api", "projects", name, "cancel"]) => {
-            handle_cancel_project(state, request, name)
+        (Method::POST, ["api", "projects", name, "cancel"]) => handle_cancel_project(state, name),
+        (Method::POST, ["api", "projects", name, "cache", "clear"]) => {
+            handle_clear_project_cache(state, name)
         }
-        (Method::Post, ["api", "projects", name, "cache", "clear"]) => {
-            handle_clear_project_cache(state, request, name)
-        }
-        (Method::Get, ["api", "runs", id]) => {
+        (Method::GET, ["api", "runs", id]) => {
             let state_dir = state.shared.lock().expect("shared").state_dir.clone();
             match lookup_run(&state_dir, id) {
-                Some(run) => request
-                    .respond(json_response(200, &run_json(&run)))
-                    .map_err(Into::into),
-                None => request
-                    .respond(error_response(404, "unknown run"))
-                    .map_err(Into::into),
+                Some(run) => json_response(200, &run_json(&run)),
+                None => error_response(404, "unknown run"),
             }
         }
-        (Method::Post, ["api", "runs", id, "deploy"]) => handle_deploy_run(state, request, id),
-        (Method::Post, ["api", "runs", id, "cancel"]) => handle_cancel_run(state, request, id),
-        (Method::Get, ["api", "runs", id, "steps", index, "log"]) => {
-            handle_step_log(state, request, id, index, &params)
+        (Method::POST, ["api", "runs", id, "deploy"]) => handle_deploy_run(state, &body_str, id),
+        (Method::POST, ["api", "runs", id, "cancel"]) => handle_cancel_run(state, id),
+        (Method::GET, ["api", "runs", id, "steps", index, "log"]) => {
+            handle_step_log(state, id, index, &params)
         }
-        (Method::Post, ["api", "cache", "clear"]) => handle_clear_cache(state, request),
-        (Method::Get, ["api", "deploy", "checks"]) => handle_deploy_checks(state, request),
-        (Method::Get, ["api", "config"]) => {
+        (Method::POST, ["api", "cache", "clear"]) => handle_clear_cache(state),
+        (Method::GET, ["api", "deploy", "checks"]) => handle_deploy_checks(state),
+        (Method::GET, ["api", "config"]) => {
             let cfg = state.shared.lock().expect("shared").config.clone();
-            let body = serde_json::to_value(cfg.masked())?;
-            request
-                .respond(json_response(200, &body))
-                .map_err(Into::into)
+            match serde_json::to_value(cfg.masked()) {
+                Ok(body) => json_response(200, &body),
+                Err(e) => error_response(500, &format!("serialising config: {e}")),
+            }
         }
-        (Method::Put, ["api", "config"]) => handle_put_config(state, request),
-        (Method::Get, ["api", "system"]) => {
+        (Method::PUT, ["api", "config"]) => handle_put_config(state, &body_str),
+        (Method::GET, ["api", "system"]) => {
             let body = system_json(state);
-            request
-                .respond(json_response(200, &body))
-                .map_err(Into::into)
+            json_response(200, &body)
         }
-        _ => request
-            .respond(error_response(404, "not found"))
-            .map_err(Into::into),
+        _ => error_response(404, "not found"),
     }
 }
 
-fn authorize(state: &Arc<ApiState>, request: &tiny_http::Request) -> Result<(), (u16, String)> {
+fn authorize(state: &Arc<ApiState>, headers: &HeaderMap) -> Result<(), (u16, String)> {
     let token = state
         .shared
         .lock()
@@ -319,12 +434,10 @@ fn authorize(state: &Arc<ApiState>, request: &tiny_http::Request) -> Result<(), 
     if token.is_empty() {
         return Ok(());
     }
-    let header = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .map(|h| h.value.as_str().to_string())
-        .unwrap_or_default();
+    let header = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let supplied = header.strip_prefix("Bearer ").unwrap_or("");
     if constant_time_eq(supplied.as_bytes(), token.as_bytes()) {
         Ok(())
@@ -344,16 +457,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn read_body(request: &mut tiny_http::Request) -> Result<String> {
-    let mut text = String::new();
-    request
-        .as_reader()
-        .read_to_string(&mut text)
-        .context("reading the request body")?;
-    Ok(text)
-}
-
-fn projects_json(state: &Arc<ApiState>) -> Value {
+pub fn projects_json(state: &Arc<ApiState>) -> Value {
     let shared = state.shared.lock().expect("shared");
     let state_dir = shared.state_dir.clone();
     let list: Vec<Value> = shared
@@ -361,6 +465,10 @@ fn projects_json(state: &Arc<ApiState>) -> Value {
         .iter()
         .map(|p| {
             let cfg_p = shared.config.project(&p.name);
+            let trigger_mode = cfg_p
+                .map(|c| c.effective_trigger_mode(&shared.config.general))
+                .unwrap_or_else(|| shared.config.general.effective_trigger_mode())
+                .as_str();
             let mut value = json!({
                 "name": p.name,
                 "branch": p.branch,
@@ -382,6 +490,7 @@ fn projects_json(state: &Arc<ApiState>) -> Value {
                 "watch_prs": cfg_p.map(|c| c.watch_prs).unwrap_or(false),
                 "watch_tags": cfg_p.map(|c| c.watch_tags).unwrap_or(false),
                 "deploy_refs": cfg_p.map(|c| c.deploy_refs.clone()).unwrap_or_default(),
+                "trigger_mode": trigger_mode,
             });
             if let Some(err) = &p.last_error {
                 value["last_error"] = json!(err);
@@ -448,41 +557,30 @@ fn lookup_run(state_dir: &Path, id: &str) -> Option<Run> {
 
 fn handle_step_log(
     state: &Arc<ApiState>,
-    request: tiny_http::Request,
     id: &str,
     index: &str,
     params: &BTreeMap<String, String>,
-) -> Result<()> {
+) -> Response {
     let state_dir = state.shared.lock().expect("shared").state_dir.clone();
     let Some(run) = lookup_run(&state_dir, id) else {
-        return request
-            .respond(error_response(404, "unknown run"))
-            .map_err(Into::into);
+        return error_response(404, "unknown run");
     };
     let Ok(index) = index.parse::<usize>() else {
-        return request
-            .respond(error_response(404, "bad step index"))
-            .map_err(Into::into);
+        return error_response(404, "bad step index");
     };
     if index >= run.steps.len() {
-        return request
-            .respond(error_response(404, "step index out of range"))
-            .map_err(Into::into);
+        return error_response(404, "step index out of range");
     }
     let path = model::run_log_path(&state_dir, &run.project, &run.id, index);
     if !path.is_file() {
-        return request
-            .respond(text_response("text/plain; charset=utf-8", String::new()))
-            .map_err(Into::into);
+        return text_response("text/plain; charset=utf-8", String::new());
     }
     let tail = params.get("tail").and_then(|v| v.parse::<usize>().ok());
     let body = match tail {
         Some(n) => model::tail_lines(&path, n).unwrap_or_default(),
         None => std::fs::read_to_string(&path).unwrap_or_default(),
     };
-    request
-        .respond(text_response("text/plain; charset=utf-8", body))
-        .map_err(Into::into)
+    text_response("text/plain; charset=utf-8", body)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -501,72 +599,52 @@ struct TriggerBody {
     pr_number: Option<u64>,
 }
 
-fn handle_trigger(
-    state: &Arc<ApiState>,
-    mut request: tiny_http::Request,
-    name: &str,
-) -> Result<()> {
-    let body = read_body(&mut request).unwrap_or_default();
+fn handle_trigger(state: &Arc<ApiState>, body: &str, name: &str) -> Response {
     let parsed: TriggerBody = if body.trim().is_empty() {
         TriggerBody::default()
     } else {
-        match serde_json::from_str(&body) {
+        match serde_json::from_str(body) {
             Ok(b) => b,
-            Err(e) => {
-                return request
-                    .respond(error_response(400, &format!("invalid JSON: {e}")))
-                    .map_err(Into::into)
-            }
+            Err(e) => return error_response(400, &format!("invalid JSON: {e}")),
         }
     };
 
     let req_sha = parsed.sha.filter(|s| !s.is_empty());
     if let Some(ref s) = req_sha {
         if !git::is_valid_sha(s) {
-            return request
-                .respond(error_response(400, "invalid commit sha"))
-                .map_err(Into::into);
+            return error_response(400, "invalid commit sha");
         }
     }
     let req_git_ref = parsed.git_ref.filter(|r| !r.is_empty());
     if let Some(ref r) = req_git_ref {
         if !git::is_valid_git_ref(r) {
-            return request
-                .respond(error_response(400, "invalid git ref"))
-                .map_err(Into::into);
+            return error_response(400, "invalid git ref");
         }
     }
 
-    let (running, known, upstream, branch, pr_summary) = {
+    let (running, known, branch, pr_summary) = {
         let shared = state.shared.lock().expect("shared");
         match shared.projects.iter().find(|p| p.name == name) {
             Some(p) => (
                 p.running,
                 true,
-                p.upstream_sha.clone(),
                 p.branch.clone(),
                 parsed
                     .pr_number
                     .and_then(|num| p.open_prs.iter().find(|pr| pr.number == num).cloned()),
             ),
-            None => (false, false, None, String::new(), None),
+            None => (false, false, String::new(), None),
         }
     };
     if !known {
-        return request
-            .respond(error_response(404, "unknown project"))
-            .map_err(Into::into);
+        return error_response(404, "unknown project");
     }
     let tx = state.commands.lock().expect("commands").get(name).cloned();
     let Some(tx) = tx else {
-        return request
-            .respond(error_response(503, "project worker is not running"))
-            .map_err(Into::into);
+        return error_response(503, "project worker is not running");
     };
     if running {
-        return request
-            .respond(error_response(409, "project is already running"))
-            .map_err(Into::into);
+        return error_response(409, "project is already running");
     }
 
     let pr_ctx = parsed.pr_number.map(|num| match &pr_summary {
@@ -588,23 +666,8 @@ fn handle_trigger(
     let resolved_sha = req_sha.or_else(|| pr_summary.as_ref().map(|pr| pr.head_sha.clone()));
     if let Some(ref s) = resolved_sha {
         if !git::is_valid_sha(s) {
-            return request
-                .respond(error_response(400, "invalid commit sha"))
-                .map_err(Into::into);
+            return error_response(400, "invalid commit sha");
         }
-    }
-
-    if resolved_sha.is_none()
-        && upstream.is_none()
-        && parsed.pr_number.is_none()
-        && req_git_ref.is_none()
-    {
-        return request
-            .respond(error_response(
-                409,
-                "no upstream sha yet; wait for the first poll",
-            ))
-            .map_err(Into::into);
     }
 
     let trigger = if parsed.pr_number.is_some() {
@@ -625,9 +688,7 @@ fn handle_trigger(
     });
     if let Some(ref r) = git_ref {
         if !git::is_valid_git_ref(r) {
-            return request
-                .respond(error_response(400, "invalid git ref"))
-                .map_err(Into::into);
+            return error_response(400, "invalid git ref");
         }
     }
 
@@ -640,9 +701,7 @@ fn handle_trigger(
         deploy_only: parsed.deploy_only,
         force_deploy: parsed.force_deploy,
     });
-    request
-        .respond(json_response(202, &json!({"queued": true})))
-        .map_err(Into::into)
+    json_response(202, &json!({"queued": true}))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -653,31 +712,20 @@ struct DeployBody {
     skip_ci: Option<bool>,
 }
 
-fn handle_deploy_project(
-    state: &Arc<ApiState>,
-    mut request: tiny_http::Request,
-    name: &str,
-) -> Result<()> {
-    let body = read_body(&mut request).unwrap_or_default();
+fn handle_deploy_project(state: &Arc<ApiState>, body: &str, name: &str) -> Response {
     let parsed: DeployBody = if body.trim().is_empty() {
         DeployBody::default()
     } else {
-        match serde_json::from_str(&body) {
+        match serde_json::from_str(body) {
             Ok(b) => b,
-            Err(e) => {
-                return request
-                    .respond(error_response(400, &format!("invalid JSON: {e}")))
-                    .map_err(Into::into)
-            }
+            Err(e) => return error_response(400, &format!("invalid JSON: {e}")),
         }
     };
 
     let req_sha = parsed.sha.filter(|s| !s.trim().is_empty());
     if let Some(ref s) = req_sha {
         if !git::is_valid_sha(s) {
-            return request
-                .respond(error_response(400, "invalid commit sha"))
-                .map_err(Into::into);
+            return error_response(400, "invalid commit sha");
         }
     }
 
@@ -688,29 +736,19 @@ fn handle_deploy_project(
         match (cfg_p, state_p) {
             (Some(c), Some(s)) => (c, s.running, s.upstream_sha.clone(), s.last_sha.clone()),
             (Some(c), None) => (c, false, None, None),
-            (None, _) => {
-                return request
-                    .respond(error_response(404, "unknown project"))
-                    .map_err(Into::into);
-            }
+            (None, _) => return error_response(404, "unknown project"),
         }
     };
 
     if project_cfg.deploy.is_empty() {
-        return request
-            .respond(error_response(400, "project has no deploy steps"))
-            .map_err(Into::into);
+        return error_response(400, "project has no deploy steps");
     }
     if running {
-        return request
-            .respond(error_response(409, "project is already running"))
-            .map_err(Into::into);
+        return error_response(409, "project is already running");
     }
     let tx = state.commands.lock().expect("commands").get(name).cloned();
     let Some(tx) = tx else {
-        return request
-            .respond(error_response(503, "project worker is not running"))
-            .map_err(Into::into);
+        return error_response(503, "project worker is not running");
     };
 
     let target_sha = req_sha
@@ -718,17 +756,13 @@ fn handle_deploy_project(
         .or(last_sha)
         .or_else(|| git::rev_parse(&project_cfg.repo_path, "HEAD").ok());
     let Some(target_sha) = target_sha else {
-        return request
-            .respond(error_response(
-                409,
-                "no resolvable sha yet; pass sha explicitly or wait for the first poll",
-            ))
-            .map_err(Into::into);
+        return error_response(
+            409,
+            "no resolvable sha yet; pass sha explicitly or wait for the first poll",
+        );
     };
     if !git::is_valid_sha(&target_sha) {
-        return request
-            .respond(error_response(400, "invalid commit sha"))
-            .map_err(Into::into);
+        return error_response(400, "invalid commit sha");
     }
 
     let deploy_only = parsed.skip_ci.unwrap_or(true);
@@ -741,16 +775,14 @@ fn handle_deploy_project(
         deploy_only,
         force_deploy: true,
     });
-    request
-        .respond(json_response(
-            202,
-            &json!({
-                "queued": true,
-                "sha": target_sha,
-                "deploy_only": deploy_only,
-            }),
-        ))
-        .map_err(Into::into)
+    json_response(
+        202,
+        &json!({
+            "queued": true,
+            "sha": target_sha,
+            "deploy_only": deploy_only,
+        }),
+    )
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -761,36 +793,23 @@ struct RunDeployBody {
     allow_pr: bool,
 }
 
-fn handle_deploy_run(
-    state: &Arc<ApiState>,
-    mut request: tiny_http::Request,
-    id: &str,
-) -> Result<()> {
-    let body = read_body(&mut request).unwrap_or_default();
+fn handle_deploy_run(state: &Arc<ApiState>, body: &str, id: &str) -> Response {
     let parsed: RunDeployBody = if body.trim().is_empty() {
         RunDeployBody::default()
     } else {
-        match serde_json::from_str(&body) {
+        match serde_json::from_str(body) {
             Ok(b) => b,
-            Err(e) => {
-                return request
-                    .respond(error_response(400, &format!("invalid JSON: {e}")))
-                    .map_err(Into::into)
-            }
+            Err(e) => return error_response(400, &format!("invalid JSON: {e}")),
         }
     };
 
     let state_dir = state.shared.lock().expect("shared").state_dir.clone();
     let Some(run) = model::read_run(&state_dir, id) else {
-        return request
-            .respond(error_response(404, "unknown run"))
-            .map_err(Into::into);
+        return error_response(404, "unknown run");
     };
 
     if run.pr_number.is_some() && !parsed.allow_pr {
-        return request
-            .respond(error_response(400, "cannot deploy a pull request build"))
-            .map_err(Into::into);
+        return error_response(400, "cannot deploy a pull request build");
     }
 
     let (project_cfg, running) = {
@@ -803,23 +822,15 @@ fn handle_deploy_run(
             .is_some_and(|p| p.running);
         match cfg_p {
             Some(c) => (c, is_running),
-            None => {
-                return request
-                    .respond(error_response(404, "unknown project"))
-                    .map_err(Into::into);
-            }
+            None => return error_response(404, "unknown project"),
         }
     };
 
     if project_cfg.deploy.is_empty() {
-        return request
-            .respond(error_response(400, "project has no deploy steps"))
-            .map_err(Into::into);
+        return error_response(400, "project has no deploy steps");
     }
     if running {
-        return request
-            .respond(error_response(409, "project is already running"))
-            .map_err(Into::into);
+        return error_response(409, "project is already running");
     }
     let tx = state
         .commands
@@ -828,9 +839,7 @@ fn handle_deploy_run(
         .get(&run.project)
         .cloned();
     let Some(tx) = tx else {
-        return request
-            .respond(error_response(503, "project worker is not running"))
-            .map_err(Into::into);
+        return error_response(503, "project worker is not running");
     };
 
     let deploy_only = parsed.skip_ci.unwrap_or(true);
@@ -858,18 +867,16 @@ fn handle_deploy_run(
         deploy_only,
         force_deploy: true,
     });
-    request
-        .respond(json_response(
-            202,
-            &json!({
-                "queued": true,
-                "sha": run.sha,
-                "deploy_only": deploy_only,
-                "run_id": run.id,
-                "project": run.project,
-            }),
-        ))
-        .map_err(Into::into)
+    json_response(
+        202,
+        &json!({
+            "queued": true,
+            "sha": run.sha,
+            "deploy_only": deploy_only,
+            "run_id": run.id,
+            "project": run.project,
+        }),
+    )
 }
 
 fn remove_docker_volumes_with_prefix(prefix: &str, wsl: bool) -> Vec<String> {
@@ -918,7 +925,7 @@ fn remove_docker_volumes_with_prefix(prefix: &str, wsl: bool) -> Vec<String> {
     removed
 }
 
-fn handle_clear_cache(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
+fn handle_clear_cache(state: &Arc<ApiState>) -> Response {
     const MANAGED_CACHE_SUBDIRS: &[&str] = &["act-actions", "act-cache-server", "projects"];
     let (cache_dir, wsl) = {
         let shared = state.shared.lock().expect("shared");
@@ -942,19 +949,10 @@ fn handle_clear_cache(state: &Arc<ApiState>, request: tiny_http::Request) -> Res
         }
     }
     removed.extend(remove_docker_volumes_with_prefix("lunacy-cache-", wsl));
-    request
-        .respond(json_response(
-            200,
-            &json!({"cleared": true, "removed": removed}),
-        ))
-        .map_err(Into::into)
+    json_response(200, &json!({"cleared": true, "removed": removed}))
 }
 
-fn handle_clear_project_cache(
-    state: &Arc<ApiState>,
-    request: tiny_http::Request,
-    name: &str,
-) -> Result<()> {
+fn handle_clear_project_cache(state: &Arc<ApiState>, name: &str) -> Response {
     let (known, cache_dir, wsl) = {
         let shared = state.shared.lock().expect("shared");
         let known = shared.config.project(name).is_some();
@@ -966,9 +964,7 @@ fn handle_clear_project_cache(
         )
     };
     if !known {
-        return request
-            .respond(error_response(404, "unknown project"))
-            .map_err(Into::into);
+        return error_response(404, "unknown project");
     }
     let slug = config::project_cache_slug(name);
     let mut removed = Vec::new();
@@ -980,71 +976,240 @@ fn handle_clear_project_cache(
         &format!("lunacy-cache-{slug}-"),
         wsl,
     ));
-    request
-        .respond(json_response(
-            200,
-            &json!({"cleared": true, "project": name, "removed": removed}),
-        ))
-        .map_err(Into::into)
+    json_response(
+        200,
+        &json!({"cleared": true, "project": name, "removed": removed}),
+    )
 }
 
-fn handle_cancel_run(state: &Arc<ApiState>, request: tiny_http::Request, id: &str) -> Result<()> {
-    let (matched, state_dir) = {
+fn handle_cancel_run(state: &Arc<ApiState>, id: &str) -> Response {
+    let (matched, state_dir, ws) = {
         let shared = state.shared.lock().expect("shared");
-        (shared.cancel_run(id), shared.state_dir.clone())
+        (
+            shared.cancel_run(id),
+            shared.state_dir.clone(),
+            shared.ws.clone(),
+        )
     };
     if let Some((project, run_id)) = matched {
-        return request
-            .respond(json_response(
-                202,
-                &json!({
-                    "cancelling": true,
-                    "run_id": run_id,
-                    "project": project,
-                }),
-            ))
-            .map_err(Into::into);
+        return json_response(
+            202,
+            &json!({
+                "cancelling": true,
+                "cancelled": false,
+                "orphaned": false,
+                "run_id": run_id,
+                "project": project,
+            }),
+        );
     }
-    if lookup_run(&state_dir, id).is_some() {
-        return request
-            .respond(error_response(409, "run is not running"))
-            .map_err(Into::into);
+    let Some(run) = lookup_run(&state_dir, id) else {
+        return error_response(404, "run not found");
+    };
+    if !run.status.is_running() {
+        return error_response(409, "run is not running");
     }
-    request
-        .respond(error_response(404, "run not found"))
-        .map_err(Into::into)
+    // Re-check under the shared lock right before touching disk in case the run became live.
+    if let Some((project, run_id)) = state.shared.lock().expect("shared").cancel_run(&run.id) {
+        return json_response(
+            202,
+            &json!({
+                "cancelling": true,
+                "cancelled": false,
+                "orphaned": false,
+                "run_id": run_id,
+                "project": project,
+            }),
+        );
+    }
+    let (updated, appended_logs) = match model::reconcile_orphaned_run_with_logs(
+        &state_dir,
+        run,
+        "cancelled via API (run was orphaned / no longer active)",
+    ) {
+        Ok(res) => res,
+        Err(e) => {
+            log::warn!("failed to reconcile orphaned run {id}: {e}");
+            return error_response(500, "failed to cancel orphaned run");
+        }
+    };
+    {
+        let mut shared = state.shared.lock().expect("shared");
+        if let Some(p) = shared
+            .projects
+            .iter_mut()
+            .find(|p| p.name == updated.project)
+        {
+            if !p.running && p.current_run.as_ref().is_some_and(|r| r.id == updated.id) {
+                p.current_run = None;
+            }
+            if p.last_run.as_ref().is_some_and(|r| r.id == updated.id) {
+                p.last_run = Some(updated.clone());
+            }
+        }
+    }
+    for appended in appended_logs {
+        ws.emit_log_chunk(&updated.id, appended.step, appended.chunk, appended.new_len);
+    }
+    ws.emit_run_updated(&updated);
+    ws.emit_projects_updated();
+    json_response(
+        202,
+        &json!({
+            "cancelling": true,
+            "cancelled": true,
+            "orphaned": true,
+            "run_id": updated.id,
+            "project": updated.project,
+        }),
+    )
 }
 
-fn handle_cancel_project(
+fn finish_reconciled_project_runs(
     state: &Arc<ApiState>,
-    request: tiny_http::Request,
+    ws: &crate::ws::WsHub,
     name: &str,
-) -> Result<()> {
-    let outcome = {
+    reconciled: &[(Run, Vec<model::AppendedLogChunk>)],
+) {
+    if reconciled.is_empty() {
+        return;
+    }
+    {
+        let mut shared = state.shared.lock().expect("shared");
+        if let Some(p) = shared.projects.iter_mut().find(|p| p.name == name) {
+            if !p.running {
+                if let Some(cur) = &p.current_run {
+                    if reconciled.iter().any(|(r, _)| r.id == cur.id) {
+                        p.current_run = None;
+                    }
+                }
+            }
+            if let Some(lr) = &p.last_run {
+                if let Some((updated, _)) = reconciled.iter().find(|(r, _)| r.id == lr.id) {
+                    p.last_run = Some(updated.clone());
+                }
+            }
+        }
+    }
+    for (run, appended_logs) in reconciled {
+        for appended in appended_logs {
+            ws.emit_log_chunk(
+                &run.id,
+                appended.step,
+                appended.chunk.clone(),
+                appended.new_len,
+            );
+        }
+        ws.emit_run_updated(run);
+    }
+    ws.emit_projects_updated();
+}
+
+fn handle_cancel_project(state: &Arc<ApiState>, name: &str) -> Response {
+    let (outcome, state_dir, last_run, ws) = {
         let shared = state.shared.lock().expect("shared");
-        shared.cancel_project(name)
+        let outcome = shared.cancel_project(name);
+        let last_run = shared
+            .projects
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| p.last_run.clone());
+        (
+            outcome,
+            shared.state_dir.clone(),
+            last_run,
+            shared.ws.clone(),
+        )
     };
     match outcome {
-        crate::daemon::CancelProjectOutcome::Cancelling(run_id) => request
-            .respond(json_response(
+        crate::daemon::CancelProjectOutcome::Cancelling(run_id) => json_response(
+            202,
+            &json!({
+                "cancelling": true,
+                "cancelled": false,
+                "orphaned": false,
+                "run_id": run_id,
+                "project": name,
+            }),
+        ),
+        crate::daemon::CancelProjectOutcome::NotFound => error_response(404, "project not found"),
+        crate::daemon::CancelProjectOutcome::NotRunning => {
+            let mut candidates: Vec<Run> = model::list_runs(&state_dir, name, usize::MAX)
+                .into_iter()
+                .filter(|r| r.status.is_running())
+                .collect();
+            if let Some(lr) = last_run {
+                if lr.status.is_running() && !candidates.iter().any(|r| r.id == lr.id) {
+                    candidates.push(lr);
+                }
+            }
+            if candidates.is_empty() {
+                return error_response(409, "project is not running");
+            }
+            let mut reconciled: Vec<(Run, Vec<model::AppendedLogChunk>)> = Vec::new();
+            for run in candidates {
+                // Re-check under the shared lock right before reconciling each run on disk.
+                let live_match = {
+                    let shared = state.shared.lock().expect("shared");
+                    shared
+                        .projects
+                        .iter()
+                        .find(|p| p.name == name)
+                        .and_then(|p| {
+                            if p.running && p.current_run.as_ref().is_some_and(|r| r.id == run.id) {
+                                if let Some(flag) = &p.cancel {
+                                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                Some(run.id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                };
+                if let Some(live_run_id) = live_match {
+                    finish_reconciled_project_runs(state, &ws, name, &reconciled);
+                    return json_response(
+                        202,
+                        &json!({
+                            "cancelling": true,
+                            "cancelled": false,
+                            "orphaned": false,
+                            "run_id": live_run_id,
+                            "project": name,
+                        }),
+                    );
+                }
+                match model::reconcile_orphaned_run_with_logs(
+                    &state_dir,
+                    run,
+                    "cancelled via API (run was orphaned / no longer active)",
+                ) {
+                    Ok(res) => reconciled.push(res),
+                    Err(e) => {
+                        log::warn!("[{name}] failed to reconcile orphaned run: {e}");
+                    }
+                }
+            }
+            if reconciled.is_empty() {
+                return error_response(500, "failed to cancel orphaned run");
+            }
+            let first_id = reconciled[0].0.id.clone();
+            finish_reconciled_project_runs(state, &ws, name, &reconciled);
+            json_response(
                 202,
                 &json!({
                     "cancelling": true,
-                    "run_id": run_id,
+                    "cancelled": true,
+                    "orphaned": true,
+                    "run_id": first_id,
                     "project": name,
                 }),
-            ))
-            .map_err(Into::into),
-        crate::daemon::CancelProjectOutcome::NotRunning => request
-            .respond(error_response(409, "project is not running"))
-            .map_err(Into::into),
-        crate::daemon::CancelProjectOutcome::NotFound => request
-            .respond(error_response(404, "project not found"))
-            .map_err(Into::into),
+            )
+        }
     }
 }
 
-fn handle_deploy_checks(state: &Arc<ApiState>, request: tiny_http::Request) -> Result<()> {
+fn handle_deploy_checks(state: &Arc<ApiState>) -> Response {
     let (cfg, snapshots, state_dir) = {
         let shared = state.shared.lock().expect("shared");
         let snaps: Vec<crate::deploy_check::ProjectSnapshot> =
@@ -1057,32 +1222,26 @@ fn handle_deploy_checks(state: &Arc<ApiState>, request: tiny_http::Request) -> R
         &state_dir,
         crate::config::Os::current(),
     );
-    let body = serde_json::to_value(report)?;
-    request
-        .respond(json_response(200, &body))
-        .map_err(Into::into)
+    match serde_json::to_value(report) {
+        Ok(body) => json_response(200, &body),
+        Err(e) => error_response(500, &format!("serialising deploy checks: {e}")),
+    }
 }
 
 // ------------------------------------------------------------ workflows
 
 fn handle_workflows(
     state: &Arc<ApiState>,
-    request: tiny_http::Request,
     name: &str,
     params: &BTreeMap<String, String>,
-) -> Result<()> {
+) -> Response {
     let repo_path = match params.get("repo_path") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => {
             let shared = state.shared.lock().expect("shared");
             match shared.config.project(name) {
                 Some(p) => p.repo_path.clone(),
-                None => {
-                    drop(shared);
-                    return request
-                        .respond(error_response(404, "unknown project"))
-                        .map_err(Into::into);
-                }
+                None => return error_response(404, "unknown project"),
             }
         }
     };
@@ -1124,36 +1283,26 @@ fn handle_workflows(
             }));
         }
     }
-    request
-        .respond(json_response(200, &Value::Array(out)))
-        .map_err(Into::into)
+    json_response(200, &Value::Array(out))
 }
 
 // --------------------------------------------------------------- config
 
-fn handle_put_config(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Result<()> {
-    let body = read_body(&mut request)?;
+fn handle_put_config(state: &Arc<ApiState>, body: &str) -> Response {
     let old = state.shared.lock().expect("shared").config.clone();
-    let mut incoming: Config = match serde_json::from_str(&body) {
+    let mut incoming: Config = match serde_json::from_str(body) {
         Ok(c) => c,
         Err(e) => {
-            return request
-                .respond(json_response(
-                    400,
-                    &json!({"error": format!("invalid config: {e}"), "field": Value::Null}),
-                ))
-                .map_err(Into::into)
+            return json_response(
+                400,
+                &json!({"error": format!("invalid config: {e}"), "field": Value::Null}),
+            );
         }
     };
     incoming.unmask_from(&old);
 
     if let Err(e) = incoming.validate() {
-        return request
-            .respond(json_response(
-                400,
-                &json!({"error": e.message, "field": e.field}),
-            ))
-            .map_err(Into::into);
+        return json_response(400, &json!({"error": e.message, "field": e.field}));
     }
 
     let path = &state.config_path;
@@ -1161,27 +1310,23 @@ fn handle_put_config(state: &Arc<ApiState>, mut request: tiny_http::Request) -> 
     let text = match crate::configfile::render(&existing, &incoming) {
         Ok(t) => t,
         Err(e) => {
-            return request
-                .respond(json_response(
-                    400,
-                    &json!({"error": format!("cannot serialise the config: {e:#}"), "field": Value::Null}),
-                ))
-                .map_err(Into::into)
+            return json_response(
+                400,
+                &json!({"error": format!("cannot serialise the config: {e:#}"), "field": Value::Null}),
+            );
         }
     };
 
     if let Err(e) = crate::configfile::write_atomic(path, &text) {
-        return request
-            .respond(json_response(
-                500,
-                &json!({"error": format!("writing {}: {e:#}", path.display()), "field": Value::Null}),
-            ))
-            .map_err(Into::into);
+        return json_response(
+            500,
+            &json!({"error": format!("writing {}: {e:#}", path.display()), "field": Value::Null}),
+        );
     }
 
     // Reload: idle workers pick it up on their next turn; a running pipeline
     // keeps the config it started with.
-    let restarted = {
+    let (restarted, ws) = {
         let mut shared = state.shared.lock().expect("shared");
         shared.config = incoming.clone();
         // Refresh the read models for added/removed/reordered projects.
@@ -1192,7 +1337,7 @@ fn handle_put_config(state: &Arc<ApiState>, mut request: tiny_http::Request) -> 
             if let Some(pos) = old_projects.iter().position(|p| p.name == project.name) {
                 let mut existing = old_projects.remove(pos);
                 existing.branch = project.branch.clone();
-                existing.github_repo = project.github_repo.clone();
+                existing.github_repo = crate::daemon::resolve_github_repo(project);
                 if !project.watch_prs {
                     existing.open_prs.clear();
                 }
@@ -1202,7 +1347,7 @@ fn handle_put_config(state: &Arc<ApiState>, mut request: tiny_http::Request) -> 
             }
         }
         shared.projects = ordered;
-        shared.server_restart_needed()
+        (shared.server_restart_needed(), shared.ws.clone())
     };
 
     let commands: Vec<(String, Sender<Command>)> = state
@@ -1221,13 +1366,17 @@ fn handle_put_config(state: &Arc<ApiState>, mut request: tiny_http::Request) -> 
         *n += 1;
     }
 
-    let mut out = serde_json::to_value(incoming.masked())?;
+    ws.emit_config_updated();
+    ws.emit_projects_updated();
+
+    let mut out = match serde_json::to_value(incoming.masked()) {
+        Ok(v) => v,
+        Err(e) => return error_response(500, &format!("serialising config: {e}")),
+    };
     if restarted {
         out["restart_required"] = json!(["server.listen"]);
     }
-    request
-        .respond(json_response(200, &out))
-        .map_err(Into::into)
+    json_response(200, &out)
 }
 
 // -------------------------------------------------------------- webhook
@@ -1236,6 +1385,8 @@ fn handle_put_config(state: &Arc<ApiState>, mut request: tiny_http::Request) -> 
 struct WebhookPayload {
     #[serde(default)]
     action: Option<String>,
+    #[serde(default)]
+    zen: Option<String>,
     #[serde(default)]
     repository: Option<WebhookRepo>,
     #[serde(default)]
@@ -1334,8 +1485,37 @@ pub fn signature_header(secret: &str, body: &[u8]) -> String {
     )
 }
 
+fn project_github_repo(p: &crate::daemon::ProjectState, cfg: &Config) -> Option<String> {
+    p.github_repo.clone().or_else(|| {
+        cfg.project(&p.name)
+            .and_then(crate::daemon::resolve_github_repo)
+    })
+}
+
+fn record_webhook(
+    state: &ApiState,
+    event: &str,
+    repo: Option<String>,
+    delivery_id: Option<String>,
+    outcome: &str,
+    queued: bool,
+) {
+    let received_at = model::now_iso();
+    let ws = {
+        let mut shared = state.shared.lock().expect("shared");
+        shared.webhook_stats.deliveries = shared.webhook_stats.deliveries.saturating_add(1);
+        shared.webhook_stats.last_event = Some(event.to_string());
+        shared.webhook_stats.last_repo = repo.clone();
+        shared.webhook_stats.last_delivery_id = delivery_id.clone();
+        shared.webhook_stats.last_received_at = Some(received_at.clone());
+        shared.webhook_stats.last_outcome = Some(outcome.to_string());
+        shared.ws.clone()
+    };
+    ws.emit_webhook_received(event, repo, delivery_id, outcome, received_at, queued);
+}
+
 #[allow(clippy::too_many_lines)]
-fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Result<()> {
+fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8]) -> Response {
     let secret = state
         .shared
         .lock()
@@ -1343,45 +1523,34 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
         .config
         .github
         .as_ref()
-        .and_then(|g| g.app.as_ref())
-        .and_then(|a| a.webhook_secret_value())
+        .and_then(|g| g.webhook_secret_value())
         .filter(|s| !s.is_empty() && s != MASK);
     let Some(secret) = secret else {
-        return request
-            .respond(error_response(404, "no webhook secret configured"))
-            .map_err(Into::into);
+        return error_response(404, "no webhook secret configured");
     };
 
-    let mut body = String::new();
-    request
-        .as_reader()
-        .read_to_string(&mut body)
-        .context("reading the webhook body")?;
-    let sig_header = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("X-Hub-Signature-256"))
-        .map(|h| h.value.as_str().to_string())
-        .unwrap_or_default();
-    let event_header = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("X-GitHub-Event"))
-        .map(|h| h.value.as_str().trim().to_ascii_lowercase());
+    let sig_header = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let event_header = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase());
+    let delivery_id = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    if !verify_signature(&secret, body.as_bytes(), &sig_header) {
-        return request
-            .respond(error_response(401, "invalid signature"))
-            .map_err(Into::into);
+    if !verify_signature(&secret, body_bytes, sig_header) {
+        return error_response(401, "invalid signature");
     }
 
+    let body = String::from_utf8_lossy(body_bytes);
     let payload: WebhookPayload = match serde_json::from_str(&body) {
         Ok(p) => p,
-        Err(e) => {
-            return request
-                .respond(error_response(400, &format!("invalid JSON: {e}")))
-                .map_err(Into::into)
-        }
+        Err(e) => return error_response(400, &format!("invalid JSON: {e}")),
     };
 
     let event_kind = match event_header.as_deref() {
@@ -1395,31 +1564,51 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
     let commands = state.commands.lock().expect("commands").clone();
 
     match event_kind {
+        "ping" => {
+            let zen = payload.zen.unwrap_or_default();
+            record_webhook(state, "ping", full_name, delivery_id, "pong", false);
+            json_response(200, &json!({"ok": true, "pong": true, "zen": zen}))
+        }
         "pull_request" => {
             let action = payload.action.as_deref().unwrap_or("");
             if !matches!(action, "opened" | "synchronize" | "reopened") {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "ignored action"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "ignored action",
+                    false,
+                );
+                return json_response(202, &json!({"queued": false, "reason": "ignored action"}));
             }
             let Some(pr) = payload.pull_request else {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "missing pull_request"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "missing pull_request",
+                    false,
+                );
+                return json_response(
+                    202,
+                    &json!({"queued": false, "reason": "missing pull_request"}),
+                );
             };
             let Some(number) = pr.number else {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "missing pull_request.number"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "missing pull_request.number",
+                    false,
+                );
+                return json_response(
+                    202,
+                    &json!({"queued": false, "reason": "missing pull_request.number"}),
+                );
             };
             let head = pr.head.unwrap_or(WebhookPrRef {
                 sha: None,
@@ -1457,74 +1646,87 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
                 _ => false,
             };
             if !is_same_repo {
-                return request
-                    .respond(json_response(
-                        200,
-                        &json!({"ignored": true, "reason": "fork pull request"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "fork pull request",
+                    false,
+                );
+                return json_response(
+                    200,
+                    &json!({"ignored": true, "reason": "fork pull request"}),
+                );
             }
             let Some(head_sha) = head.sha.filter(|s| !s.is_empty()) else {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "no head_sha"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "no head_sha",
+                    false,
+                );
+                return json_response(202, &json!({"queued": false, "reason": "no head_sha"}));
             };
             if !git::is_valid_sha(&head_sha) {
-                return request
-                    .respond(error_response(400, "invalid head_sha"))
-                    .map_err(Into::into);
+                return error_response(400, "invalid head_sha");
             }
             let head_ref = head
                 .git_ref
                 .filter(|r| !r.is_empty())
                 .unwrap_or_else(|| format!("pull/{number}"));
             if !git::is_valid_git_ref(&head_ref) {
-                return request
-                    .respond(error_response(400, "invalid head ref"))
-                    .map_err(Into::into);
+                return error_response(400, "invalid head ref");
             }
             let base_ref = base.git_ref.unwrap_or_default();
             if !base_ref.is_empty() && !git::is_valid_git_ref(&base_ref) {
-                return request
-                    .respond(error_response(400, "invalid base ref"))
-                    .map_err(Into::into);
+                return error_response(400, "invalid base ref");
             }
             let base_sha = base.sha.unwrap_or_default();
             if !base_sha.is_empty() && !git::is_valid_sha(&base_sha) {
-                return request
-                    .respond(error_response(400, "invalid base_sha"))
-                    .map_err(Into::into);
+                return error_response(400, "invalid base_sha");
             }
             let title = pr.title.unwrap_or_default();
 
+            let mut filtered_by_poll = false;
             let targets: Vec<(String, Sender<Command>)> = {
                 let shared = state.shared.lock().expect("shared");
-                shared
-                    .projects
-                    .iter()
-                    .filter(|p| match (&full_name, &p.github_repo) {
+                let mut out = Vec::new();
+                for p in &shared.projects {
+                    let have = project_github_repo(p, &shared.config);
+                    let repo_match = match (&full_name, &have) {
                         (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
                         _ => false,
-                    })
-                    .filter(|p| {
-                        shared
-                            .config
-                            .project(&p.name)
-                            .is_some_and(|cfg_p| cfg_p.watch_prs)
-                    })
-                    .filter_map(|p| commands.get(&p.name).map(|tx| (p.name.clone(), tx.clone())))
-                    .collect()
+                    };
+                    if !repo_match {
+                        continue;
+                    }
+                    let Some(cfg_p) = shared.config.project(&p.name) else {
+                        continue;
+                    };
+                    if !cfg_p.watch_prs {
+                        continue;
+                    }
+                    if cfg_p.effective_trigger_mode(&shared.config.general) == TriggerMode::Poll {
+                        filtered_by_poll = true;
+                        continue;
+                    }
+                    if let Some(tx) = commands.get(&p.name) {
+                        out.push((p.name.clone(), tx.clone()));
+                    }
+                }
+                out
             };
             if targets.is_empty() {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "no matching project"}),
-                    ))
-                    .map_err(Into::into);
+                let reason = if filtered_by_poll {
+                    "poll-only mode"
+                } else {
+                    "no matching project"
+                };
+                record_webhook(state, event_kind, full_name, delivery_id, reason, false);
+                return json_response(202, &json!({"queued": false, "reason": reason}));
             }
             let pr_ctx = PrContext {
                 number,
@@ -1546,50 +1748,51 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
                 });
                 queued.push(name);
             }
-            request
-                .respond(json_response(
-                    202,
-                    &json!({"queued": true, "projects": queued, "pr_number": number}),
-                ))
-                .map_err(Into::into)
+            let outcome = format!("queued PR #{number} for {}", queued.join(", "));
+            record_webhook(state, event_kind, full_name, delivery_id, &outcome, true);
+            json_response(
+                202,
+                &json!({"queued": true, "projects": queued, "pr_number": number}),
+            )
         }
         "push" => {
             if payload.deleted == Some(true) {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "branch or tag deleted"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "branch or tag deleted",
+                    false,
+                );
+                return json_response(
+                    202,
+                    &json!({"queued": false, "reason": "branch or tag deleted"}),
+                );
             }
             let Some(raw_ref) = payload.git_ref.filter(|r| !r.is_empty()) else {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "no ref"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(state, event_kind, full_name, delivery_id, "no ref", false);
+                return json_response(202, &json!({"queued": false, "reason": "no ref"}));
             };
             if !git::is_valid_git_ref(&raw_ref) {
-                return request
-                    .respond(error_response(400, "invalid git ref"))
-                    .map_err(Into::into);
+                return error_response(400, "invalid git ref");
             }
             let Some(after) = payload
                 .after
                 .filter(|s| !s.is_empty() && s != crate::act::ZERO_SHA)
             else {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "no after sha"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "no after sha",
+                    false,
+                );
+                return json_response(202, &json!({"queued": false, "reason": "no after sha"}));
             };
             if !git::is_valid_sha(&after) {
-                return request
-                    .respond(error_response(400, "invalid after sha"))
-                    .map_err(Into::into);
+                return error_response(400, "invalid after sha");
             }
             let is_tag = raw_ref.starts_with("refs/tags/") || raw_ref.starts_with("tags/");
             let norm_ref = if let Some(tag) = raw_ref.strip_prefix("refs/tags/") {
@@ -1605,32 +1808,46 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
                 Trigger::Webhook
             };
 
+            let mut filtered_by_poll = false;
             let targets: Vec<(String, Sender<Command>)> = {
                 let shared = state.shared.lock().expect("shared");
-                shared
-                    .projects
-                    .iter()
-                    .filter(|p| match (&full_name, &p.github_repo) {
-                        (Some(want), Some(have)) => want == have,
+                let mut out = Vec::new();
+                for p in &shared.projects {
+                    let have = project_github_repo(p, &shared.config);
+                    let repo_match = match (&full_name, &have) {
+                        (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
                         _ => false,
-                    })
-                    .filter(|p| {
-                        shared.config.project(&p.name).is_some_and(|cfg_p| {
-                            raw_ref == format!("refs/heads/{}", cfg_p.branch)
-                                || config::matches_deploy_ref(cfg_p, &raw_ref, false)
-                                || (is_tag && cfg_p.watch_tags)
-                        })
-                    })
-                    .filter_map(|p| commands.get(&p.name).map(|tx| (p.name.clone(), tx.clone())))
-                    .collect()
+                    };
+                    if !repo_match {
+                        continue;
+                    }
+                    let Some(cfg_p) = shared.config.project(&p.name) else {
+                        continue;
+                    };
+                    let ref_match = raw_ref == format!("refs/heads/{}", cfg_p.branch)
+                        || config::matches_deploy_ref(cfg_p, &raw_ref, false)
+                        || (is_tag && cfg_p.watch_tags);
+                    if !ref_match {
+                        continue;
+                    }
+                    if cfg_p.effective_trigger_mode(&shared.config.general) == TriggerMode::Poll {
+                        filtered_by_poll = true;
+                        continue;
+                    }
+                    if let Some(tx) = commands.get(&p.name) {
+                        out.push((p.name.clone(), tx.clone()));
+                    }
+                }
+                out
             };
             if targets.is_empty() {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "no matching project"}),
-                    ))
-                    .map_err(Into::into);
+                let reason = if filtered_by_poll {
+                    "poll-only mode"
+                } else {
+                    "no matching project"
+                };
+                record_webhook(state, event_kind, full_name, delivery_id, reason, false);
+                return json_response(202, &json!({"queued": false, "reason": reason}));
             }
             let mut queued = Vec::new();
             for (name, tx) in targets {
@@ -1645,58 +1862,71 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
                 });
                 queued.push(name);
             }
-            request
-                .respond(json_response(
-                    202,
-                    &json!({"queued": true, "projects": queued, "ref": norm_ref}),
-                ))
-                .map_err(Into::into)
+            let outcome = format!("queued {norm_ref} for {}", queued.join(", "));
+            record_webhook(state, event_kind, full_name, delivery_id, &outcome, true);
+            json_response(
+                202,
+                &json!({"queued": true, "projects": queued, "ref": norm_ref}),
+            )
         }
         "check_run" | "check_suite" => {
             if payload.action.as_deref() != Some("rerequested") {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "ignored action"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "ignored action",
+                    false,
+                );
+                return json_response(202, &json!({"queued": false, "reason": "ignored action"}));
             }
             let sha = payload
                 .check_run
                 .and_then(|c| c.head_sha)
                 .or_else(|| payload.check_suite.and_then(|c| c.head_sha));
             let Some(sha) = sha else {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "no head_sha"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "no head_sha",
+                    false,
+                );
+                return json_response(202, &json!({"queued": false, "reason": "no head_sha"}));
             };
             if !git::is_valid_sha(&sha) {
-                return request
-                    .respond(error_response(400, "invalid head_sha"))
-                    .map_err(Into::into);
+                return error_response(400, "invalid head_sha");
             }
             let targets: Vec<(String, Sender<Command>)> = {
                 let shared = state.shared.lock().expect("shared");
                 shared
                     .projects
                     .iter()
-                    .filter(|p| match (&full_name, &p.github_repo) {
-                        (Some(want), Some(have)) => want == have,
-                        _ => false,
+                    .filter(|p| {
+                        let have = project_github_repo(p, &shared.config);
+                        match (&full_name, &have) {
+                            (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
+                            _ => false,
+                        }
                     })
                     .filter_map(|p| commands.get(&p.name).map(|tx| (p.name.clone(), tx.clone())))
                     .collect()
             };
             if targets.is_empty() {
-                return request
-                    .respond(json_response(
-                        202,
-                        &json!({"queued": false, "reason": "no matching project"}),
-                    ))
-                    .map_err(Into::into);
+                record_webhook(
+                    state,
+                    event_kind,
+                    full_name,
+                    delivery_id,
+                    "no matching project",
+                    false,
+                );
+                return json_response(
+                    202,
+                    &json!({"queued": false, "reason": "no matching project"}),
+                );
             }
             let mut queued = Vec::new();
             for (name, tx) in targets {
@@ -1711,28 +1941,54 @@ fn handle_webhook(state: &Arc<ApiState>, mut request: tiny_http::Request) -> Res
                 });
                 queued.push(name);
             }
-            request
-                .respond(json_response(
-                    202,
-                    &json!({"queued": true, "projects": queued}),
-                ))
-                .map_err(Into::into)
+            let outcome = format!("queued rerun for {}", queued.join(", "));
+            record_webhook(state, event_kind, full_name, delivery_id, &outcome, true);
+            json_response(202, &json!({"queued": true, "projects": queued}))
         }
-        _ => request
-            .respond(json_response(
-                202,
-                &json!({"queued": false, "reason": "ignored event"}),
-            ))
-            .map_err(Into::into),
+        _ => {
+            record_webhook(
+                state,
+                event_kind,
+                full_name,
+                delivery_id,
+                "ignored event",
+                false,
+            );
+            json_response(202, &json!({"queued": false, "reason": "ignored event"}))
+        }
     }
 }
 
 // -------------------------------------------------------------- system
 
 fn system_json(state: &Arc<ApiState>) -> Value {
-    let (config_path, state_dir) = {
+    let (config_path, state_dir, webhook_configured, webhook_endpoint, webhook_stats) = {
         let shared = state.shared.lock().expect("shared");
-        (state.config_path.clone(), shared.state_dir.clone())
+        let configured = shared
+            .config
+            .github
+            .as_ref()
+            .and_then(|g| g.webhook_secret_value())
+            .filter(|s| !s.is_empty() && s != MASK)
+            .is_some();
+        let endpoint = match shared
+            .config
+            .server
+            .as_ref()
+            .and_then(|s| s.public_url.as_deref())
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            Some(base) => format!("{}/api/github/webhook", base.trim_end_matches('/')),
+            None => "/api/github/webhook".to_string(),
+        };
+        (
+            state.config_path.clone(),
+            shared.state_dir.clone(),
+            configured,
+            endpoint,
+            shared.webhook_stats.clone(),
+        )
     };
     let act_path = crate::exec::which("act");
     let act_version = act_path
@@ -1762,12 +2018,22 @@ fn system_json(state: &Arc<ApiState>) -> Value {
         },
         "docker": { "ok": docker_ok, "error": docker_error },
         "git": { "version": git_version },
+        "webhook": {
+            "configured": webhook_configured,
+            "endpoint": webhook_endpoint,
+            "deliveries": webhook_stats.deliveries,
+            "last_event": webhook_stats.last_event,
+            "last_repo": webhook_stats.last_repo,
+            "last_delivery_id": webhook_stats.last_delivery_id,
+            "last_received_at": webhook_stats.last_received_at,
+            "last_outcome": webhook_stats.last_outcome,
+        },
     })
 }
 
 // --------------------------------------------------------------- static
 
-fn serve_static(state: &Arc<ApiState>, request: tiny_http::Request, path: &str) -> Result<()> {
+fn serve_static(state: &Arc<ApiState>, path: &str) -> Response {
     let root = state
         .shared
         .lock()
@@ -1777,9 +2043,7 @@ fn serve_static(state: &Arc<ApiState>, request: tiny_http::Request, path: &str) 
         .as_ref()
         .and_then(|s| s.web_root.clone());
     let Some(root) = root else {
-        return request
-            .respond(error_response(404, "no web_root configured"))
-            .map_err(Into::into);
+        return error_response(404, "no web_root configured");
     };
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
@@ -1788,18 +2052,14 @@ fn serve_static(state: &Arc<ApiState>, request: tiny_http::Request, path: &str) 
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
     {
-        return request
-            .respond(error_response(400, "bad path"))
-            .map_err(Into::into);
+        return error_response(400, "bad path");
     }
     let mut file = root.join(rel);
     if !file.is_file() {
         // SPA fallback.
         file = root.join("index.html");
         if !file.is_file() {
-            return request
-                .respond(error_response(404, "not found"))
-                .map_err(Into::into);
+            return error_response(404, "not found");
         }
     }
     let ext = file
@@ -1818,18 +2078,17 @@ fn serve_static(state: &Arc<ApiState>, request: tiny_http::Request, path: &str) 
         Some("ttf") => "font/ttf",
         _ => "application/octet-stream",
     };
-    let body = std::fs::read(&file)?;
-    let mut response = Response::from_data(body)
-        .with_header(Header::from_bytes("Content-Type", mime).expect("static header"));
+    let Ok(body) = std::fs::read(&file) else {
+        return error_response(500, "failed reading static file");
+    };
+    let mut res = (StatusCode::OK, body).into_response();
+    let headers = res.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(mime));
     if ext.as_deref() == Some("html") {
-        if let Ok(h) = Header::from_bytes("Cache-Control", "no-cache") {
-            response.add_header(h);
-        }
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     }
-    if let Ok(h) = Header::from_bytes("Access-Control-Allow-Origin", "*") {
-        response.add_header(h);
-    }
-    request.respond(response).map_err(Into::into)
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    res
 }
 
 #[cfg(test)]
@@ -1879,16 +2138,21 @@ mod tests {
     #[test]
     fn serve_static_mime_and_cache_control() {
         use std::io::{BufRead, BufReader, Write};
-        use std::net::TcpStream;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Instant;
 
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("index.html"), b"<html>root</html>").unwrap();
         std::fs::write(dir.path().join("Inter-Regular.ttf"), b"font-bytes").unwrap();
         std::fs::write(dir.path().join("app.js"), b"console.log(1);").unwrap();
 
+        let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
+        let addr = probe.local_addr().expect("addr");
+        drop(probe);
+
         let cfg = Config {
             server: Some(crate::config::ServerCfg {
-                listen: "127.0.0.1:0".into(),
+                listen: addr.to_string(),
                 token: String::new(),
                 token_file: None,
                 web_root: Some(dir.path().to_path_buf()),
@@ -1896,25 +2160,29 @@ mod tests {
             }),
             ..Config::default()
         };
+        let shared = Arc::new(Mutex::new(Shared {
+            config: cfg,
+            ..Shared::default()
+        }));
         let state = Arc::new(ApiState {
-            shared: Arc::new(Mutex::new(Shared {
-                config: cfg,
-                ..Shared::default()
-            })),
+            shared: shared.clone(),
             commands: Arc::new(Mutex::new(BTreeMap::new())),
             config_path: dir.path().join("config.toml"),
             reloads: Arc::new(Mutex::new(0)),
         });
 
-        let server = Server::http("127.0.0.1:0").expect("bind tiny_http");
-        let addr = server.server_addr().to_ip().expect("socket addr");
-        let worker_state = Arc::clone(&state);
+        let listen = addr.to_string();
         let thread = std::thread::spawn(move || {
-            for _ in 0..4 {
-                let req = server.recv().expect("recv");
-                handle(&worker_state, req).expect("handle static");
-            }
+            let _ = serve(state, &listen);
         });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
 
         let fetch_headers = |path: &str| -> BTreeMap<String, String> {
             let mut stream = TcpStream::connect(addr).expect("connect");
@@ -1978,6 +2246,7 @@ mod tests {
         );
         assert!(!js_hdrs.contains_key("cache-control"));
 
+        shared.lock().unwrap().shutdown = true;
         thread.join().expect("server thread");
     }
 }

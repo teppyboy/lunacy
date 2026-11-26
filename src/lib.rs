@@ -16,5 +16,6 @@ pub mod github_app;
 pub mod model;
 pub mod pipeline;
 pub mod report;
+pub mod ws;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

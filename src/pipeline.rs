@@ -69,6 +69,9 @@ pub fn is_default_branch_ref(project: &ProjectCfg, git_ref: &str) -> bool {
     !git_ref.starts_with("tags/") && !git_ref.starts_with("refs/tags/") && trimmed == project.branch
 }
 
+/// Callback receiving `(step_index, chunk)` for every live log chunk appended to a step's log.
+pub type LogChunkCallback = Arc<dyn Fn(usize, &str) + Send + Sync>;
+
 /// Everything a pipeline needs from the daemon.
 pub struct Ctx<'a> {
     pub cfg: &'a Config,
@@ -81,6 +84,8 @@ pub struct Ctx<'a> {
     pub act_lock: &'a Path,
     /// Optional cancellation flag; when set to `true`, the pipeline aborts promptly.
     pub cancel: Option<&'a AtomicBool>,
+    /// Optional live log-chunk callback for streaming step output (e.g. over WebSockets).
+    pub on_log_chunk: Option<LogChunkCallback>,
 }
 
 fn is_cancelled(ctx: &Ctx<'_>) -> bool {
@@ -437,10 +442,11 @@ fn run_steps(
                     if let Some(parent) = log_path.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
-                    let _ = fs::write(
-                        &log_path,
-                        format!("[lunacy] pipeline timed out after {secs}s\n"),
-                    );
+                    let msg = format!("[lunacy] pipeline timed out after {secs}s\n");
+                    let _ = fs::write(&log_path, &msg);
+                    if let Some(cb) = &ctx.on_log_chunk {
+                        cb(index, &msg);
+                    }
                     set_step(run, index, StepStatus::Timeout, Some(0), None);
                     log::info!(
                         "[{}] {} {}: timeout (pipeline timed out after {}s)",
@@ -751,8 +757,12 @@ fn run_shell_step(
         timeout: effective_timeout,
         log_path: run_log_path(ctx.state_dir, &project.name, &run.id, index),
     };
+    let log_hook: Option<LineSink> = ctx.on_log_chunk.as_ref().map(|cb| {
+        let cb = cb.clone();
+        Arc::new(move |chunk: &str| cb(index, chunk)) as LineSink
+    });
     Ok((
-        exec::exec(&exec_spec, None, ctx.cancel)?.outcome,
+        exec::exec_with_log_hook(&exec_spec, None, log_hook, ctx.cancel)?.outcome,
         Vec::new(),
     ))
 }
@@ -799,11 +809,21 @@ fn run_act_step(
         fs::create_dir_all(parent)?;
     }
     let human_log = Arc::new(Mutex::new(fs::File::create(&log_path)?));
+    let emit_human_line = |line: &str| {
+        let mut chunk = String::with_capacity(line.len() + 1);
+        chunk.push_str(line);
+        chunk.push('\n');
+        if let Ok(mut f) = human_log.lock() {
+            let _ = f.write_all(chunk.as_bytes());
+            let _ = f.flush();
+            if let Some(cb) = &ctx.on_log_chunk {
+                cb(index, &chunk);
+            }
+        }
+    };
 
     if is_cancelled(ctx) {
-        if let Ok(mut f) = human_log.lock() {
-            let _ = writeln!(f, "[lunacy] cancelled before starting act");
-        }
+        emit_human_line("[lunacy] cancelled before starting act");
         return Ok((Outcome::Cancelled, Vec::new()));
     }
 
@@ -924,17 +944,27 @@ fn run_act_step(
     let sink: LineSink = {
         let progress = progress.clone();
         let human_log = human_log.clone();
+        let on_log_chunk = ctx.on_log_chunk.clone();
         Arc::new(move |line: &str| {
-            let Ok(mut p) = progress.lock() else { return };
-            let text = match p.feed(line) {
-                Some(msg) => p.human_line(msg.trim_end()),
-                None => line.to_string(),
+            let text = {
+                let Ok(mut p) = progress.lock() else { return };
+                match p.feed(line) {
+                    Some(msg) => p.human_line(msg.trim_end()),
+                    None => line.to_string(),
+                }
             };
             if text.is_empty() {
                 return;
             }
+            let mut chunk = String::with_capacity(text.len() + 1);
+            chunk.push_str(&text);
+            chunk.push('\n');
             if let Ok(mut f) = human_log.lock() {
-                let _ = writeln!(f, "{text}");
+                let _ = f.write_all(chunk.as_bytes());
+                let _ = f.flush();
+                if let Some(cb) = &on_log_chunk {
+                    cb(index, &chunk);
+                }
             }
         })
     };
@@ -944,32 +974,24 @@ fn run_act_step(
     let _lock = match ActLock::acquire(ctx.act_lock, ctx.cancel, Some(step_deadline))? {
         LockOutcome::Acquired(lock) => lock,
         LockOutcome::Cancelled => {
-            if let Ok(mut f) = human_log.lock() {
-                let _ = writeln!(f, "[lunacy] cancelled while waiting for act lock");
-            }
+            emit_human_line("[lunacy] cancelled while waiting for act lock");
             return Ok((Outcome::Cancelled, Vec::new()));
         }
         LockOutcome::TimedOut => {
-            if let Ok(mut f) = human_log.lock() {
-                let _ = writeln!(
-                    f,
-                    "[lunacy] timed out after {}s while waiting for act lock",
-                    effective_timeout.as_secs()
-                );
-            }
+            emit_human_line(&format!(
+                "[lunacy] timed out after {}s while waiting for act lock",
+                effective_timeout.as_secs()
+            ));
             return Ok((Outcome::Timeout, Vec::new()));
         }
     };
 
     let remaining = step_deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        if let Ok(mut f) = human_log.lock() {
-            let _ = writeln!(
-                f,
-                "[lunacy] timed out after {}s",
-                effective_timeout.as_secs()
-            );
-        }
+        emit_human_line(&format!(
+            "[lunacy] timed out after {}s",
+            effective_timeout.as_secs()
+        ));
         return Ok((Outcome::Timeout, Vec::new()));
     }
 

@@ -67,6 +67,24 @@ pub enum GithubMode {
     Checks,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerMode {
+    Both,
+    Webhook,
+    Poll,
+}
+
+impl TriggerMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriggerMode::Both => "both",
+            TriggerMode::Webhook => "webhook",
+            TriggerMode::Poll => "poll",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[derive(Default)]
@@ -93,6 +111,9 @@ pub struct General {
     pub state_dir: Option<PathBuf>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval: u64,
+    /// Trigger mode across projects: "both" (default), "webhook" (skip polling), or "poll".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_mode: Option<TriggerMode>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     /// argv prefix used to run a `shell` step, e.g. `["bash", "-c"]`.
@@ -108,10 +129,17 @@ impl Default for General {
         General {
             state_dir: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            trigger_mode: None,
             log_level: default_log_level(),
             shell: None,
             step_timeout: None,
         }
+    }
+}
+
+impl General {
+    pub fn effective_trigger_mode(&self) -> TriggerMode {
+        self.trigger_mode.unwrap_or(TriggerMode::Both)
     }
 }
 
@@ -164,6 +192,12 @@ pub struct GithubCfg {
     pub token_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
+    /// Standalone webhook HMAC secret for `POST /api/github/webhook` (no GitHub App needed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
+    /// File holding the standalone webhook secret instead of the inline value; read trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<AppCfg>,
 }
@@ -192,6 +226,15 @@ impl GithubCfg {
             Some(t) if !t.is_empty() => Some(t.to_string()),
             _ => self.token_file.as_deref().and_then(read_trimmed),
         }
+    }
+
+    /// Standalone `webhook_secret` / `webhook_secret_file`, falling back to `[github.app]`.
+    pub fn webhook_secret_value(&self) -> Option<String> {
+        let standalone = match self.webhook_secret.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => Some(s.to_string()),
+            _ => self.webhook_secret_file.as_deref().and_then(read_trimmed),
+        };
+        standalone.or_else(|| self.app.as_ref().and_then(|a| a.webhook_secret_value()))
     }
 }
 
@@ -353,6 +396,9 @@ pub struct ProjectCfg {
     pub checkout: Checkout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<u64>,
+    /// Override global trigger mode: "both", "webhook" (skip polling), or "poll".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_mode: Option<TriggerMode>,
     /// Default per-step timeout in seconds for this project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_timeout: Option<u64>,
@@ -401,6 +447,11 @@ fn default_branch() -> String {
 impl ProjectCfg {
     pub fn poll_interval(&self, general: &General) -> u64 {
         self.poll_interval.unwrap_or(general.poll_interval).max(1)
+    }
+
+    pub fn effective_trigger_mode(&self, general: &General) -> TriggerMode {
+        self.trigger_mode
+            .unwrap_or_else(|| general.effective_trigger_mode())
     }
 
     pub fn effective_step_timeout(&self, general: &General) -> u64 {
@@ -630,7 +681,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> std::result::Result<(), ConfigError> {
-        if self.general.poll_interval == 0 {
+        if self.general.poll_interval == 0
+            && self.general.effective_trigger_mode() != TriggerMode::Webhook
+        {
             return Err(ConfigError::new(
                 "general.poll_interval",
                 "must be at least 1 second",
@@ -662,6 +715,16 @@ impl Config {
                 github.token_file.is_some(),
             )?;
             check_secret_file("github.token_file", github.token_file.as_deref())?;
+            conflict(
+                "github.webhook_secret",
+                non_empty(&github.webhook_secret),
+                "github.webhook_secret_file",
+                github.webhook_secret_file.is_some(),
+            )?;
+            check_secret_file(
+                "github.webhook_secret_file",
+                github.webhook_secret_file.as_deref(),
+            )?;
             if let Some(mode) = github.mode {
                 if mode == GithubMode::Checks && github.app.is_none() {
                     return Err(ConfigError::new(
@@ -804,6 +867,15 @@ impl Config {
                     ));
                 }
             }
+            let effective_poll_interval = p.poll_interval.unwrap_or(self.general.poll_interval);
+            if effective_poll_interval == 0
+                && p.effective_trigger_mode(&self.general) != TriggerMode::Webhook
+            {
+                return Err(ConfigError::new(
+                    format!("{base}.poll_interval"),
+                    "must be at least 1 second when trigger_mode polls",
+                ));
+            }
             if p.step_timeout == Some(0) {
                 return Err(ConfigError::new(
                     format!("{base}.step_timeout"),
@@ -914,6 +986,7 @@ impl Config {
         let mut c = self.clone();
         if let Some(g) = c.github.as_mut() {
             mask_opt(&mut g.token);
+            mask_opt(&mut g.webhook_secret);
             if let Some(app) = g.app.as_mut() {
                 mask_opt(&mut app.private_key);
                 mask_opt(&mut app.webhook_secret);
@@ -940,6 +1013,7 @@ impl Config {
     pub fn unmask_from(&mut self, old: &Config) {
         if let (Some(new), Some(old)) = (self.github.as_mut(), old.github.as_ref()) {
             unmask_opt(&mut new.token, &old.token);
+            unmask_opt(&mut new.webhook_secret, &old.webhook_secret);
             if let (Some(na), Some(oa)) = (new.app.as_mut(), old.app.as_ref()) {
                 unmask_opt(&mut na.private_key, &oa.private_key);
                 unmask_opt(&mut na.webhook_secret, &oa.webhook_secret);
@@ -1247,6 +1321,8 @@ chekout = "worktree"
             token: Some("t".into()),
             token_file: None,
             api_url: None,
+            webhook_secret: None,
+            webhook_secret_file: None,
             app: None,
         };
         assert_eq!(plain.effective_mode(), GithubMode::Status);
@@ -1270,6 +1346,8 @@ chekout = "worktree"
             token: Some("x".into()),
             token_file: None,
             api_url: None,
+            webhook_secret: None,
+            webhook_secret_file: None,
             app: None,
         });
         let err = cfg.validate().unwrap_err();
@@ -1284,6 +1362,8 @@ chekout = "worktree"
             token: Some("ghp_secret".into()),
             token_file: None,
             api_url: None,
+            webhook_secret: Some("wh_standalone_secret".into()),
+            webhook_secret_file: None,
             app: None,
         });
         cfg.discord = Some(DiscordCfg {
@@ -1297,6 +1377,7 @@ chekout = "worktree"
         let masked = cfg.masked();
         let json = serde_json::to_string(&masked).unwrap();
         assert!(!json.contains("ghp_secret"));
+        assert!(!json.contains("wh_standalone_secret"));
         assert!(!json.contains("ui-token"));
         assert!(json.contains(MASK));
 
@@ -1306,6 +1387,10 @@ chekout = "worktree"
         assert_eq!(
             back.github.as_ref().unwrap().token.as_deref(),
             Some("ghp_secret")
+        );
+        assert_eq!(
+            back.github.as_ref().unwrap().webhook_secret.as_deref(),
+            Some("wh_standalone_secret")
         );
         assert_eq!(back.server.as_ref().unwrap().token, "ui-token");
         assert_eq!(
@@ -1403,6 +1488,8 @@ chekout = "worktree"
             token: None,
             token_file: Some(token.clone()),
             api_url: None,
+            webhook_secret: None,
+            webhook_secret_file: None,
             app: Some(AppCfg {
                 app_id: 1,
                 private_key_path: Some(dir.path().join("missing.pem")),
@@ -1723,5 +1810,118 @@ chekout = "worktree"
             ..ActCfg::default()
         });
         cfg.validate().expect("valid cache_dir");
+    }
+
+    #[test]
+    fn trigger_mode_and_standalone_webhook_secret_validation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret_file = dir.path().join("wh.secret");
+        std::fs::write(&secret_file, "  file-secret\n").unwrap();
+
+        // Default poll_interval == 0 is rejected (Both mode).
+        let mut cfg = example();
+        cfg.general.poll_interval = 0;
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("general.poll_interval"));
+        assert!(err.message.contains("at least 1 second"), "{}", err.message);
+
+        // Webhook mode allows poll_interval == 0 globally and per-project.
+        cfg.general.trigger_mode = Some(TriggerMode::Webhook);
+        cfg.projects[0].poll_interval = Some(0);
+        cfg.validate().expect("webhook mode allows poll_interval=0");
+
+        // Overriding a project back to Poll rejects project poll_interval == 0.
+        cfg.projects[0].trigger_mode = Some(TriggerMode::Poll);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("project[0].poll_interval"));
+        assert_eq!(
+            cfg.projects[0].effective_trigger_mode(&cfg.general),
+            TriggerMode::Poll
+        );
+        assert_eq!(
+            cfg.projects[1].effective_trigger_mode(&cfg.general),
+            TriggerMode::Webhook
+        );
+
+        // Standalone github.webhook_secret takes precedence over github.app.webhook_secret.
+        let gh = GithubCfg {
+            mode: None,
+            token: None,
+            token_file: None,
+            api_url: None,
+            webhook_secret: None,
+            webhook_secret_file: Some(secret_file.clone()),
+            app: Some(AppCfg {
+                app_id: 1,
+                private_key_path: None,
+                private_key: Some("pem".into()),
+                installation_id: None,
+                webhook_secret: Some("app-secret".into()),
+                webhook_secret_file: None,
+            }),
+        };
+        assert_eq!(gh.webhook_secret_value().as_deref(), Some("file-secret"));
+
+        // Falls back to app secret when standalone is unset.
+        let mut gh_fallback = gh.clone();
+        gh_fallback.webhook_secret_file = None;
+        assert_eq!(
+            gh_fallback.webhook_secret_value().as_deref(),
+            Some("app-secret")
+        );
+
+        // Mutual exclusion between github.webhook_secret and github.webhook_secret_file.
+        let mut cfg2 = example();
+        cfg2.github = Some(GithubCfg {
+            mode: None,
+            token: None,
+            token_file: None,
+            api_url: None,
+            webhook_secret: Some("inline".into()),
+            webhook_secret_file: Some(secret_file),
+            app: None,
+        });
+        let err = cfg2.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("github.webhook_secret_file"));
+    }
+
+    #[test]
+    fn inherited_zero_poll_interval_rejected_when_project_overrides_to_poll_or_both() {
+        let mut cfg = example();
+        cfg.general.poll_interval = 0;
+        cfg.general.trigger_mode = Some(TriggerMode::Webhook);
+        cfg.projects[0].poll_interval = None;
+        cfg.projects[0].trigger_mode = None;
+        cfg.projects[1].poll_interval = None;
+        cfg.projects[1].trigger_mode = None;
+        cfg.validate()
+            .expect("webhook mode globally allows general.poll_interval = 0");
+
+        // Project inherits poll_interval = 0 from general, overrides trigger_mode to Poll -> error.
+        cfg.projects[0].trigger_mode = Some(TriggerMode::Poll);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("project[0].poll_interval"));
+        assert!(
+            err.message
+                .contains("must be at least 1 second when trigger_mode polls"),
+            "{}",
+            err.message
+        );
+
+        // Same for trigger_mode = Both.
+        cfg.projects[0].trigger_mode = Some(TriggerMode::Both);
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("project[0].poll_interval"));
+        assert!(
+            err.message
+                .contains("must be at least 1 second when trigger_mode polls"),
+            "{}",
+            err.message
+        );
+
+        // Explicit positive project poll_interval fixes it.
+        cfg.projects[0].poll_interval = Some(60);
+        cfg.validate()
+            .expect("explicit positive project poll_interval is valid");
     }
 }

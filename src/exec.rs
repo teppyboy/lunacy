@@ -48,6 +48,18 @@ pub fn exec(
     sink: Option<LineSink>,
     cancel: Option<&AtomicBool>,
 ) -> Result<ExecResult> {
+    exec_with_log_hook(spec, sink, None, cancel)
+}
+
+/// Like [`exec`], plus an optional `log_hook` called with every exact line chunk (`"{line}\n"`)
+/// written to `spec.log_path` (including empty lines and `[lunacy]` notes), while holding the
+/// log file lock so disk writes, monotonic byte offsets, and hook emissions stay strictly ordered.
+pub fn exec_with_log_hook(
+    spec: &ExecSpec,
+    sink: Option<LineSink>,
+    log_hook: Option<LineSink>,
+    cancel: Option<&AtomicBool>,
+) -> Result<ExecResult> {
     if let Some(parent) = spec.log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating log dir {}", parent.display()))?;
@@ -57,7 +69,12 @@ pub fn exec(
     let log = Arc::new(Mutex::new(file));
 
     if is_cancelled(cancel) {
-        note(&log, sink.as_ref(), "[lunacy] cancelled before starting");
+        note(
+            &log,
+            sink.as_ref(),
+            log_hook.as_ref(),
+            "[lunacy] cancelled before starting",
+        );
         return Ok(ExecResult {
             outcome: Outcome::Cancelled,
         });
@@ -81,6 +98,7 @@ pub fn exec(
             note(
                 &log,
                 sink.as_ref(),
+                log_hook.as_ref(),
                 &format!("failed to start {}: {e}", spec.program),
             );
             guard.disarm();
@@ -93,9 +111,9 @@ pub fn exec(
 
     let out = child.stdout.take().expect("piped stdout");
     let err = child.stderr.take().expect("piped stderr");
-    let pump_out = spawn_pump(out, log.clone(), sink.clone());
+    let pump_out = spawn_pump(out, log.clone(), sink.clone(), log_hook.clone());
     // stderr goes to the sink too: act prints fatal errors there as plain text.
-    let pump_err = spawn_pump(err, log.clone(), sink.clone());
+    let pump_err = spawn_pump(err, log.clone(), sink.clone(), log_hook.clone());
 
     let mut timed_out = false;
     let mut cancelled = false;
@@ -132,6 +150,7 @@ pub fn exec(
         note(
             &log,
             sink.as_ref(),
+            log_hook.as_ref(),
             "[lunacy] cancelled; killed the process tree",
         );
         Outcome::Cancelled
@@ -139,6 +158,7 @@ pub fn exec(
         note(
             &log,
             sink.as_ref(),
+            log_hook.as_ref(),
             &format!(
                 "[lunacy] timed out after {}s; killed the process tree",
                 spec.timeout.as_secs()
@@ -157,9 +177,21 @@ pub fn exec(
 }
 
 /// A lunacy message: into the raw log and, if any, the sink's log.
-fn note(log: &Mutex<std::fs::File>, sink: Option<&LineSink>, msg: &str) {
+fn note(
+    log: &Mutex<std::fs::File>,
+    sink: Option<&LineSink>,
+    log_hook: Option<&LineSink>,
+    msg: &str,
+) {
+    let mut chunk = String::with_capacity(msg.len() + 1);
+    chunk.push_str(msg);
+    chunk.push('\n');
     if let Ok(mut f) = log.lock() {
-        let _ = writeln!(f, "{msg}");
+        let _ = f.write_all(chunk.as_bytes());
+        let _ = f.flush();
+        if let Some(hook) = log_hook {
+            hook(&chunk);
+        }
     }
     if let Some(sink) = sink {
         sink(msg);
@@ -170,6 +202,7 @@ fn spawn_pump<R: std::io::Read + Send + 'static>(
     reader: R,
     log: Arc<Mutex<std::fs::File>>,
     sink: Option<LineSink>,
+    log_hook: Option<LineSink>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = BufReader::new(reader);
@@ -181,8 +214,15 @@ fn spawn_pump<R: std::io::Read + Send + 'static>(
                 Ok(_) => {
                     let text = String::from_utf8_lossy(&line);
                     let text = text.trim_end_matches(['\n', '\r']);
+                    let mut chunk = String::with_capacity(text.len() + 1);
+                    chunk.push_str(text);
+                    chunk.push('\n');
                     if let Ok(mut f) = log.lock() {
-                        let _ = writeln!(f, "{text}");
+                        let _ = f.write_all(chunk.as_bytes());
+                        let _ = f.flush();
+                        if let Some(hook) = &log_hook {
+                            hook(&chunk);
+                        }
                     }
                     if let Some(sink) = &sink {
                         if !text.is_empty() {

@@ -292,6 +292,7 @@ fn once(path: PathBuf, project_name: String, sha: Option<String>, force: bool) -
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
     let run = pipeline::run_pipeline(&ctx, &project, &sha, Trigger::Manual);
     model::write_last_sha(&state_dir, &project.name, &sha)?;

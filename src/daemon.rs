@@ -1,13 +1,14 @@
 //! Daemon: one worker thread per project, poll loop, state, trigger channel.
 
-use crate::config::{self, Config, ProjectCfg};
+use crate::config::{self, Config, ProjectCfg, TriggerMode};
 use crate::git;
 use crate::model::{
-    read_last_sha, read_pr_shas, read_seen_tags, seen_tags_path, write_last_sha, write_pr_shas,
-    write_seen_tags, Run, RunStatus, Trigger,
+    read_last_sha, read_pr_shas, read_seen_tags, reconcile_orphaned_runs, seen_tags_path,
+    write_last_sha, write_pr_shas, write_seen_tags, Run, RunStatus, Trigger,
 };
-use crate::pipeline::{self, Ctx, PrContext, RunSpec};
+use crate::pipeline::{self, Ctx, LogChunkCallback, PrContext, RunSpec};
 use crate::report::Github;
+use crate::ws::WsHub;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Live diagnostics for verified `POST /api/github/webhook` deliveries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebhookStats {
+    pub deliveries: u64,
+    pub last_event: Option<String>,
+    pub last_repo: Option<String>,
+    pub last_delivery_id: Option<String>,
+    pub last_received_at: Option<String>,
+    pub last_outcome: Option<String>,
+}
 
 /// Live state the API reads: everything is behind one mutex for simplicity.
 #[derive(Default)]
@@ -24,6 +36,10 @@ pub struct Shared {
     pub projects: Vec<ProjectState>,
     /// Set by the API to stop the daemon.
     pub shutdown: bool,
+    /// Diagnostics for recent verified GitHub webhook deliveries.
+    pub webhook_stats: WebhookStats,
+    /// Real-time WebSocket broadcast hub.
+    pub ws: WsHub,
 }
 
 /// Result of requesting cancellation of a project's active run.
@@ -111,12 +127,14 @@ impl ProjectState {
         ProjectState {
             name: project.name.clone(),
             branch: project.branch.clone(),
-            github_repo: project.github_repo.clone(),
+            github_repo: resolve_github_repo(project),
             upstream_sha: None,
             last_sha: read_last_sha(state_dir, &project.name),
             running: false,
             current_run: None,
-            last_run: None,
+            last_run: crate::model::list_runs(state_dir, &project.name, 1)
+                .into_iter()
+                .next(),
             last_error: None,
             cancel: None,
             open_prs: Vec::new(),
@@ -131,9 +149,14 @@ impl ProjectState {
     /// Re-point at a changed config entry, keeping history.
     fn refresh(&mut self, project: &ProjectCfg, state_dir: &Path) {
         self.branch = project.branch.clone();
-        self.github_repo = project.github_repo.clone();
+        self.github_repo = resolve_github_repo(project);
         if self.last_sha.is_none() {
             self.last_sha = read_last_sha(state_dir, &project.name);
+        }
+        if self.last_run.is_none() {
+            self.last_run = crate::model::list_runs(state_dir, &project.name, 1)
+                .into_iter()
+                .next();
         }
         if !project.watch_prs {
             self.open_prs.clear();
@@ -175,6 +198,7 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(config_path: PathBuf, cfg: Config) -> Daemon {
         let state_dir = cfg.state_dir();
+        let _ = reconcile_orphaned_runs(&state_dir);
         let projects = cfg
             .projects
             .iter()
@@ -185,6 +209,8 @@ impl Daemon {
             state_dir,
             projects,
             shutdown: false,
+            webhook_stats: WebhookStats::default(),
+            ws: WsHub::new(),
         }));
         Daemon {
             shared,
@@ -232,20 +258,24 @@ impl Daemon {
             log::info!("[{}] worker started", project.name);
         }
 
-        let mut shared = self.shared.lock().expect("shared");
-        let state_dir = shared.state_dir.clone();
-        let mut old_projects = std::mem::take(&mut shared.projects);
-        let mut ordered = Vec::with_capacity(cfg.projects.len());
-        for project in &cfg.projects {
-            if let Some(pos) = old_projects.iter().position(|p| p.name == project.name) {
-                let mut existing = old_projects.remove(pos);
-                existing.refresh(project, &state_dir);
-                ordered.push(existing);
-            } else {
-                ordered.push(ProjectState::new(project, &state_dir));
+        let ws = {
+            let mut shared = self.shared.lock().expect("shared");
+            let state_dir = shared.state_dir.clone();
+            let mut old_projects = std::mem::take(&mut shared.projects);
+            let mut ordered = Vec::with_capacity(cfg.projects.len());
+            for project in &cfg.projects {
+                if let Some(pos) = old_projects.iter().position(|p| p.name == project.name) {
+                    let mut existing = old_projects.remove(pos);
+                    existing.refresh(project, &state_dir);
+                    ordered.push(existing);
+                } else {
+                    ordered.push(ProjectState::new(project, &state_dir));
+                }
             }
-        }
-        shared.projects = ordered;
+            shared.projects = ordered;
+            shared.ws.clone()
+        };
+        ws.emit_projects_updated();
     }
 
     /// Keep an API command map aligned with the currently active workers.
@@ -361,6 +391,7 @@ fn worker_loop(
         .checked_sub(Duration::from_secs(3600))
         .unwrap_or_else(Instant::now);
     let mut queued: VecDeque<QueuedTrigger> = VecDeque::new();
+    let mut want_reload = false;
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -368,7 +399,6 @@ fn worker_loop(
         }
 
         // Config reload: take the new definition of this project (and daemon-wide settings).
-        let mut want_reload = false;
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Command::Stop => return,
@@ -395,6 +425,7 @@ fn worker_loop(
             }
         }
         if want_reload {
+            want_reload = false;
             match Config::load(&config_path) {
                 Ok(new_cfg) => match new_cfg.project(&name).cloned() {
                     Some(p) => {
@@ -419,11 +450,13 @@ fn worker_loop(
         }
 
         let cfg = shared.lock().expect("shared").config.clone();
-        let interval = Duration::from_secs(project.poll_interval(&cfg.general));
-        if last_poll.elapsed() < interval && queued.is_empty() {
+        let webhook_only = project.effective_trigger_mode(&cfg.general) == TriggerMode::Webhook;
+        let interval = Duration::from_secs(project.poll_interval(&cfg.general).max(1));
+        if (webhook_only || last_poll.elapsed() < interval) && queued.is_empty() {
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(Command::Stop) => return,
                 Ok(Command::Reload) => {
+                    want_reload = true;
                     continue;
                 }
                 Ok(Command::Trigger {
@@ -518,7 +551,15 @@ fn handle_queued_trigger(
                 .unwrap_or_else(|| project.branch.clone())
         });
 
-    let target = resolve_queued_sha(shared, cfg, project, &git_ref, q.pr.as_ref(), q.sha);
+    let target = resolve_queued_sha(
+        shared,
+        cfg,
+        project,
+        &git_ref,
+        q.pr.as_ref(),
+        q.sha,
+        q.trigger,
+    );
     let Some(target) = target.filter(|s| !s.is_empty()) else {
         log::warn!("[{name}] trigger with no resolvable sha; ignoring");
         return;
@@ -559,6 +600,7 @@ fn resolve_queued_sha(
     git_ref: &str,
     pr: Option<&PrContext>,
     sha: Option<String>,
+    trigger: Trigger,
 ) -> Option<String> {
     let sha = sha.filter(|s| !s.trim().is_empty());
     if let Some(pr) = pr {
@@ -600,7 +642,7 @@ fn resolve_queued_sha(
 
     match sha {
         Some(s) => {
-            if git::rev_parse(&project.repo_path, &s).is_err() {
+            if trigger == Trigger::Webhook || git::rev_parse(&project.repo_path, &s).is_err() {
                 let _ = fetch_upstream(cfg, project, shared);
             }
             Some(s)
@@ -624,7 +666,7 @@ fn github_client(cfg: &Config, project_name: &str) -> Option<Github> {
     })
 }
 
-fn resolve_github_repo(project: &ProjectCfg) -> Option<String> {
+pub(crate) fn resolve_github_repo(project: &ProjectCfg) -> Option<String> {
     project.github_repo.clone().or_else(|| {
         git::remote_url(&project.repo_path, &project.remote)
             .as_deref()
@@ -664,11 +706,13 @@ fn poll_open_prs(
     }
 
     // Refresh lightweight `open_prs` snapshot on `ProjectState`.
-    if let Ok(mut s) = shared.lock() {
+    let prs_changed_ws = if let Ok(mut s) = shared.lock() {
+        let ws = s.ws.clone();
+        let mut changed = false;
         if let Some(ps) = s.projects.iter_mut().find(|p| p.name == project.name) {
             let prev: HashMap<u64, PrSummary> =
                 ps.open_prs.iter().cloned().map(|p| (p.number, p)).collect();
-            ps.open_prs = pulls
+            let next: Vec<PrSummary> = pulls
                 .iter()
                 .map(|pr| {
                     let last_tested_sha = seen.get(&pr.number).cloned();
@@ -690,7 +734,17 @@ fn poll_open_prs(
                     }
                 })
                 .collect();
+            if ps.open_prs != next {
+                ps.open_prs = next;
+                changed = true;
+            }
         }
+        changed.then_some(ws)
+    } else {
+        None
+    };
+    if let Some(ws) = prs_changed_ws {
+        ws.emit_projects_updated();
     }
 
     for pr in pulls {
@@ -734,13 +788,19 @@ fn poll_open_prs(
         if let Err(e) = write_pr_shas(&state_dir, &project.name, &seen) {
             log::warn!("[{}] persisting PR shas failed: {e}", project.name);
         }
-        if let Ok(mut s) = shared.lock() {
+        let ws = if let Ok(mut s) = shared.lock() {
             if let Some(ps) = s.projects.iter_mut().find(|p| p.name == project.name) {
                 if let Some(entry) = ps.open_prs.iter_mut().find(|p| p.number == pr.number) {
                     entry.last_tested_sha = Some(pr.head_sha.clone());
                     entry.status = Some(run.status);
                 }
             }
+            Some(s.ws.clone())
+        } else {
+            None
+        };
+        if let Some(ws) = ws {
+            ws.emit_projects_updated();
         }
     }
 }
@@ -833,23 +893,51 @@ fn fetch_upstream(
         .and_then(|_| git::upstream_sha(&project.repo_path, &project.remote, &project.branch))
     {
         Ok(sha) => {
-            if let Ok(mut s) = shared.lock() {
+            let notify_ws = if let Ok(mut s) = shared.lock() {
+                let mut changed = false;
                 if let Some(p) = s.projects.iter_mut().find(|p| p.name == project.name) {
-                    p.upstream_sha = Some(sha.clone());
-                    p.last_error = None;
+                    if p.upstream_sha.as_deref() != Some(sha.as_str()) {
+                        p.upstream_sha = Some(sha.clone());
+                        changed = true;
+                    }
+                    if p.last_error.is_some() {
+                        p.last_error = None;
+                        changed = true;
+                    }
                     if p.github_repo.is_none() && cfg.github.is_some() {
-                        p.github_repo = resolve_github_repo(project);
+                        let resolved = resolve_github_repo(project);
+                        if resolved.is_some() {
+                            p.github_repo = resolved;
+                            changed = true;
+                        }
                     }
                 }
+                changed.then(|| s.ws.clone())
+            } else {
+                None
+            };
+            if let Some(ws) = notify_ws {
+                ws.emit_projects_updated();
             }
             Some(sha)
         }
         Err(e) => {
             log::warn!("[{}] fetch failed: {e:#}", project.name);
-            if let Ok(mut s) = shared.lock() {
+            let msg = format!("fetch: {e:#}");
+            let notify_ws = if let Ok(mut s) = shared.lock() {
+                let mut changed = false;
                 if let Some(p) = s.projects.iter_mut().find(|p| p.name == project.name) {
-                    p.last_error = Some(format!("fetch: {e:#}"));
+                    if p.last_error.as_deref() != Some(msg.as_str()) {
+                        p.last_error = Some(msg);
+                        changed = true;
+                    }
                 }
+                changed.then(|| s.ws.clone())
+            } else {
+                None
+            };
+            if let Some(ws) = notify_ws {
+                ws.emit_projects_updated();
             }
             None
         }
@@ -882,7 +970,10 @@ fn execute_spec(
     );
     let github = github_client(cfg, &project.name);
 
-    let state_dir = shared.lock().expect("shared").state_dir.clone();
+    let (state_dir, ws) = {
+        let s = shared.lock().expect("shared");
+        (s.state_dir.clone(), s.ws.clone())
+    };
     let act_lock = cfg.act_lock_file();
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -897,6 +988,7 @@ fn execute_spec(
     } else {
         (None, None)
     };
+    ws.emit_projects_updated();
 
     let is_default_branch =
         spec.pr.is_none() && pipeline::is_default_branch_ref(project, &spec.git_ref);
@@ -907,9 +999,17 @@ fn execute_spec(
         existing_last_sha.as_deref(),
         upstream_sha.as_deref(),
     );
+    let current_run_id: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let on_update = {
         let shared = shared.clone();
+        let ws = ws.clone();
+        let current_run_id = current_run_id.clone();
         move |run: &Run| {
+            if let Ok(mut id_guard) = current_run_id.lock() {
+                if id_guard.is_empty() {
+                    *id_guard = run.id.clone();
+                }
+            }
             if let Ok(mut s) = shared.lock() {
                 if let Some(p) = s.projects.iter_mut().find(|p| p.name == run.project) {
                     p.current_run = Some(run.clone());
@@ -918,7 +1018,30 @@ fn execute_spec(
                     }
                 }
             }
+            ws.emit_run_updated(run);
+            ws.emit_projects_updated();
         }
+    };
+    let on_log_chunk: LogChunkCallback = {
+        let ws = ws.clone();
+        let current_run_id = current_run_id.clone();
+        let offsets: Arc<Mutex<HashMap<usize, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        Arc::new(move |step: usize, chunk: &str| {
+            if chunk.is_empty() {
+                return;
+            }
+            let run_id = current_run_id.lock().map(|g| g.clone()).unwrap_or_default();
+            if run_id.is_empty() {
+                return;
+            }
+            let offset = {
+                let mut map = offsets.lock().expect("log offsets");
+                let entry = map.entry(step).or_insert(0);
+                *entry = entry.saturating_add(chunk.len() as u64);
+                *entry
+            };
+            ws.emit_log_chunk(run_id, step, chunk, offset);
+        })
     };
 
     let ctx = Ctx {
@@ -929,6 +1052,7 @@ fn execute_spec(
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: Some(cancel.as_ref()),
+        on_log_chunk: Some(on_log_chunk),
     };
     let run = pipeline::run_pipeline_spec(&ctx, project, spec);
 
@@ -965,6 +1089,8 @@ fn execute_spec(
             p.last_run = Some(run.clone());
         }
     }
+    ws.emit_run_updated(&run);
+    ws.emit_projects_updated();
     run
 }
 
@@ -1094,6 +1220,7 @@ mod tests {
             github_repo: None,
             checkout: Checkout::None,
             poll_interval: None,
+            trigger_mode: None,
             step_timeout: None,
             timeout: None,
             env: BTreeMap::new(),
@@ -1123,6 +1250,8 @@ mod tests {
             state_dir: state_dir.clone(),
             projects: vec![ps],
             shutdown: false,
+            webhook_stats: WebhookStats::default(),
+            ws: WsHub::new(),
         }));
 
         // Force-deploy older commit (rollback): must NOT rewind last_sha on disk or in memory.
@@ -1146,5 +1275,181 @@ mod tests {
             Some(new_sha.as_str()),
             "persisted last_sha must not rewind on rollback"
         );
+    }
+
+    #[test]
+    fn daemon_new_reconciles_orphaned_running_runs_on_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mut orphan = Run::new(
+            "demo",
+            "1111111111111111111111111111111111111111",
+            "feat: orphaned".into(),
+            Trigger::Manual,
+            vec![crate::model::Step {
+                phase: crate::model::Phase::Ci,
+                name: "Test".into(),
+                status: crate::model::StepStatus::Running,
+                duration_ms: None,
+                exit_code: None,
+                kind: StepKind::Shell,
+                substeps: Vec::new(),
+            }],
+        );
+        orphan.status = RunStatus::Running;
+        crate::model::persist_run(&state_dir, &orphan).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.general.state_dir = Some(state_dir.clone());
+        let _daemon = Daemon::new(dir.path().join("config.toml"), cfg);
+
+        let updated = crate::model::read_run(&state_dir, &orphan.id).expect("run");
+        assert_eq!(updated.status, RunStatus::Cancelled);
+        assert!(updated.finished_at.is_some());
+        assert_eq!(updated.steps[0].status, crate::model::StepStatus::Cancelled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_trigger_mode_skips_polling_but_runs_webhook_triggers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&origin, &["init", "--bare", "-b", "master"]);
+        let clone_out = std::process::Command::new("git")
+            .args(["clone", origin.to_str().unwrap(), work.to_str().unwrap()])
+            .output()
+            .expect("clone");
+        assert!(clone_out.status.success());
+        run_git(&work, &["config", "user.email", "lunacy@example.invalid"]);
+        run_git(&work, &["config", "user.name", "lunacy"]);
+        std::fs::write(work.join("a.txt"), "v1\n").unwrap();
+        run_git(&work, &["add", "a.txt"]);
+        run_git(&work, &["commit", "-m", "v1"]);
+        run_git(&work, &["push", "origin", "master"]);
+        let sha1 = run_git(&work, &["rev-parse", "HEAD"]);
+
+        let step = StepCfg {
+            name: "Echo".into(),
+            kind: StepKind::Shell,
+            run: Some("echo webhook-ok".into()),
+            workflow: None,
+            job: None,
+            event: None,
+            platforms: BTreeMap::new(),
+            args: Vec::new(),
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            only_on: Vec::new(),
+            timeout: Some(30),
+            cwd: None,
+            shell: Some(vec!["bash".into(), "-c".into()]),
+            env: BTreeMap::new(),
+        };
+        let project = ProjectCfg {
+            name: "demo".into(),
+            repo_path: work.clone(),
+            remote: "origin".into(),
+            branch: "master".into(),
+            github_repo: Some("teppyboy/demo".into()),
+            checkout: Checkout::None,
+            poll_interval: Some(0),
+            trigger_mode: Some(TriggerMode::Webhook),
+            step_timeout: None,
+            timeout: None,
+            env: BTreeMap::new(),
+            contexts: Default::default(),
+            discord_webhook_url: None,
+            notify_on_start: None,
+            shell: None,
+            platforms: BTreeMap::new(),
+            watch_prs: false,
+            deploy_refs: Vec::new(),
+            watch_tags: false,
+            cache: Some(false),
+            ci: vec![step],
+            deploy: Vec::new(),
+        };
+        let mut cfg = Config::default();
+        cfg.general.state_dir = Some(state_dir.clone());
+        cfg.general.trigger_mode = Some(TriggerMode::Webhook);
+        cfg.general.poll_interval = 0;
+        cfg.projects = vec![project];
+
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, toml::to_string(&cfg).unwrap()).unwrap();
+
+        let mut daemon = Daemon::new(cfg_path, cfg);
+        daemon.reconcile();
+
+        // Wait longer than poll tick: webhook-only worker MUST NOT poll or auto-run.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            crate::model::list_runs(&state_dir, "demo", 10).is_empty(),
+            "webhook-only project must not poll"
+        );
+        assert!(
+            daemon.shared.lock().unwrap().projects[0]
+                .upstream_sha
+                .is_none(),
+            "webhook-only project must not fetch during idle loop"
+        );
+
+        // Now deliver an explicit webhook trigger: worker fetches and executes the run.
+        let tx = daemon.command_sender("demo").expect("worker sender");
+        tx.send(Command::Trigger {
+            sha: Some(sha1.clone()),
+            force: false,
+            trigger: Trigger::Webhook,
+            git_ref: Some("master".into()),
+            pr: None,
+            deploy_only: false,
+            force_deploy: false,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let runs = crate::model::list_runs(&state_dir, "demo", 10);
+            if runs.first().is_some_and(|r| r.status == RunStatus::Success) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let runs = crate::model::list_runs(&state_dir, "demo", 10);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Success);
+        assert_eq!(runs[0].trigger, Trigger::Webhook);
+        assert_eq!(runs[0].sha, sha1);
+        assert_eq!(
+            daemon.shared.lock().unwrap().projects[0]
+                .upstream_sha
+                .as_deref(),
+            Some(sha1.as_str()),
+            "webhook trigger should fetch upstream_sha"
+        );
+
+        daemon.shutdown();
     }
 }

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +11,31 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Format unix seconds as UTC ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn format_iso_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    // Howard Hinnant's civil-from-days algorithm (days since 1970-01-01).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+pub fn now_iso() -> String {
+    format_iso_utc(now_secs())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +51,10 @@ pub enum RunStatus {
 impl RunStatus {
     pub fn is_final(self) -> bool {
         !matches!(self, RunStatus::Running)
+    }
+
+    pub fn is_running(self) -> bool {
+        matches!(self, RunStatus::Running)
     }
 }
 
@@ -366,6 +395,119 @@ pub fn read_run(state_dir: &Path, id: &str) -> Option<Run> {
     find_run(state_dir, &project, id)
 }
 
+/// A cancellation note appended to an orphaned run's step log file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendedLogChunk {
+    pub step: usize,
+    pub chunk: String,
+    pub new_len: u64,
+}
+
+/// Transition a persisted `RunStatus::Running` run that has no live worker into `RunStatus::Cancelled`,
+/// finalizing any running steps/substeps, appending a best-effort note to existing step logs,
+/// and persisting atomically.
+pub fn reconcile_orphaned_run(state_dir: &Path, run: Run, reason: &str) -> std::io::Result<Run> {
+    reconcile_orphaned_run_with_logs(state_dir, run, reason).map(|(updated, _)| updated)
+}
+
+/// Like [`reconcile_orphaned_run`], also returning each appended log chunk for existing step logs
+/// that received the cancellation footer.
+pub fn reconcile_orphaned_run_with_logs(
+    state_dir: &Path,
+    mut run: Run,
+    reason: &str,
+) -> std::io::Result<(Run, Vec<AppendedLogChunk>)> {
+    if !run.status.is_running() {
+        return Ok((run, Vec::new()));
+    }
+    let now = now_secs();
+    run.status = RunStatus::Cancelled;
+    run.finished_at = Some(now);
+    let mut appended_logs = Vec::new();
+    for (idx, step) in run.steps.iter_mut().enumerate() {
+        if step.status == StepStatus::Running {
+            step.status = StepStatus::Cancelled;
+            for sub in &mut step.substeps {
+                if sub.status == StepStatus::Running {
+                    sub.status = StepStatus::Cancelled;
+                }
+            }
+            let log_path = run_log_path(state_dir, &run.project, &run.id, idx);
+            if log_path.is_file() {
+                let note = format!("\n[lunacy] cancelled; {reason}\n");
+                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+                    if file.write_all(note.as_bytes()).is_ok() {
+                        let _ = file.flush();
+                        let new_len = file
+                            .metadata()
+                            .map(|m| m.len())
+                            .unwrap_or(note.len() as u64);
+                        appended_logs.push(AppendedLogChunk {
+                            step: idx,
+                            chunk: note,
+                            new_len,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    persist_run(state_dir, &run)?;
+    Ok((run, appended_logs))
+}
+
+/// Scan `<state_dir>/runs/<project>/*.json` and reconcile any run still marked `running`
+/// (e.g., left behind after a crash or unclean daemon restart) to `cancelled`.
+pub fn reconcile_orphaned_runs(state_dir: &Path) -> Vec<Run> {
+    let mut reconciled = Vec::new();
+    let runs_root = state_dir.join("runs");
+    let Ok(entries) = std::fs::read_dir(&runs_root) else {
+        return reconciled;
+    };
+    let mut json_files: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Ok(sub) = std::fs::read_dir(&p) {
+                for f in sub.flatten() {
+                    let fp = f.path();
+                    if fp.extension().is_some_and(|e| e == "json") {
+                        json_files.push(fp);
+                    }
+                }
+            }
+        } else if p.extension().is_some_and(|e| e == "json") {
+            json_files.push(p);
+        }
+    }
+    json_files.sort();
+    for path in json_files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(run) = serde_json::from_str::<Run>(&text) else {
+            continue;
+        };
+        if !run.status.is_running() {
+            continue;
+        }
+        let id = run.id.clone();
+        let project = run.project.clone();
+        match reconcile_orphaned_run(state_dir, run, "run was orphaned after daemon restart") {
+            Ok(updated) => {
+                log::warn!(
+                    "[{project}] reconciled orphaned running run {id} to cancelled on startup"
+                );
+                reconciled.push(updated);
+            }
+            Err(e) => {
+                log::warn!("[{project}] failed to reconcile orphaned run {id}: {e}");
+            }
+        }
+    }
+    reconciled
+}
+
 pub const LOG_TAIL_BYTES: u64 = 512 * 1024;
 
 /// Last `lines` lines of a file, read from the end and capped at [`LOG_TAIL_BYTES`].
@@ -464,5 +606,117 @@ mod tests {
         );
         assert_eq!(serde_json::to_string(&Trigger::Tag).unwrap(), "\"tag\"");
         assert_eq!(serde_json::to_string(&Trigger::Poll).unwrap(), "\"poll\"");
+    }
+
+    #[test]
+    fn format_iso_utc_matches_known_timestamps() {
+        assert_eq!(format_iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_iso_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(format_iso_utc(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn reconcile_orphaned_runs_cancels_running_steps_substeps_and_appends_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut orphan = Run::new(
+            "demo",
+            "0123456789abcdef0123456789abcdef01234567",
+            "feat: crash".into(),
+            Trigger::Manual,
+            vec![
+                Step {
+                    phase: Phase::Ci,
+                    name: "Build".into(),
+                    status: StepStatus::Success,
+                    duration_ms: Some(120),
+                    exit_code: Some(0),
+                    kind: crate::config::StepKind::Shell,
+                    substeps: Vec::new(),
+                },
+                Step {
+                    phase: Phase::Ci,
+                    name: "Test".into(),
+                    status: StepStatus::Running,
+                    duration_ms: None,
+                    exit_code: None,
+                    kind: crate::config::StepKind::Act,
+                    substeps: vec![
+                        Substep {
+                            job: "ci".into(),
+                            job_id: "ci".into(),
+                            name: "Checkout".into(),
+                            status: StepStatus::Success,
+                            duration_ms: Some(50),
+                        },
+                        Substep {
+                            job: "ci".into(),
+                            job_id: "ci".into(),
+                            name: "Cargo test".into(),
+                            status: StepStatus::Running,
+                            duration_ms: None,
+                        },
+                    ],
+                },
+                Step {
+                    phase: Phase::Deploy,
+                    name: "Publish".into(),
+                    status: StepStatus::Pending,
+                    duration_ms: None,
+                    exit_code: None,
+                    kind: crate::config::StepKind::Shell,
+                    substeps: Vec::new(),
+                },
+            ],
+        );
+        orphan.status = RunStatus::Running;
+        persist_run(dir.path(), &orphan).unwrap();
+
+        let log_path = run_log_path(dir.path(), "demo", &orphan.id, 1);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(&log_path, "running tests...\n").unwrap();
+
+        let mut finished = Run::new(
+            "demo",
+            "fedcba9876543210fedcba9876543210fedcba98",
+            "feat: ok".into(),
+            Trigger::Poll,
+            vec![],
+        );
+        finished.id = "demo-999-fedcba9".into();
+        finished.status = RunStatus::Success;
+        finished.finished_at = Some(finished.started_at);
+        persist_run(dir.path(), &finished).unwrap();
+
+        let reconciled = reconcile_orphaned_runs(dir.path());
+        assert_eq!(reconciled.len(), 1);
+        let updated = &reconciled[0];
+        assert_eq!(updated.id, orphan.id);
+        assert_eq!(updated.status, RunStatus::Cancelled);
+        assert!(updated.finished_at.is_some());
+        assert_eq!(updated.steps[0].status, StepStatus::Success);
+        assert_eq!(updated.steps[1].status, StepStatus::Cancelled);
+        assert_eq!(updated.steps[1].substeps[0].status, StepStatus::Success);
+        assert_eq!(updated.steps[1].substeps[1].status, StepStatus::Cancelled);
+        assert_eq!(updated.steps[2].status, StepStatus::Pending);
+
+        // Persisted on disk as cancelled.
+        let reloaded = read_run(dir.path(), &orphan.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.steps[1].status, StepStatus::Cancelled);
+
+        // Log file got the cancellation note.
+        let log_text = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log_text.contains("[lunacy] cancelled; run was orphaned after daemon restart"),
+            "{log_text}"
+        );
+
+        // Running again is a no-op.
+        assert!(reconcile_orphaned_runs(dir.path()).is_empty());
+        // Already-finished run was untouched.
+        assert_eq!(
+            read_run(dir.path(), &finished.id).unwrap().status,
+            RunStatus::Success
+        );
     }
 }

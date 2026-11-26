@@ -68,6 +68,7 @@ fn act_step_runs_the_workflow_and_records_substeps() {
         github_repo: None,
         checkout: Checkout::None,
         poll_interval: None,
+        trigger_mode: None,
         step_timeout: None,
         timeout: None,
         env: Default::default(),
@@ -110,6 +111,7 @@ fn act_step_runs_the_workflow_and_records_substeps() {
         on_update: &on_update,
         act_lock: &act_lock,
         cancel: None,
+        on_log_chunk: None,
     };
     let run = pipeline::run_pipeline(&ctx, &project, &sha, Trigger::Manual);
 

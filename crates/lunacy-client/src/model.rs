@@ -271,6 +271,15 @@ pub struct Project {
     pub last_error: Option<String>,
     #[serde(default)]
     pub open_prs: Vec<PrSummary>,
+    #[serde(default)]
+    pub watch_prs: bool,
+    #[serde(default)]
+    pub watch_tags: bool,
+    #[serde(default)]
+    pub deploy_refs: Vec<String>,
+    /// `poll` / `webhook` / `both`.
+    #[serde(default)]
+    pub trigger_mode: Option<String>,
 }
 
 impl Default for Project {
@@ -289,6 +298,10 @@ impl Default for Project {
             last_run: None,
             last_error: None,
             open_prs: Vec::new(),
+            watch_prs: false,
+            watch_tags: false,
+            deploy_refs: Vec::new(),
+            trigger_mode: None,
         }
     }
 }

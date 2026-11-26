@@ -3888,3 +3888,77 @@ fn api_trigger_atomically_enforces_capacity_cancels_pending_and_releases_on_send
         "failed tx.send must release reserved pending slot"
     );
 }
+
+/// The daemon builds its JSON by hand (`api.rs`) and every client parses it with
+/// `lunacy-client`'s types. Decode each endpoint's real answer with those exact types, with
+/// unknown fields reported, so a field renamed or retyped on either side fails here instead
+/// of showing up as a blank value in the UI or the CLI.
+#[test]
+fn client_types_decode_every_daemon_response() {
+    use lunacy_client::model as wire;
+    use serde::de::DeserializeOwned;
+
+    fn decode<T: DeserializeOwned>(what: &str, body: &str) -> T {
+        let de = &mut serde_json::Deserializer::from_str(body);
+        let mut unknown = Vec::new();
+        let value: T = serde_ignored::deserialize(de, |path| unknown.push(path.to_string()))
+            .unwrap_or_else(|e| {
+                panic!("{what}: client type rejects the daemon's JSON ({e}): {body}")
+            });
+        assert!(
+            unknown.is_empty(),
+            "{what}: daemon sends fields the client type drops: {unknown:?}"
+        );
+        value
+    }
+
+    let s = start("");
+    let mut run = lunacy::model::Run::new(
+        "demo",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "feat: contract".into(),
+        lunacy::model::Trigger::Manual,
+        vec![lunacy::model::Step {
+            phase: lunacy::model::Phase::Ci,
+            name: "act".into(),
+            status: lunacy::model::StepStatus::Success,
+            duration_ms: Some(10),
+            exit_code: Some(0),
+            kind: StepKind::Act,
+            substeps: vec![lunacy::model::Substep {
+                job: "Build".into(),
+                job_id: "build".into(),
+                name: "Test".into(),
+                status: lunacy::model::StepStatus::Success,
+                duration_ms: Some(5),
+            }],
+        }],
+    );
+    run.trigger_reason = Some("contract test".into());
+    run.git_ref = Some("master".into());
+    run.status = lunacy::model::RunStatus::Success;
+    run.finished_at = Some(run.started_at + 1);
+    lunacy::model::persist_run(&s.state_dir, &run).unwrap();
+
+    let get = |path: &str| {
+        let r = request(s.port, "GET", path, None, None);
+        assert_eq!(r.status, 200, "{path}: {}", r.body);
+        r.body
+    };
+
+    let projects: Vec<wire::Project> = decode("/api/projects", &get("/api/projects"));
+    assert_eq!(projects[0].name, "demo");
+    let project: wire::Project = decode("/api/projects/demo", &get("/api/projects/demo"));
+    assert_eq!(
+        project.last_run.as_ref().map(|r| r.id.as_str()),
+        Some(run.id.as_str())
+    );
+    let runs: Vec<wire::Run> = decode("/api/projects/demo/runs", &get("/api/projects/demo/runs"));
+    assert_eq!(runs.len(), 1);
+    let got: wire::Run = decode("/api/runs/{id}", &get(&format!("/api/runs/{}", run.id)));
+    assert_eq!(got.steps[0].substeps[0].job_id, "build");
+    assert_eq!(got.trigger_reason.as_deref(), Some("contract test"));
+    let _: wire::Health = decode("/api/health", &get("/api/health"));
+    let _: wire::SystemInfo = decode("/api/system", &get("/api/system"));
+    let _: wire::DeployChecksReport = decode("/api/deploy/checks", &get("/api/deploy/checks"));
+}

@@ -1,0 +1,19 @@
+[package]
+name = "lunacy-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client for the Lunacy daemon's HTTP API: wire types, calls, and transport (native + wasm32)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Headers", "Request", "RequestInit", "Response", "Window"] }

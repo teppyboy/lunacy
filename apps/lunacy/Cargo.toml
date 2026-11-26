@@ -25,6 +25,8 @@ toml.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+lunacy-client.workspace = true
+serde_ignored.workspace = true
 fs2.workspace = true
 tempfile.workspace = true
 tiny_http.workspace = true

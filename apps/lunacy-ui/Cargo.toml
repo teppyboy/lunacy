@@ -13,6 +13,7 @@ name = "lunacy-ui"
 path = "src/main.rs"
 
 [dependencies]
+lunacy-client.workspace = true
 rune = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5", default-features = true }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "267df807ae5a23b7310eca336ca1af85ead32fa5", default-features = true }
 serde.workspace = true

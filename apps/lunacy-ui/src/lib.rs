@@ -4,13 +4,12 @@
 //! daemon on another one, or a mock. It builds natively (`cargo run`) and for the web
 //! (`build-web.sh`), from one view tree.
 
-pub mod api;
+// The daemon API client is shared with lunacy-cli; keep the old module paths.
+pub use lunacy_client::{api, config, model, net};
+
 pub mod app;
-pub mod config;
 pub mod demo;
 pub mod icons;
-pub mod model;
-pub mod net;
 pub mod paths;
 pub mod state;
 pub mod theme;

@@ -195,12 +195,11 @@ pub fn run_pipeline_spec(ctx: &Ctx<'_>, project: &ProjectCfg, spec: &RunSpec) ->
     (ctx.on_update)(&run);
     persist(ctx, &run);
 
-    let discord = ctx
-        .cfg
-        .discord_for(project)
-        .and_then(|(url, notify_start)| {
-            Discord::new(&url).ok().map(|d| (Arc::new(d), notify_start))
-        });
+    let discord = ctx.cfg.discord_for(project).and_then(|resolved| {
+        Discord::from_resolved(&resolved)
+            .ok()
+            .map(|d| (Arc::new(d), resolved.notify_on_start))
+    });
     if let Some((d, true)) = &discord {
         if let Err(e) = d.notify_start(&run, repo.as_deref()) {
             log::warn!("[{}] discord start notification failed: {e}", project.name);
@@ -579,6 +578,9 @@ fn publish(
 ) {
     (ctx.on_update)(run);
     persist(ctx, run);
+    if !ctx.cfg.github_enabled_for(project) {
+        return;
+    }
     let (Some(gh), Some(repo), Some(check)) = (ctx.github, repo, check.as_ref()) else {
         return;
     };
@@ -637,6 +639,9 @@ fn start_report(
     repo: Option<&str>,
     phase: Phase,
 ) -> Option<CheckHandle> {
+    if !ctx.cfg.github_enabled_for(project) {
+        return None;
+    }
     let gh = ctx.github?;
     let repo = repo.or(project.github_repo.as_deref())?;
     if project.deploy.is_empty() && phase == Phase::Deploy {
@@ -664,6 +669,9 @@ fn finish_report(
     phase: Phase,
     repo: Option<&str>,
 ) {
+    if !ctx.cfg.github_enabled_for(project) {
+        return;
+    }
     let (Some(gh), Some(check), Some(repo)) = (ctx.github, check.as_ref(), repo) else {
         return;
     };
@@ -897,6 +905,7 @@ fn run_act_step(
         fs::create_dir_all(&cache_server_path)?;
 
         let mut combined_user_args = act_cfg.args.clone();
+        combined_user_args.extend(project.act_args.iter().cloned());
         combined_user_args.extend(step.args.iter().cloned());
         let pull_false = !self_hosted
             && !act::has_pull_flag(&combined_user_args)
@@ -922,6 +931,7 @@ fn run_act_step(
         workflow,
         job: step.job.clone(),
         event: event_name,
+        project_args: project.act_args.clone(),
         cache: cache_plan,
     };
     let args = act::build_args(&plan, step, &platform_map, &act_cfg, wsl);

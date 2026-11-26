@@ -258,18 +258,22 @@ fn once(path: PathBuf, project_name: String, sha: Option<String>, force: bool) -
         }
     }
 
-    let github = cfg.github.as_ref().and_then(|g| {
-        if !g.enabled() {
-            return None;
-        }
-        match report::Github::new(g) {
-            Ok(gh) => Some(gh),
-            Err(e) => {
-                eprintln!("lunacy: github reporting disabled: {e:#}");
-                None
+    let github = if cfg.github_enabled_for(&project) {
+        cfg.github.as_ref().and_then(|g| {
+            if !g.enabled() {
+                return None;
             }
-        }
-    });
+            match report::Github::new(g) {
+                Ok(gh) => Some(gh),
+                Err(e) => {
+                    eprintln!("lunacy: github reporting disabled: {e:#}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
     let act_lock = cfg.act_lock_file();
     let on_update = |run: &model::Run| {
         println!(
@@ -358,6 +362,7 @@ fn run(path: PathBuf) -> Result<()> {
         commands,
         config_path: path.clone(),
         reloads: Arc::new(Mutex::new(0)),
+        discord_test_guard: Mutex::new(api::DiscordTestGuard::default()),
     });
 
     let mut api_thread = None;

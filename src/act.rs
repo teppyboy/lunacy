@@ -448,6 +448,7 @@ pub struct ActPlan {
     pub workflow: String,
     pub job: Option<String>,
     pub event: String,
+    pub project_args: Vec<String>,
     pub cache: Option<ActCachePlan>,
 }
 
@@ -656,8 +657,10 @@ pub fn build_args(
     args.push("--artifact-server-path".into());
     args.push(plan.artifact_dir.to_string_lossy().to_string());
 
-    let mut user_args: Vec<String> = Vec::with_capacity(act.args.len() + step.args.len());
+    let mut user_args: Vec<String> =
+        Vec::with_capacity(act.args.len() + plan.project_args.len() + step.args.len());
     user_args.extend(act.args.iter().cloned());
+    user_args.extend(plan.project_args.iter().cloned());
     user_args.extend(step.args.iter().cloned());
 
     if let Some(cache) = &plan.cache {
@@ -1140,6 +1143,7 @@ jobs:
             workflow: ".github/workflows/ci.yml".into(),
             job: Some("web".into()),
             event: "push".into(),
+            project_args: Vec::new(),
             cache: None,
         };
         let step = StepCfg {
@@ -1181,6 +1185,7 @@ jobs:
             workflow: ".github/workflows/ci.yml".into(),
             job: Some("validate".into()),
             event: "push".into(),
+            project_args: Vec::new(),
             cache: Some(ActCachePlan {
                 action_cache_path: PathBuf::from("/state/cache/act-actions"),
                 cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
@@ -1300,6 +1305,7 @@ jobs:
             workflow: ".github/workflows/ci.yml".into(),
             job: None,
             event: "push".into(),
+            project_args: Vec::new(),
             cache: Some(ActCachePlan {
                 action_cache_path: PathBuf::from("/state/cache/act-actions"),
                 cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
@@ -1368,6 +1374,7 @@ jobs:
             workflow: ".github/workflows/ci.yml".into(),
             job: Some("windows".into()),
             event: "push".into(),
+            project_args: Vec::new(),
             cache: Some(ActCachePlan {
                 action_cache_path: PathBuf::from("/state/cache/act-actions"),
                 cache_server_path: PathBuf::from("/state/cache/act-cache-server"),
@@ -1441,5 +1448,46 @@ jobs:
         assert_eq!(v["pull_request"]["base"]["sha"], "bbbb2222");
         assert_eq!(v["pull_request"]["base"]["ref"], "master");
         assert_eq!(v["repository"]["full_name"], "teppyboy/frostedge");
+    }
+
+    #[test]
+    fn act_args_order_is_global_then_project_then_step() {
+        let plan = ActPlan {
+            event_file: PathBuf::from("/tmp/event.json"),
+            secret_file: None,
+            var_file: None,
+            artifact_dir: PathBuf::from("/tmp/art"),
+            workflow: ".github/workflows/ci.yml".into(),
+            job: Some("build".into()),
+            event: "push".into(),
+            project_args: vec!["--project-flag".into(), "p1".into()],
+            cache: None,
+        };
+        let act = ActCfg {
+            args: vec!["--global-flag".into(), "g1".into()],
+            ..ActCfg::default()
+        };
+        let step = StepCfg {
+            name: "s".into(),
+            kind: crate::config::StepKind::Act,
+            run: None,
+            workflow: Some(".github/workflows/ci.yml".into()),
+            job: Some("build".into()),
+            event: None,
+            platforms: BTreeMap::new(),
+            args: vec!["--step-flag".into(), "s1".into()],
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            only_on: Vec::new(),
+            timeout: None,
+            cwd: None,
+            shell: None,
+            env: BTreeMap::new(),
+        };
+        let args = build_args(&plan, &step, &BTreeMap::new(), &act, false);
+        let g = args.iter().position(|a| a == "--global-flag").unwrap();
+        let p = args.iter().position(|a| a == "--project-flag").unwrap();
+        let s = args.iter().position(|a| a == "--step-flag").unwrap();
+        assert!(g < p && p < s, "expected global < project < step: {args:?}");
     }
 }

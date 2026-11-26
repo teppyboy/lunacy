@@ -6,7 +6,7 @@ use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,10 +27,10 @@ fn b64url(data: &[u8]) -> String {
 
 /// Sign `claims` as an RS256 JWT with a PKCS#8 or PKCS#1 RSA PEM key.
 pub fn sign_jwt(pem: &str, claims: &serde_json::Value) -> Result<String> {
-    let key = RsaPrivateKey::from_pkcs8_pem(pem)
+    let key = PrivateKey::from_pkcs8_pem(pem)
         .or_else(|_| {
             use rsa::pkcs1::DecodeRsaPrivateKey;
-            RsaPrivateKey::from_pkcs1_pem(pem)
+            PrivateKey::from_pkcs1_pem(pem)
         })
         .map_err(|e| anyhow::anyhow!("parsing the GitHub App private key: {e}"))?;
     let header = serde_json::json!({"alg": "RS256", "typ": "JWT"});

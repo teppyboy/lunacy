@@ -108,8 +108,15 @@ struct Server {
     config_path: PathBuf,
     shared: Arc<Mutex<Shared>>,
     commands: Commands,
+    api_state: Arc<ApiState>,
     _dir: tempfile::TempDir,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Server {
+    fn reset_discord_test_guard(&self) {
+        self.api_state.discord_test_guard.lock().unwrap().reset();
+    }
 }
 
 impl Drop for Server {
@@ -150,7 +157,9 @@ fn project(root: &std::path::Path) -> ProjectCfg {
         repo_path: root.join("repo"),
         remote: "origin".into(),
         branch: "master".into(),
+        enabled: None,
         github_repo: Some("teppyboy/demo".into()),
+        github_enabled: None,
         checkout: Checkout::None,
         poll_interval: None,
         trigger_mode: None,
@@ -158,10 +167,16 @@ fn project(root: &std::path::Path) -> ProjectCfg {
         timeout: None,
         env: Default::default(),
         contexts: Default::default(),
+        discord_enabled: None,
         discord_webhook_url: None,
+        discord_webhook_url_file: None,
         notify_on_start: None,
+        discord_notify_on: None,
+        discord_username: None,
+        discord_mention_on_failure: None,
         shell: None,
         platforms: Default::default(),
+        act_args: Vec::new(),
         watch_prs: false,
         deploy_refs: Vec::new(),
         watch_tags: false,
@@ -209,9 +224,11 @@ fn start(token: &str) -> Server {
         commands: commands.clone(),
         config_path: config_path.clone(),
         reloads: Arc::new(Mutex::new(0)),
+        discord_test_guard: Mutex::new(api::DiscordTestGuard::default()),
     });
+    let serve_state = state.clone();
     let thread = std::thread::spawn(move || {
-        let _ = api::serve(state, &format!("127.0.0.1:{port}"));
+        let _ = api::serve(serve_state, &format!("127.0.0.1:{port}"));
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -227,6 +244,7 @@ fn start(token: &str) -> Server {
         config_path,
         shared,
         commands,
+        api_state: state,
         _dir: dir,
         thread: Some(thread),
     }
@@ -472,6 +490,7 @@ fn config_get_masks_secrets_and_put_roundtrips() {
             webhook_url: Some("https://discord.com/api/webhooks/a/b".into()),
             webhook_url_file: None,
             notify_on_start: false,
+            ..Default::default()
         });
     }
 
@@ -2351,4 +2370,760 @@ fn cancel_project_scans_beyond_20_runs_for_orphaned_running_run() {
             .status,
         lunacy::model::RunStatus::Cancelled
     );
+}
+
+#[test]
+fn paused_project_exposed_in_api_skips_webhooks_and_allows_manual_trigger() {
+    let s = start("tok");
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.commands.lock().unwrap().insert("demo".into(), tx);
+
+    // Default: enabled = true on GET /api/projects and GET /api/projects/demo.
+    let r = request(s.port, "GET", "/api/projects/demo", Some("tok"), None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(json(&r.body)["enabled"], true);
+
+    // Pause project and enable webhook secret + watch_prs.
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.projects[0].enabled = Some(false);
+        guard.config.projects[0].watch_prs = true;
+        guard.config.github = Some(lunacy::config::GithubCfg {
+            mode: None,
+            token: None,
+            token_file: None,
+            api_url: None,
+            webhook_secret: Some("wh-sec".into()),
+            webhook_secret_file: None,
+            app: None,
+        });
+    }
+
+    let r = request(s.port, "GET", "/api/projects", Some("tok"), None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(json(&r.body)[0]["enabled"], false);
+    let r = request(s.port, "GET", "/api/projects/demo", Some("tok"), None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(json(&r.body)["enabled"], false);
+
+    // Push webhook -> 202 project is paused.
+    let push_body = serde_json::json!({
+        "ref": "refs/heads/master",
+        "after": "1111111111111111111111111111111111111111",
+        "repository": { "full_name": "teppyboy/demo" }
+    })
+    .to_string();
+    let push_sig = api::signature_header("wh-sec", push_body.as_bytes());
+    let r = request_with_headers(
+        s.port,
+        "POST",
+        "/api/github/webhook",
+        None,
+        &[
+            ("X-GitHub-Event", "push"),
+            ("X-Hub-Signature-256", &push_sig),
+        ],
+        Some(&push_body),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    let v = json(&r.body);
+    assert_eq!(v["queued"], false);
+    assert_eq!(v["reason"], "project is paused");
+
+    // Pull request webhook -> 202 project is paused.
+    let pr_body = serde_json::json!({
+        "action": "opened",
+        "repository": { "full_name": "teppyboy/demo" },
+        "pull_request": {
+            "number": 7,
+            "title": "feat: paused pr",
+            "head": {
+                "sha": "2222222222222222222222222222222222222222",
+                "ref": "feat/x",
+                "repo": { "full_name": "teppyboy/demo", "fork": false }
+            },
+            "base": {
+                "sha": "1111111111111111111111111111111111111111",
+                "ref": "master",
+                "repo": { "full_name": "teppyboy/demo", "fork": false }
+            }
+        }
+    })
+    .to_string();
+    let pr_sig = api::signature_header("wh-sec", pr_body.as_bytes());
+    let r = request_with_headers(
+        s.port,
+        "POST",
+        "/api/github/webhook",
+        None,
+        &[
+            ("X-GitHub-Event", "pull_request"),
+            ("X-Hub-Signature-256", &pr_sig),
+        ],
+        Some(&pr_body),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    let v = json(&r.body);
+    assert_eq!(v["queued"], false);
+    assert_eq!(v["reason"], "project is paused");
+
+    // check_run rerequested webhook -> 202 project is paused.
+    let cr_body = serde_json::json!({
+        "action": "rerequested",
+        "repository": { "full_name": "teppyboy/demo" },
+        "check_run": { "head_sha": "3333333333333333333333333333333333333333" }
+    })
+    .to_string();
+    let cr_sig = api::signature_header("wh-sec", cr_body.as_bytes());
+    let r = request_with_headers(
+        s.port,
+        "POST",
+        "/api/github/webhook",
+        None,
+        &[
+            ("X-GitHub-Event", "check_run"),
+            ("X-Hub-Signature-256", &cr_sig),
+        ],
+        Some(&cr_body),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    let v = json(&r.body);
+    assert_eq!(v["queued"], false);
+    assert_eq!(v["reason"], "project is paused");
+
+    assert!(rx.try_recv().is_err(), "no webhook triggers queued");
+
+    // Manual trigger still succeeds on a paused project.
+    let r = request(
+        s.port,
+        "POST",
+        "/api/projects/demo/trigger",
+        Some("tok"),
+        Some(r#"{"force":true}"#),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert!(matches!(rx.try_recv(), Ok(Command::Trigger { .. })));
+}
+
+#[test]
+fn discord_test_endpoint_validation_and_mock_delivery() {
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+
+    let s = start("tok");
+
+    // Auth required.
+    let r = request(s.port, "POST", "/api/discord/test", None, None);
+    assert_eq!(r.status, 401);
+
+    // Unknown project -> 404.
+    let r = request(
+        s.port,
+        "POST",
+        "/api/discord/test",
+        Some("tok"),
+        Some(r#"{"project":"missing"}"#),
+    );
+    assert_eq!(r.status, 404, "{}", r.body);
+    assert_eq!(json(&r.body)["error"], "project not found");
+
+    // Unconfigured global & project -> 400 (even if caller tries passing arbitrary url).
+    let r = request(
+        s.port,
+        "POST",
+        "/api/discord/test",
+        Some("tok"),
+        Some(r#"{"url":"http://127.0.0.1:9/evil"}"#),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(
+        json(&r.body)["error"],
+        "discord webhook is disabled or not configured"
+    );
+
+    // Spin up a local mock Discord webhook server.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let status_code = Arc::new(AtomicU16::new(204));
+    let status_clone = status_code.clone();
+    let captured: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap_clone = captured.clone();
+
+    let mock = std::thread::spawn(move || {
+        while !stop_clone.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut first_line = String::new();
+                    let _ = reader.read_line(&mut first_line);
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        cap_clone
+                            .lock()
+                            .unwrap()
+                            .push((first_line.trim().to_string(), v));
+                    }
+                    let code = status_clone.load(Ordering::SeqCst);
+                    let resp = if code == 204 {
+                        "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                            .to_string()
+                    } else {
+                        format!(
+                            "HTTP/1.1 {code} Error\r\nConnection: close\r\nContent-Length: 4\r\n\r\nfail"
+                        )
+                    };
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Configure global webhook.
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.discord = Some(lunacy::config::DiscordCfg {
+            webhook_url: Some(format!("http://{addr}/global")),
+            username: Some("GlobalTester".into()),
+            ..Default::default()
+        });
+    }
+
+    // Global test (empty body).
+    let r = request(s.port, "POST", "/api/discord/test", Some("tok"), None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = json(&r.body);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["source"], "global");
+
+    // Immediate back-to-back request hits cooldown -> 429.
+    let r = request(s.port, "POST", "/api/discord/test", Some("tok"), None);
+    assert_eq!(r.status, 429, "{}", r.body);
+    assert_eq!(
+        json(&r.body)["error"],
+        "discord test already in flight; please wait a moment"
+    );
+
+    // Project test inheriting global webhook (after cooldown reset).
+    s.reset_discord_test_guard();
+    let r = request(
+        s.port,
+        "POST",
+        "/api/discord/test",
+        Some("tok"),
+        Some(r#"{"project":"demo"}"#),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(json(&r.body)["source"], "global");
+
+    // Project disabled -> 400 even when global is configured.
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.projects[0].discord_enabled = Some(false);
+    }
+    let r = request(
+        s.port,
+        "POST",
+        "/api/discord/test",
+        Some("tok"),
+        Some(r#"{"project":"demo"}"#),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(
+        json(&r.body)["error"],
+        "discord webhook is disabled or not configured"
+    );
+
+    // Project with custom webhook + username -> source = "project".
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.projects[0].discord_enabled = Some(true);
+        guard.config.projects[0].discord_webhook_url = Some(format!("http://{addr}/project"));
+        guard.config.projects[0].discord_username = Some("DemoTester".into());
+    }
+    s.reset_discord_test_guard();
+    let r = request(
+        s.port,
+        "POST",
+        "/api/discord/test",
+        Some("tok"),
+        Some(r#"{"project":"demo"}"#),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(json(&r.body)["ok"], true);
+    assert_eq!(json(&r.body)["source"], "project");
+
+    // Upstream webhook failure -> 502.
+    status_code.store(500, Ordering::SeqCst);
+    s.reset_discord_test_guard();
+    let r = request(
+        s.port,
+        "POST",
+        "/api/discord/test",
+        Some("tok"),
+        Some(r#"{"project":"demo"}"#),
+    );
+    assert_eq!(r.status, 502, "{}", r.body);
+
+    stop.store(true, Ordering::SeqCst);
+    mock.join().unwrap();
+
+    let got = captured.lock().unwrap();
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert!(got[0].0.contains("/global"), "{}", got[0].0);
+    assert_eq!(got[0].1["username"], "GlobalTester");
+    assert_eq!(got[0].1["embeds"][0]["title"], "[lunacy] test notification");
+
+    assert!(got[2].0.contains("/project"), "{}", got[2].0);
+    assert_eq!(got[2].1["username"], "DemoTester");
+    assert_eq!(got[2].1["embeds"][0]["title"], "[lunacy] test notification");
+}
+
+#[test]
+fn discord_test_endpoint_rejects_concurrent_in_flight_request_with_429() {
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let s = start("tok");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+
+    let slow_mock = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+        }
+        let _ = accepted_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        let _ = stream.write_all(
+            b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        );
+    });
+
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.discord = Some(lunacy::config::DiscordCfg {
+            webhook_url: Some(format!("http://{addr}/slow")),
+            ..Default::default()
+        });
+    }
+
+    let port = s.port;
+    let first =
+        std::thread::spawn(move || request(port, "POST", "/api/discord/test", Some("tok"), None));
+
+    // Wait until the first request is in-flight against the slow mock server.
+    accepted_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first request reached mock");
+
+    // Second concurrent request gets 429 immediately.
+    let second = request(s.port, "POST", "/api/discord/test", Some("tok"), None);
+    assert_eq!(second.status, 429, "{}", second.body);
+    assert_eq!(
+        json(&second.body)["error"],
+        "discord test already in flight; please wait a moment"
+    );
+
+    let _ = release_tx.send(());
+    let first_reply = first.join().unwrap();
+    assert_eq!(first_reply.status, 200, "{}", first_reply.body);
+    slow_mock.join().unwrap();
+}
+
+#[test]
+fn retry_run_endpoint_requeues_regular_and_pr_runs_and_enforces_guards() {
+    let s = start("tok");
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.commands.lock().unwrap().insert("demo".into(), tx);
+
+    // 1. Auth required.
+    let r = request(s.port, "POST", "/api/runs/demo-1-aaa/retry", None, None);
+    assert_eq!(r.status, 401);
+
+    // 2. Unknown run -> 404.
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-999-missing/retry",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 404, "{}", r.body);
+    assert_eq!(json(&r.body)["error"], "run not found");
+
+    // 3. Regular failed run -> 202 and Command::Trigger preserves sha + git_ref with force=true.
+    let mut regular = lunacy::model::Run::new(
+        "demo",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fix: flaky test".into(),
+        lunacy::model::Trigger::Webhook,
+        Vec::new(),
+    );
+    regular.id = "demo-1001-aaaaaaa".into();
+    regular.status = lunacy::model::RunStatus::Failure;
+    regular.git_ref = Some("master".into());
+    regular.finished_at = Some(regular.started_at + 5);
+    lunacy::model::persist_run(&s.state_dir, &regular).unwrap();
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-1001-aaaaaaa/retry",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    let v = json(&r.body);
+    assert_eq!(v["queued"], true);
+    assert_eq!(v["project"], "demo");
+    assert_eq!(v["sha"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    assert_eq!(v["run_id"], "demo-1001-aaaaaaa");
+    match rx.recv_timeout(Duration::from_secs(5)).expect("cmd") {
+        Command::Trigger {
+            sha,
+            force,
+            trigger,
+            git_ref,
+            pr,
+            deploy_only,
+            force_deploy,
+        } => {
+            assert_eq!(
+                sha.as_deref(),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            );
+            assert!(force);
+            assert_eq!(trigger, lunacy::model::Trigger::Manual);
+            assert_eq!(git_ref.as_deref(), Some("master"));
+            assert!(pr.is_none());
+            assert!(!deploy_only);
+            assert!(!force_deploy);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    // 4. PR run retry preserves full PrContext and git_ref (CI-only on worker).
+    let mut pr_run = lunacy::model::Run::new(
+        "demo",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "feat: pr work".into(),
+        lunacy::model::Trigger::PullRequest,
+        Vec::new(),
+    );
+    pr_run.id = "demo-1002-bbbbbbb".into();
+    pr_run.status = lunacy::model::RunStatus::Failure;
+    pr_run.git_ref = Some("feat/pr-77".into());
+    pr_run.pr_number = Some(77);
+    pr_run.pr_title = Some("feat: pr work".into());
+    pr_run.pr_head_ref = Some("feat/pr-77".into());
+    pr_run.pr_base_ref = Some("master".into());
+    pr_run.finished_at = Some(pr_run.started_at + 5);
+    lunacy::model::persist_run(&s.state_dir, &pr_run).unwrap();
+
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-1002-bbbbbbb/retry",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    let v = json(&r.body);
+    assert_eq!(v["queued"], true);
+    assert_eq!(v["project"], "demo");
+    assert_eq!(v["sha"], "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert_eq!(v["run_id"], "demo-1002-bbbbbbb");
+    match rx.recv_timeout(Duration::from_secs(5)).expect("pr cmd") {
+        Command::Trigger {
+            sha,
+            force,
+            trigger,
+            git_ref,
+            pr,
+            deploy_only,
+            force_deploy,
+        } => {
+            assert_eq!(
+                sha.as_deref(),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            );
+            assert!(force);
+            assert_eq!(trigger, lunacy::model::Trigger::Manual);
+            assert_eq!(git_ref.as_deref(), Some("feat/pr-77"));
+            let pr = pr.expect("PrContext preserved");
+            assert_eq!(pr.number, 77);
+            assert_eq!(pr.title, "feat: pr work");
+            assert_eq!(pr.head_ref, "feat/pr-77");
+            assert_eq!(pr.base_ref, "master");
+            assert!(pr.base_sha.is_empty());
+            assert!(!deploy_only);
+            assert!(!force_deploy);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    // 5. Running project -> 409.
+    s.shared.lock().unwrap().projects[0].running = true;
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/demo-1001-aaaaaaa/retry",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 409, "{}", r.body);
+    assert_eq!(json(&r.body)["error"], "project is already running");
+    s.shared.lock().unwrap().projects[0].running = false;
+
+    // 6. Project removed from config -> 404.
+    let mut removed_run = lunacy::model::Run::new(
+        "deleted-proj",
+        "cccccccccccccccccccccccccccccccccccccccc",
+        "old".into(),
+        lunacy::model::Trigger::Manual,
+        Vec::new(),
+    );
+    removed_run.id = "deleted-proj-1003-ccccccc".into();
+    removed_run.status = lunacy::model::RunStatus::Failure;
+    lunacy::model::persist_run(&s.state_dir, &removed_run).unwrap();
+    let r = request(
+        s.port,
+        "POST",
+        "/api/runs/deleted-proj-1003-ccccccc/retry",
+        Some("tok"),
+        None,
+    );
+    assert_eq!(r.status, 404, "{}", r.body);
+    assert_eq!(json(&r.body)["error"], "project not found");
+}
+
+#[test]
+fn check_run_requested_action_webhook_handles_retry_ci_retry_deploy_and_pr_safety() {
+    let s = start("tok");
+    let secret = "wh-action-secret";
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.commands.lock().unwrap().insert("demo".into(), tx);
+    {
+        let mut guard = s.shared.lock().unwrap();
+        guard.config.github = Some(lunacy::config::GithubCfg {
+            mode: None,
+            token: None,
+            token_file: None,
+            api_url: None,
+            webhook_secret: Some(secret.into()),
+            webhook_secret_file: None,
+            app: None,
+        });
+    }
+
+    // Persist a branch run and a PR run so external_id lookup can restore context.
+    let mut branch_run = lunacy::model::Run::new(
+        "demo",
+        "1111111111111111111111111111111111111111",
+        "release: main".into(),
+        lunacy::model::Trigger::Webhook,
+        Vec::new(),
+    );
+    branch_run.id = "demo-2001-1111111".into();
+    branch_run.status = lunacy::model::RunStatus::Failure;
+    branch_run.git_ref = Some("tags/v2.0.0".into());
+    lunacy::model::persist_run(&s.state_dir, &branch_run).unwrap();
+
+    let mut pr_run = lunacy::model::Run::new(
+        "demo",
+        "2222222222222222222222222222222222222222",
+        "feat: pr retry".into(),
+        lunacy::model::Trigger::PullRequest,
+        Vec::new(),
+    );
+    pr_run.id = "demo-2002-2222222".into();
+    pr_run.status = lunacy::model::RunStatus::Failure;
+    pr_run.git_ref = Some("feat/pr-99".into());
+    pr_run.pr_number = Some(99);
+    pr_run.pr_title = Some("feat: pr retry".into());
+    pr_run.pr_head_ref = Some("feat/pr-99".into());
+    pr_run.pr_base_ref = Some("master".into());
+    lunacy::model::persist_run(&s.state_dir, &pr_run).unwrap();
+
+    let send_check_run = |payload: &serde_json::Value| {
+        let body = payload.to_string();
+        let sig = api::signature_header(secret, body.as_bytes());
+        request_with_headers(
+            s.port,
+            "POST",
+            "/api/github/webhook",
+            None,
+            &[
+                ("X-GitHub-Event", "check_run"),
+                ("X-Hub-Signature-256", &sig),
+            ],
+            Some(&body),
+        )
+    };
+
+    // 1. retry_ci on PR run preserves PR context and queues full CI (deploy_only=false).
+    let r = send_check_run(&serde_json::json!({
+        "action": "requested_action",
+        "requested_action": { "identifier": "retry_ci" },
+        "repository": { "full_name": "teppyboy/demo" },
+        "check_run": {
+            "head_sha": "2222222222222222222222222222222222222222",
+            "external_id": "demo-2002-2222222"
+        }
+    }));
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(json(&r.body)["queued"], true);
+    match rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("retry_ci cmd")
+    {
+        Command::Trigger {
+            sha,
+            force,
+            trigger,
+            git_ref,
+            pr,
+            deploy_only,
+            force_deploy,
+        } => {
+            assert_eq!(
+                sha.as_deref(),
+                Some("2222222222222222222222222222222222222222")
+            );
+            assert!(force);
+            assert_eq!(trigger, lunacy::model::Trigger::Webhook);
+            assert_eq!(git_ref.as_deref(), Some("feat/pr-99"));
+            let pr = pr.expect("PR context preserved from external_id");
+            assert_eq!(pr.number, 99);
+            assert_eq!(pr.head_ref, "feat/pr-99");
+            assert_eq!(pr.base_ref, "master");
+            assert!(!deploy_only);
+            assert!(!force_deploy);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    // 2. retry_deploy on branch/tag run queues deploy_only=true, force_deploy=true, preserving git_ref.
+    let r = send_check_run(&serde_json::json!({
+        "action": "requested_action",
+        "requested_action": { "identifier": "retry_deploy" },
+        "repository": { "full_name": "teppyboy/demo" },
+        "check_run": {
+            "head_sha": "1111111111111111111111111111111111111111",
+            "external_id": "demo-2001-1111111"
+        }
+    }));
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(json(&r.body)["queued"], true);
+    match rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("retry_deploy cmd")
+    {
+        Command::Trigger {
+            sha,
+            force,
+            trigger,
+            git_ref,
+            pr,
+            deploy_only,
+            force_deploy,
+        } => {
+            assert_eq!(
+                sha.as_deref(),
+                Some("1111111111111111111111111111111111111111")
+            );
+            assert!(force);
+            assert_eq!(trigger, lunacy::model::Trigger::Webhook);
+            assert_eq!(git_ref.as_deref(), Some("tags/v2.0.0"));
+            assert!(pr.is_none());
+            assert!(deploy_only);
+            assert!(force_deploy);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    // 3. retry_deploy on PR run MUST be refused (pull requests cannot deploy).
+    let r = send_check_run(&serde_json::json!({
+        "action": "requested_action",
+        "requested_action": { "identifier": "retry_deploy" },
+        "repository": { "full_name": "teppyboy/demo" },
+        "check_run": {
+            "head_sha": "2222222222222222222222222222222222222222",
+            "external_id": "demo-2002-2222222"
+        }
+    }));
+    assert_eq!(r.status, 202, "{}", r.body);
+    let v = json(&r.body);
+    assert_eq!(v["queued"], false);
+    assert_eq!(v["reason"], "pull requests cannot deploy");
+    assert!(rx.try_recv().is_err(), "PR retry_deploy must queue nothing");
+
+    // 4. Unknown requested_action identifier is ignored cleanly.
+    let r = send_check_run(&serde_json::json!({
+        "action": "requested_action",
+        "requested_action": { "identifier": "something_else" },
+        "repository": { "full_name": "teppyboy/demo" },
+        "check_run": {
+            "head_sha": "1111111111111111111111111111111111111111"
+        }
+    }));
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(json(&r.body)["queued"], false);
+    assert_eq!(json(&r.body)["reason"], "ignored requested_action");
+    assert!(rx.try_recv().is_err());
+
+    // 5. Paused project skips requested_action too.
+    s.shared.lock().unwrap().config.projects[0].enabled = Some(false);
+    let r = send_check_run(&serde_json::json!({
+        "action": "requested_action",
+        "requested_action": { "identifier": "retry_ci" },
+        "repository": { "full_name": "teppyboy/demo" },
+        "check_run": {
+            "head_sha": "1111111111111111111111111111111111111111",
+            "external_id": "demo-2001-1111111"
+        }
+    }));
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(json(&r.body)["queued"], false);
+    assert_eq!(json(&r.body)["reason"], "project is paused");
+    assert!(rx.try_recv().is_err());
 }

@@ -31,6 +31,7 @@ pub struct DeployChecksResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectDeployCheck {
     pub name: String,
+    pub enabled: bool,
     pub repo_path: String,
     pub remote: String,
     pub branch: String,
@@ -73,6 +74,7 @@ pub struct ReportingCheck {
     pub ci_context: String,
     pub deploy_context: String,
     pub discord_source: String,
+    pub discord_notify_on: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,7 +195,6 @@ pub fn build_deploy_checks(
                 state_dir,
                 os,
                 github_enabled,
-                discord_global,
                 &mut docker_cache,
             )
         })
@@ -225,10 +226,11 @@ fn check_project(
     snap: Option<&ProjectSnapshot>,
     state_dir: &Path,
     os: Os,
-    github_enabled: bool,
-    discord_global: bool,
+    global_github_enabled: bool,
     docker_cache: &mut BTreeMap<bool, Result<String, String>>,
 ) -> ProjectDeployCheck {
+    let enabled = project.is_enabled();
+    let project_github_enabled = cfg.github_enabled_for(project);
     let repo_path = &project.repo_path;
     let repo_exists = repo_path.is_dir();
     let is_git_repo = repo_exists && is_git_work_tree(repo_path);
@@ -277,6 +279,20 @@ fn check_project(
 
     let mut checks = Vec::new();
 
+    if !enabled {
+        checks.push(CheckItem::warn(
+            "Status",
+            "project is paused (automatic polling and webhooks disabled)",
+        ));
+    }
+
+    if project.github_enabled == Some(true) && !global_github_enabled {
+        checks.push(CheckItem::warn(
+            "GitHub",
+            "project enables GitHub reporting, but global [github] is not configured",
+        ));
+    }
+
     // 1. Repository path & git check.
     if !repo_exists {
         checks.push(CheckItem::error(
@@ -302,7 +318,7 @@ fn check_project(
                 "Remote",
                 format!("remote '{}' is not configured", project.remote),
             ));
-        } else if github_enabled && github_repo.is_none() {
+        } else if project_github_enabled && github_repo.is_none() {
             checks.push(CheckItem::warn(
                 "Remote",
                 format!(
@@ -322,7 +338,7 @@ fn check_project(
             };
             checks.push(CheckItem::ok("Remote", detail));
         }
-    } else if github_enabled && github_repo.is_none() {
+    } else if project_github_enabled && github_repo.is_none() {
         checks.push(CheckItem::warn(
             "GitHub repo",
             "GitHub reporting is enabled but github_repo could not be resolved",
@@ -431,23 +447,32 @@ fn check_project(
 
     let overall = compute_overall(&checks, &deploy_steps);
 
-    let discord_source = if project
-        .discord_webhook_url
-        .as_deref()
-        .is_some_and(|u| !u.trim().is_empty())
-    {
-        "project"
-    } else if discord_global {
-        "global"
+    let resolved_discord = cfg.discord_for(project);
+    let discord_source = if project.discord_enabled == Some(false) {
+        "disabled"
+    } else if let Some(ref resolved) = resolved_discord {
+        resolved.source
     } else {
         "none"
     };
+    let discord_notify_on = resolved_discord
+        .as_ref()
+        .map(|r| r.notify_on)
+        .unwrap_or_else(|| {
+            project
+                .discord_notify_on
+                .or_else(|| cfg.discord.as_ref().and_then(|d| d.notify_on))
+                .unwrap_or_default()
+        })
+        .as_str()
+        .to_string();
 
     let reporting = ReportingCheck {
-        github_enabled: github_enabled && github_repo.is_some(),
+        github_enabled: project_github_enabled && github_repo.is_some(),
         ci_context: project.contexts.ci.clone(),
         deploy_context: project.contexts.deploy.clone(),
         discord_source: discord_source.to_string(),
+        discord_notify_on,
     };
 
     let last_deploy = resolve_last_deploy(snap, state_dir, &project.name);
@@ -455,6 +480,7 @@ fn check_project(
 
     ProjectDeployCheck {
         name: project.name.clone(),
+        enabled,
         repo_path: repo_path.to_string_lossy().to_string(),
         remote: project.remote.clone(),
         branch: project.branch.clone(),
@@ -1009,7 +1035,9 @@ mod tests {
             repo_path,
             remote: "origin".into(),
             branch: "master".into(),
+            enabled: None,
             github_repo: None,
+            github_enabled: None,
             checkout: Checkout::None,
             poll_interval: None,
             trigger_mode: None,
@@ -1017,10 +1045,16 @@ mod tests {
             timeout: None,
             env: Default::default(),
             contexts: Default::default(),
+            discord_enabled: None,
             discord_webhook_url: None,
+            discord_webhook_url_file: None,
             notify_on_start: None,
+            discord_notify_on: None,
+            discord_username: None,
+            discord_mention_on_failure: None,
             shell: None,
             platforms: Default::default(),
+            act_args: Vec::new(),
             watch_prs: false,
             deploy_refs: Vec::new(),
             watch_tags: false,
@@ -1118,6 +1152,7 @@ mod tests {
             webhook_url: Some("https://discord.com/api/webhooks/1/2".into()),
             webhook_url_file: None,
             notify_on_start: false,
+            ..DiscordCfg::default()
         });
         cfg.projects = vec![proj];
 
@@ -1295,5 +1330,65 @@ mod tests {
             .expect("Webhook check");
         assert_eq!(wh.level, "ok");
         assert!(wh.detail.contains("owner/demo"), "{}", wh.detail);
+    }
+
+    #[test]
+    fn deploy_checks_report_paused_discord_disabled_and_github_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo, Some("https://github.com/owner/demo.git"));
+        let state_dir = dir.path().join("state");
+
+        let mut proj = base_project(repo);
+        proj.enabled = Some(false);
+        proj.discord_enabled = Some(false);
+        proj.discord_notify_on = Some(config::DiscordNotifyOn::Failures);
+        proj.github_enabled = Some(false);
+
+        let mut cfg = Config {
+            projects: vec![proj],
+            ..Config::default()
+        };
+        cfg.github = Some(GithubCfg {
+            mode: None,
+            token: Some("tok".into()),
+            token_file: None,
+            api_url: None,
+            webhook_secret: None,
+            webhook_secret_file: None,
+            app: None,
+        });
+        cfg.discord = Some(DiscordCfg {
+            webhook_url: Some("https://discord.com/api/webhooks/1/2".into()),
+            ..DiscordCfg::default()
+        });
+
+        let res = build_deploy_checks(&cfg, &[], &state_dir, Os::Linux);
+        let p = &res.projects[0];
+        assert!(!p.enabled);
+        assert_eq!(p.overall, "warn");
+        assert!(p
+            .checks
+            .iter()
+            .any(|c| c.label == "Status" && c.level == "warn" && c.detail.contains("paused")));
+        assert!(!p.reporting.github_enabled);
+        assert_eq!(p.reporting.discord_source, "disabled");
+        assert_eq!(p.reporting.discord_notify_on, "failures");
+
+        // Project enables github_enabled = Some(true) while global [github] is unconfigured -> warning.
+        cfg.github = None;
+        cfg.projects[0].enabled = Some(true);
+        cfg.projects[0].github_enabled = Some(true);
+        cfg.projects[0].discord_enabled = None;
+        let res = build_deploy_checks(&cfg, &[], &state_dir, Os::Linux);
+        let p = &res.projects[0];
+        assert!(p.enabled);
+        assert!(!p.reporting.github_enabled);
+        assert_eq!(p.reporting.discord_source, "global");
+        assert_eq!(p.reporting.discord_notify_on, "failures");
+        assert!(p
+            .checks
+            .iter()
+            .any(|c| c.label == "GitHub" && c.level == "warn"));
     }
 }

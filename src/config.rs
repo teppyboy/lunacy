@@ -280,7 +280,35 @@ impl AppCfg {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscordNotifyOn {
+    #[default]
+    All,
+    Failures,
+}
+
+impl DiscordNotifyOn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiscordNotifyOn::All => "all",
+            DiscordNotifyOn::Failures => "failures",
+        }
+    }
+}
+
+/// Resolved Discord notification settings for a project (or global fallback).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDiscord {
+    pub url: String,
+    pub notify_on_start: bool,
+    pub notify_on: DiscordNotifyOn,
+    pub username: Option<String>,
+    pub mention_on_failure: Option<String>,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscordCfg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,6 +318,12 @@ pub struct DiscordCfg {
     pub webhook_url_file: Option<PathBuf>,
     #[serde(default)]
     pub notify_on_start: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_on: Option<DiscordNotifyOn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_on_failure: Option<String>,
 }
 
 impl DiscordCfg {
@@ -389,9 +423,15 @@ pub struct ProjectCfg {
     pub remote: String,
     #[serde(default = "default_branch")]
     pub branch: String,
+    /// Set to `false` to pause automatic polling and webhooks for this project (manual triggers still work).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// `owner/name`; derived from the remote URL when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_repo: Option<String>,
+    /// Set to `false` to suppress GitHub status/check reporting for this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_enabled: Option<bool>,
     #[serde(default)]
     pub checkout: Checkout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,14 +449,29 @@ pub struct ProjectCfg {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub contexts: Contexts,
+    /// Set to `false` to disable Discord notifications for this project even when global `[discord]` is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord_webhook_url: Option<String>,
+    /// File holding the project's Discord webhook URL instead of the inline value; read trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_webhook_url_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_on_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_notify_on: Option<DiscordNotifyOn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_mention_on_failure: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<Vec<String>>,
     #[serde(default)]
     pub platforms: BTreeMap<String, String>,
+    /// Extra `act` CLI arguments appended after global `[act].args` and before `step.args`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub act_args: Vec<String>,
     /// Poll/build open GitHub Pull Requests (CI-only; PRs never deploy).
     #[serde(default)]
     pub watch_prs: bool,
@@ -445,6 +500,21 @@ fn default_branch() -> String {
 }
 
 impl ProjectCfg {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// The inline project Discord webhook URL, else the trimmed contents of `discord_webhook_url_file`.
+    pub fn discord_webhook_url_value(&self) -> Option<String> {
+        match self.discord_webhook_url.as_deref().map(str::trim) {
+            Some(u) if !u.is_empty() => Some(u.to_string()),
+            _ => self
+                .discord_webhook_url_file
+                .as_deref()
+                .and_then(read_trimmed),
+        }
+    }
+
     pub fn poll_interval(&self, general: &General) -> u64 {
         self.poll_interval.unwrap_or(general.poll_interval).max(1)
     }
@@ -695,6 +765,9 @@ impl Config {
                 "must be at least 1",
             ));
         }
+        if let Some(shell) = &self.general.shell {
+            validate_shell("general.shell", shell)?;
+        }
         if let Some(server) = &self.server {
             if server.listen.trim().is_empty() {
                 return Err(ConfigError::new("server.listen", "must not be empty"));
@@ -773,6 +846,28 @@ impl Config {
                 "discord.webhook_url_file",
                 discord.webhook_url_file.as_deref(),
             )?;
+            let url_field = if discord.webhook_url_file.is_some() {
+                "discord.webhook_url_file"
+            } else {
+                "discord.webhook_url"
+            };
+            validate_discord_webhook_url(url_field, discord.webhook_url_value().as_deref())?;
+            if let Some(username) = &discord.username {
+                if username.trim().chars().count() > 80 {
+                    return Err(ConfigError::new(
+                        "discord.username",
+                        "must be at most 80 characters",
+                    ));
+                }
+            }
+            if let Some(mention) = &discord.mention_on_failure {
+                if mention.trim().chars().count() > 2000 {
+                    return Err(ConfigError::new(
+                        "discord.mention_on_failure",
+                        "must be at most 2000 characters",
+                    ));
+                }
+            }
         }
         if let Some(act) = &self.act {
             if act.command().is_empty() {
@@ -894,6 +989,62 @@ impl Config {
                     "must not contain empty entries",
                 ));
             }
+            if p.contexts.ci.trim().is_empty() {
+                return Err(ConfigError::new(
+                    format!("{base}.contexts.ci"),
+                    "must not be empty",
+                ));
+            }
+            if p.contexts.deploy.trim().is_empty() {
+                return Err(ConfigError::new(
+                    format!("{base}.contexts.deploy"),
+                    "must not be empty",
+                ));
+            }
+            conflict(
+                &format!("{base}.discord_webhook_url"),
+                non_empty(&p.discord_webhook_url),
+                &format!("{base}.discord_webhook_url_file"),
+                p.discord_webhook_url_file.is_some(),
+            )?;
+            check_secret_file(
+                &format!("{base}.discord_webhook_url_file"),
+                p.discord_webhook_url_file.as_deref(),
+            )?;
+            let proj_url_field = if p.discord_webhook_url_file.is_some() {
+                format!("{base}.discord_webhook_url_file")
+            } else {
+                format!("{base}.discord_webhook_url")
+            };
+            validate_discord_webhook_url(
+                &proj_url_field,
+                p.discord_webhook_url_value().as_deref(),
+            )?;
+            if let Some(username) = &p.discord_username {
+                if username.trim().chars().count() > 80 {
+                    return Err(ConfigError::new(
+                        format!("{base}.discord_username"),
+                        "must be at most 80 characters",
+                    ));
+                }
+            }
+            if let Some(mention) = &p.discord_mention_on_failure {
+                if mention.trim().chars().count() > 2000 {
+                    return Err(ConfigError::new(
+                        format!("{base}.discord_mention_on_failure"),
+                        "must be at most 2000 characters",
+                    ));
+                }
+            }
+            if let Some(shell) = &p.shell {
+                validate_shell(&format!("{base}.shell"), shell)?;
+            }
+            if p.act_args.iter().any(|a| a.is_empty() || a.contains('\0')) {
+                return Err(ConfigError::new(
+                    format!("{base}.act_args"),
+                    "must not contain empty strings or NUL bytes",
+                ));
+            }
             for (kind, steps) in [("ci", &p.ci), ("deploy", &p.deploy)] {
                 for (j, s) in steps.iter().enumerate() {
                     let sb = format!("{base}.{kind}[{j}]");
@@ -925,12 +1076,7 @@ impl Config {
                         ));
                     }
                     if let Some(shell) = &s.shell {
-                        if shell.is_empty() {
-                            return Err(ConfigError::new(
-                                format!("{sb}.shell"),
-                                "must not be empty",
-                            ));
-                        }
+                        validate_shell(&format!("{sb}.shell"), shell)?;
                     }
                 }
             }
@@ -952,21 +1098,63 @@ impl Config {
         self.projects.iter().find(|p| p.name == name)
     }
 
-    pub fn discord_for(&self, project: &ProjectCfg) -> Option<(String, bool)> {
-        let url = project
-            .discord_webhook_url
-            .clone()
-            .filter(|u| !u.trim().is_empty())
-            .or_else(|| self.discord.as_ref().and_then(|d| d.webhook_url_value()))?;
-        let url = url.trim().to_string();
-        if url.is_empty() {
+    pub fn github_enabled_for(&self, project: &ProjectCfg) -> bool {
+        if project.github_enabled == Some(false) {
+            return false;
+        }
+        self.github.as_ref().is_some_and(|g| g.enabled())
+    }
+
+    pub fn discord_for(&self, project: &ProjectCfg) -> Option<ResolvedDiscord> {
+        if project.discord_enabled == Some(false) {
             return None;
         }
-        let start = project
+        let (url, source) = if let Some(url) = project.discord_webhook_url_value() {
+            (url, "project")
+        } else {
+            let url = self.discord.as_ref().and_then(|d| d.webhook_url_value())?;
+            (url, "global")
+        };
+        let notify_on_start = project
             .notify_on_start
             .or_else(|| self.discord.as_ref().map(|d| d.notify_on_start))
             .unwrap_or(false);
-        Some((url, start))
+        let notify_on = project
+            .discord_notify_on
+            .or_else(|| self.discord.as_ref().and_then(|d| d.notify_on))
+            .unwrap_or(DiscordNotifyOn::All);
+        let username = trimmed_non_empty(project.discord_username.as_deref()).or_else(|| {
+            trimmed_non_empty(self.discord.as_ref().and_then(|d| d.username.as_deref()))
+        });
+        let mention_on_failure = trimmed_non_empty(project.discord_mention_on_failure.as_deref())
+            .or_else(|| {
+                trimmed_non_empty(
+                    self.discord
+                        .as_ref()
+                        .and_then(|d| d.mention_on_failure.as_deref()),
+                )
+            });
+        Some(ResolvedDiscord {
+            url,
+            notify_on_start,
+            notify_on,
+            username,
+            mention_on_failure,
+            source,
+        })
+    }
+
+    pub fn discord_global(&self) -> Option<ResolvedDiscord> {
+        let d = self.discord.as_ref()?;
+        let url = d.webhook_url_value()?;
+        Some(ResolvedDiscord {
+            url,
+            notify_on_start: d.notify_on_start,
+            notify_on: d.notify_on.unwrap_or(DiscordNotifyOn::All),
+            username: trimmed_non_empty(d.username.as_deref()),
+            mention_on_failure: trimmed_non_empty(d.mention_on_failure.as_deref()),
+            source: "global",
+        })
     }
 
     pub fn act(&self) -> ActCfg {
@@ -1129,6 +1317,10 @@ fn non_empty(v: &Option<String>) -> bool {
     v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
 
+fn trimmed_non_empty(v: Option<&str>) -> Option<String> {
+    v.map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
 /// The inline value and its `*_file` alternative are mutually exclusive.
 fn conflict(
     inline: &str,
@@ -1158,6 +1350,51 @@ fn check_secret_file(field: &str, path: Option<&Path>) -> std::result::Result<()
             field,
             format!("{} is empty", expanded.display()),
         ));
+    }
+    Ok(())
+}
+
+/// Validate a resolved Discord webhook URL (skipping the masked sentinel).
+fn validate_discord_webhook_url(
+    field: &str,
+    url: Option<&str>,
+) -> std::result::Result<(), ConfigError> {
+    let Some(u) = url else {
+        return Ok(());
+    };
+    if u == MASK {
+        return Ok(());
+    }
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"));
+    let has_bad_chars = u.chars().any(|c| c.is_whitespace() || c.is_control());
+    let authority = rest
+        .map(|r| r.split(['/', '?', '#']).next().unwrap_or(""))
+        .unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    if rest.is_none() || has_bad_chars || host.is_empty() || host.starts_with(':') {
+        return Err(ConfigError::new(
+            field,
+            "must be a valid http:// or https:// URL without whitespace or control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a shell argv list: non-empty, non-empty executable, and no NUL bytes.
+fn validate_shell(field: &str, shell: &[String]) -> std::result::Result<(), ConfigError> {
+    if shell.is_empty() {
+        return Err(ConfigError::new(field, "must not be empty"));
+    }
+    if shell[0].trim().is_empty() {
+        return Err(ConfigError::new(
+            field,
+            "shell executable must not be empty",
+        ));
+    }
+    if shell.iter().any(|a| a.contains('\0')) {
+        return Err(ConfigError::new(field, "must not contain NUL bytes"));
     }
     Ok(())
 }
@@ -1370,6 +1607,7 @@ chekout = "worktree"
             webhook_url: Some("https://discord.com/api/webhooks/x".into()),
             webhook_url_file: None,
             notify_on_start: false,
+            ..DiscordCfg::default()
         });
         if let Some(s) = cfg.server.as_mut() {
             s.token = "ui-token".into();
@@ -1503,6 +1741,7 @@ chekout = "worktree"
             webhook_url: None,
             webhook_url_file: Some(url.clone()),
             notify_on_start: false,
+            ..DiscordCfg::default()
         });
         cfg.server = Some(ServerCfg {
             listen: "127.0.0.1:1".into(),
@@ -1530,7 +1769,7 @@ chekout = "worktree"
         );
         assert_eq!(
             cfg.discord_for(&cfg.projects[0].clone())
-                .map(|(u, _)| u)
+                .map(|r| r.url)
                 .as_deref(),
             Some("https://discord.com/api/webhooks/f/g")
         );
@@ -1923,5 +2162,312 @@ chekout = "worktree"
         cfg.projects[0].poll_interval = Some(60);
         cfg.validate()
             .expect("explicit positive project poll_interval is valid");
+    }
+
+    #[test]
+    fn discord_resolution_inheritance_and_validation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proj_url_file = dir.path().join("proj-discord-url");
+        std::fs::write(
+            &proj_url_file,
+            "  https://discord.com/api/webhooks/proj/file \n",
+        )
+        .unwrap();
+
+        let mut cfg = example();
+        cfg.discord = Some(DiscordCfg {
+            webhook_url: Some("https://discord.com/api/webhooks/global/1".into()),
+            webhook_url_file: None,
+            notify_on_start: true,
+            notify_on: Some(DiscordNotifyOn::Failures),
+            username: Some("  GlobalBot  ".into()),
+            mention_on_failure: Some("  <@&111>  ".into()),
+        });
+
+        // Inherits everything from global when project overrides are unset.
+        let resolved = cfg.discord_for(&cfg.projects[0]).expect("global discord");
+        assert_eq!(resolved.url, "https://discord.com/api/webhooks/global/1");
+        assert_eq!(resolved.source, "global");
+        assert!(resolved.notify_on_start);
+        assert_eq!(resolved.notify_on, DiscordNotifyOn::Failures);
+        assert_eq!(resolved.username.as_deref(), Some("GlobalBot"));
+        assert_eq!(resolved.mention_on_failure.as_deref(), Some("<@&111>"));
+
+        // Global-only helper.
+        let global = cfg.discord_global().expect("discord_global");
+        assert_eq!(global, resolved);
+
+        // Project overrides URL (file), notify_on_start, notify_on, username, mention_on_failure.
+        cfg.projects[0].discord_webhook_url_file = Some(proj_url_file.clone());
+        cfg.projects[0].notify_on_start = Some(false);
+        cfg.projects[0].discord_notify_on = Some(DiscordNotifyOn::All);
+        cfg.projects[0].discord_username = Some("ProjectBot".into());
+        cfg.projects[0].discord_mention_on_failure = Some("<@222>".into());
+        cfg.validate().expect("valid project discord overrides");
+
+        let resolved = cfg.discord_for(&cfg.projects[0]).expect("project discord");
+        assert_eq!(resolved.url, "https://discord.com/api/webhooks/proj/file");
+        assert_eq!(resolved.source, "project");
+        assert!(!resolved.notify_on_start);
+        assert_eq!(resolved.notify_on, DiscordNotifyOn::All);
+        assert_eq!(resolved.username.as_deref(), Some("ProjectBot"));
+        assert_eq!(resolved.mention_on_failure.as_deref(), Some("<@222>"));
+
+        // Whitespace-only project username/mention falls back to global.
+        cfg.projects[0].discord_username = Some("   ".into());
+        cfg.projects[0].discord_mention_on_failure = Some("".into());
+        let resolved = cfg.discord_for(&cfg.projects[0]).expect("fallback fields");
+        assert_eq!(resolved.username.as_deref(), Some("GlobalBot"));
+        assert_eq!(resolved.mention_on_failure.as_deref(), Some("<@&111>"));
+
+        // discord_enabled = Some(false) suppresses even when both project and global URLs exist.
+        cfg.projects[0].discord_enabled = Some(false);
+        assert!(cfg.discord_for(&cfg.projects[0]).is_none());
+        cfg.projects[0].discord_enabled = None;
+
+        // Mutual exclusion between project discord_webhook_url and discord_webhook_url_file.
+        let mut bad = cfg.clone();
+        bad.projects[0].discord_webhook_url =
+            Some("https://discord.com/api/webhooks/inline/1".into());
+        let err = bad.validate().unwrap_err();
+        assert_eq!(
+            err.field.as_deref(),
+            Some("project[0].discord_webhook_url_file")
+        );
+
+        // Unreadable project discord_webhook_url_file fails validation.
+        let mut bad = cfg.clone();
+        bad.projects[0].discord_webhook_url = None;
+        bad.projects[0].discord_webhook_url_file = Some(dir.path().join("missing-hook"));
+        let err = bad.validate().unwrap_err();
+        assert_eq!(
+            err.field.as_deref(),
+            Some("project[0].discord_webhook_url_file")
+        );
+
+        // Username > 80 chars rejected on global and project.
+        let mut bad = cfg.clone();
+        bad.discord.as_mut().unwrap().username = Some("a".repeat(81));
+        assert_eq!(
+            bad.validate().unwrap_err().field.as_deref(),
+            Some("discord.username")
+        );
+        let mut bad = cfg.clone();
+        bad.projects[0].discord_username = Some("b".repeat(81));
+        assert_eq!(
+            bad.validate().unwrap_err().field.as_deref(),
+            Some("project[0].discord_username")
+        );
+        // Exactly 80 chars is accepted.
+        let mut ok = cfg.clone();
+        ok.discord.as_mut().unwrap().username = Some("a".repeat(80));
+        ok.projects[0].discord_username = Some("b".repeat(80));
+        ok.validate().expect("80 char usernames are valid");
+    }
+
+    #[test]
+    fn per_project_overrides_validation_and_github_enabled_for() {
+        let mut cfg = example();
+        assert!(cfg.projects[0].is_enabled());
+        cfg.projects[0].enabled = Some(false);
+        assert!(!cfg.projects[0].is_enabled());
+
+        // github_enabled_for
+        cfg.github = Some(GithubCfg {
+            mode: None,
+            token: Some("ghp_tok".into()),
+            token_file: None,
+            api_url: None,
+            webhook_secret: None,
+            webhook_secret_file: None,
+            app: None,
+        });
+        assert!(cfg.github_enabled_for(&cfg.projects[0]));
+        cfg.projects[0].github_enabled = Some(false);
+        assert!(!cfg.github_enabled_for(&cfg.projects[0]));
+        cfg.projects[0].github_enabled = Some(true);
+        assert!(cfg.github_enabled_for(&cfg.projects[0]));
+        cfg.github = None;
+        assert!(!cfg.github_enabled_for(&cfg.projects[0]));
+
+        // Empty general.shell and project.shell rejected.
+        let mut bad = example();
+        bad.general.shell = Some(Vec::new());
+        assert_eq!(
+            bad.validate().unwrap_err().field.as_deref(),
+            Some("general.shell")
+        );
+        let mut bad = example();
+        bad.projects[0].shell = Some(Vec::new());
+        assert_eq!(
+            bad.validate().unwrap_err().field.as_deref(),
+            Some("project[0].shell")
+        );
+
+        // project.act_args rejects empty string and NUL byte.
+        let mut bad = example();
+        bad.projects[0].act_args = vec!["--pull=false".into(), "".into()];
+        assert_eq!(
+            bad.validate().unwrap_err().field.as_deref(),
+            Some("project[0].act_args")
+        );
+        let mut bad = example();
+        bad.projects[0].act_args = vec!["--env\0bad".into()];
+        assert_eq!(
+            bad.validate().unwrap_err().field.as_deref(),
+            Some("project[0].act_args")
+        );
+        let mut ok = example();
+        ok.projects[0].act_args = vec!["--pull=false".into(), "--verbose".into()];
+        ok.validate().expect("valid act_args");
+    }
+
+    #[test]
+    fn discord_webhook_url_and_mention_validation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Invalid schemes, missing host, whitespace, and control chars rejected on global inline URL.
+        for bad_url in [
+            "ftp://discord.com/api/webhooks/1/2",
+            "not-a-url",
+            "https://",
+            "https:///path",
+            "http://:8080/hook",
+            "https://discord.com/api/webhooks/1 2",
+            "https://discord.com/api/webhooks/1\n2",
+        ] {
+            let mut cfg = example();
+            cfg.discord = Some(DiscordCfg {
+                webhook_url: Some(bad_url.into()),
+                ..DiscordCfg::default()
+            });
+            let err = cfg.validate().unwrap_err();
+            assert_eq!(
+                err.field.as_deref(),
+                Some("discord.webhook_url"),
+                "url={bad_url:?}"
+            );
+        }
+
+        // Invalid URL inside discord.webhook_url_file blames discord.webhook_url_file.
+        let bad_file = dir.path().join("bad-global-hook");
+        std::fs::write(&bad_file, "file:///etc/passwd\n").unwrap();
+        let mut cfg = example();
+        cfg.discord = Some(DiscordCfg {
+            webhook_url_file: Some(bad_file),
+            ..DiscordCfg::default()
+        });
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("discord.webhook_url_file")
+        );
+
+        // Invalid project inline URL blames project[0].discord_webhook_url.
+        let mut cfg = example();
+        cfg.projects[0].discord_webhook_url = Some("javascript:alert(1)".into());
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].discord_webhook_url")
+        );
+
+        // Invalid project file URL blames project[0].discord_webhook_url_file.
+        let bad_proj_file = dir.path().join("bad-proj-hook");
+        std::fs::write(&bad_proj_file, "https://discord.com/bad url\n").unwrap();
+        let mut cfg = example();
+        cfg.projects[0].discord_webhook_url_file = Some(bad_proj_file);
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].discord_webhook_url_file")
+        );
+
+        // MASK sentinel is permitted (e.g. masked config validation).
+        let mut cfg = example();
+        cfg.discord = Some(DiscordCfg {
+            webhook_url: Some(MASK.into()),
+            ..DiscordCfg::default()
+        });
+        cfg.projects[0].discord_webhook_url = Some(MASK.into());
+        cfg.validate().expect("MASK sentinel allowed");
+
+        // mention_on_failure > 2000 chars rejected on global and project; 2000 accepted.
+        let mut cfg = example();
+        cfg.discord = Some(DiscordCfg {
+            webhook_url: Some("https://discord.com/api/webhooks/1/2".into()),
+            mention_on_failure: Some("x".repeat(2001)),
+            ..DiscordCfg::default()
+        });
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("discord.mention_on_failure")
+        );
+        cfg.discord.as_mut().unwrap().mention_on_failure = Some("x".repeat(2000));
+        cfg.validate().expect("2000 char global mention accepted");
+
+        cfg.projects[0].discord_mention_on_failure = Some("y".repeat(2001));
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].discord_mention_on_failure")
+        );
+        cfg.projects[0].discord_mention_on_failure = Some("y".repeat(2000));
+        cfg.validate().expect("2000 char project mention accepted");
+    }
+
+    #[test]
+    fn contexts_and_shell_executable_and_nul_validation() {
+        // Empty contexts.ci and contexts.deploy rejected.
+        let mut cfg = example();
+        cfg.projects[0].contexts.ci = "   ".into();
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].contexts.ci")
+        );
+        let mut cfg = example();
+        cfg.projects[0].contexts.deploy = "".into();
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].contexts.deploy")
+        );
+
+        // general.shell: whitespace shell[0] and NUL byte rejected.
+        let mut cfg = example();
+        cfg.general.shell = Some(vec!["  ".into(), "-c".into()]);
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("general.shell")
+        );
+        let mut cfg = example();
+        cfg.general.shell = Some(vec!["bash".into(), "-c\0bad".into()]);
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("general.shell")
+        );
+
+        // project.shell: whitespace shell[0] and NUL byte rejected.
+        let mut cfg = example();
+        cfg.projects[0].shell = Some(vec!["".into()]);
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].shell")
+        );
+        let mut cfg = example();
+        cfg.projects[0].shell = Some(vec!["sh\0".into(), "-c".into()]);
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].shell")
+        );
+
+        // step.shell: whitespace shell[0] and NUL byte rejected.
+        let mut cfg = example();
+        cfg.projects[0].ci[0].shell = Some(vec![" \t ".into(), "-c".into()]);
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].ci[0].shell")
+        );
+        let mut cfg = example();
+        cfg.projects[0].ci[0].shell = Some(vec!["bash".into(), "arg\0nul".into()]);
+        assert_eq!(
+            cfg.validate().unwrap_err().field.as_deref(),
+            Some("project[0].ci[0].shell")
+        );
     }
 }

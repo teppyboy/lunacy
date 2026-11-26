@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -30,6 +30,21 @@ use std::time::Duration;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const DISCORD_TEST_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// In-flight and cooldown guard for `POST /api/discord/test`.
+#[derive(Default)]
+pub struct DiscordTestGuard {
+    in_flight: bool,
+    last_sent: Option<std::time::Instant>,
+}
+
+impl DiscordTestGuard {
+    pub fn reset(&mut self) {
+        self.in_flight = false;
+        self.last_sent = None;
+    }
+}
 
 /// One project's command channel plus its worker generation.
 pub type Commands = Arc<Mutex<BTreeMap<String, Sender<Command>>>>;
@@ -40,6 +55,8 @@ pub struct ApiState {
     pub config_path: PathBuf,
     /// Bumped whenever a reload happened; the server thread reports it.
     pub reloads: Arc<Mutex<u32>>,
+    /// Rate-limits `POST /api/discord/test` against concurrent or rapid abuse.
+    pub discord_test_guard: Mutex<DiscordTestGuard>,
 }
 
 pub fn build_router(state: Arc<ApiState>) -> Router {
@@ -399,11 +416,13 @@ fn handle_sync(
             }
         }
         (Method::POST, ["api", "runs", id, "deploy"]) => handle_deploy_run(state, &body_str, id),
+        (Method::POST, ["api", "runs", id, "retry"]) => handle_retry_run(state, id),
         (Method::POST, ["api", "runs", id, "cancel"]) => handle_cancel_run(state, id),
         (Method::GET, ["api", "runs", id, "steps", index, "log"]) => {
             handle_step_log(state, id, index, &params)
         }
         (Method::POST, ["api", "cache", "clear"]) => handle_clear_cache(state),
+        (Method::POST, ["api", "discord", "test"]) => handle_discord_test(state, &body_str),
         (Method::GET, ["api", "deploy", "checks"]) => handle_deploy_checks(state),
         (Method::GET, ["api", "config"]) => {
             let cfg = state.shared.lock().expect("shared").config.clone();
@@ -471,6 +490,7 @@ pub fn projects_json(state: &Arc<ApiState>) -> Value {
                 .as_str();
             let mut value = json!({
                 "name": p.name,
+                "enabled": cfg_p.map(|c| c.is_enabled()).unwrap_or(true),
                 "branch": p.branch,
                 "github_repo": p.github_repo,
                 "upstream_sha": p.upstream_sha,
@@ -879,6 +899,90 @@ fn handle_deploy_run(state: &Arc<ApiState>, body: &str, id: &str) -> Response {
     )
 }
 
+fn run_retry_context(run: &Run) -> (Option<String>, Option<PrContext>) {
+    let git_ref = run.git_ref.clone().filter(|r| !r.is_empty());
+    let pr = run.pr_number.map(|number| PrContext {
+        number,
+        title: run.pr_title.clone().unwrap_or_default(),
+        head_ref: run
+            .pr_head_ref
+            .clone()
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| format!("pull/{number}")),
+        base_ref: run.pr_base_ref.clone().unwrap_or_default(),
+        base_sha: String::new(),
+    });
+    (git_ref, pr)
+}
+
+fn handle_retry_run(state: &Arc<ApiState>, id: &str) -> Response {
+    let (state_dir, live_run) = {
+        let shared = state.shared.lock().expect("shared");
+        let live = shared.projects.iter().find_map(|p| {
+            p.current_run
+                .as_ref()
+                .filter(|r| r.id == id)
+                .map(|r| (r.clone(), p.running))
+        });
+        (shared.state_dir.clone(), live)
+    };
+    if live_run.as_ref().is_some_and(|(_, running)| *running) {
+        return error_response(409, "project is already running");
+    }
+    let Some(run) = lookup_run(&state_dir, id).or_else(|| live_run.map(|(r, _)| r)) else {
+        return error_response(404, "run not found");
+    };
+
+    let (project_exists, running) = {
+        let shared = state.shared.lock().expect("shared");
+        let exists = shared.config.project(&run.project).is_some();
+        let is_running = shared
+            .projects
+            .iter()
+            .find(|p| p.name == run.project)
+            .is_some_and(|p| p.running);
+        (exists, is_running)
+    };
+    if !project_exists {
+        return error_response(404, "project not found");
+    }
+    if running {
+        return error_response(409, "project is already running");
+    }
+    if !git::is_valid_sha(&run.sha) {
+        return error_response(400, "invalid commit sha");
+    }
+    let tx = state
+        .commands
+        .lock()
+        .expect("commands")
+        .get(&run.project)
+        .cloned();
+    let Some(tx) = tx else {
+        return error_response(503, "project worker is not running");
+    };
+
+    let (git_ref, pr) = run_retry_context(&run);
+    let _ = tx.send(Command::Trigger {
+        sha: Some(run.sha.clone()),
+        force: true,
+        trigger: Trigger::Manual,
+        git_ref,
+        pr,
+        deploy_only: false,
+        force_deploy: false,
+    });
+    json_response(
+        202,
+        &json!({
+            "queued": true,
+            "project": run.project,
+            "sha": run.sha,
+            "run_id": id,
+        }),
+    )
+}
+
 fn remove_docker_volumes_with_prefix(prefix: &str, wsl: bool) -> Vec<String> {
     let mut removed = Vec::new();
     let mut ls = if wsl {
@@ -1209,6 +1313,73 @@ fn handle_cancel_project(state: &Arc<ApiState>, name: &str) -> Response {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct DiscordTestBody {
+    #[serde(default)]
+    project: Option<String>,
+}
+
+struct DiscordTestPermit<'a>(&'a Mutex<DiscordTestGuard>);
+
+impl Drop for DiscordTestPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.in_flight = false;
+            guard.last_sent = Some(std::time::Instant::now());
+        }
+    }
+}
+
+fn handle_discord_test(state: &Arc<ApiState>, body: &str) -> Response {
+    let parsed: DiscordTestBody = if body.trim().is_empty() {
+        DiscordTestBody::default()
+    } else {
+        match serde_json::from_str(body) {
+            Ok(b) => b,
+            Err(e) => return error_response(400, &format!("invalid JSON: {e}")),
+        }
+    };
+
+    let cfg = state.shared.lock().expect("shared").config.clone();
+    let project_name = parsed
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let resolved = match project_name {
+        Some(name) => {
+            let Some(proj) = cfg.project(name) else {
+                return error_response(404, "project not found");
+            };
+            cfg.discord_for(proj)
+        }
+        None => cfg.discord_global(),
+    };
+    let Some(resolved) = resolved else {
+        return error_response(400, "discord webhook is disabled or not configured");
+    };
+    let discord = match crate::discord::Discord::from_resolved(&resolved) {
+        Ok(d) => d,
+        Err(e) => return error_response(500, &format!("creating discord client: {e}")),
+    };
+    {
+        let mut guard = state.discord_test_guard.lock().expect("discord_test_guard");
+        if guard.in_flight
+            || guard
+                .last_sent
+                .is_some_and(|t| t.elapsed() < DISCORD_TEST_COOLDOWN)
+        {
+            return error_response(429, "discord test already in flight; please wait a moment");
+        }
+        guard.in_flight = true;
+    }
+    let _permit = DiscordTestPermit(&state.discord_test_guard);
+    match discord.send_test(project_name) {
+        Ok(()) => json_response(200, &json!({ "ok": true, "source": resolved.source })),
+        Err(e) => error_response(502, &format!("{e}")),
+    }
+}
+
 fn handle_deploy_checks(state: &Arc<ApiState>) -> Response {
     let (cfg, snapshots, state_dir) = {
         let shared = state.shared.lock().expect("shared");
@@ -1394,6 +1565,8 @@ struct WebhookPayload {
     #[serde(default)]
     check_suite: Option<WebhookCheckSuite>,
     #[serde(default)]
+    requested_action: Option<WebhookRequestedAction>,
+    #[serde(default)]
     pull_request: Option<WebhookPullRequest>,
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
@@ -1401,6 +1574,12 @@ struct WebhookPayload {
     after: Option<String>,
     #[serde(default)]
     deleted: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookRequestedAction {
+    #[serde(default)]
+    identifier: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1415,6 +1594,8 @@ struct WebhookRepo {
 struct WebhookCheckRun {
     #[serde(default)]
     head_sha: Option<String>,
+    #[serde(default)]
+    external_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1690,6 +1871,7 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
             }
             let title = pr.title.unwrap_or_default();
 
+            let mut filtered_by_paused = false;
             let mut filtered_by_poll = false;
             let targets: Vec<(String, Sender<Command>)> = {
                 let shared = state.shared.lock().expect("shared");
@@ -1709,6 +1891,10 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                     if !cfg_p.watch_prs {
                         continue;
                     }
+                    if !cfg_p.is_enabled() {
+                        filtered_by_paused = true;
+                        continue;
+                    }
                     if cfg_p.effective_trigger_mode(&shared.config.general) == TriggerMode::Poll {
                         filtered_by_poll = true;
                         continue;
@@ -1720,7 +1906,9 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                 out
             };
             if targets.is_empty() {
-                let reason = if filtered_by_poll {
+                let reason = if filtered_by_paused {
+                    "project is paused"
+                } else if filtered_by_poll {
                     "poll-only mode"
                 } else {
                     "no matching project"
@@ -1808,6 +1996,7 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                 Trigger::Webhook
             };
 
+            let mut filtered_by_paused = false;
             let mut filtered_by_poll = false;
             let targets: Vec<(String, Sender<Command>)> = {
                 let shared = state.shared.lock().expect("shared");
@@ -1830,6 +2019,10 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                     if !ref_match {
                         continue;
                     }
+                    if !cfg_p.is_enabled() {
+                        filtered_by_paused = true;
+                        continue;
+                    }
                     if cfg_p.effective_trigger_mode(&shared.config.general) == TriggerMode::Poll {
                         filtered_by_poll = true;
                         continue;
@@ -1841,7 +2034,9 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
                 out
             };
             if targets.is_empty() {
-                let reason = if filtered_by_poll {
+                let reason = if filtered_by_paused {
+                    "project is paused"
+                } else if filtered_by_poll {
                     "poll-only mode"
                 } else {
                     "no matching project"
@@ -1870,17 +2065,52 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
             )
         }
         "check_run" | "check_suite" => {
-            if payload.action.as_deref() != Some("rerequested") {
-                record_webhook(
-                    state,
-                    event_kind,
-                    full_name,
-                    delivery_id,
-                    "ignored action",
-                    false,
-                );
-                return json_response(202, &json!({"queued": false, "reason": "ignored action"}));
-            }
+            let (deploy_only, force_deploy, action_label) = match payload.action.as_deref() {
+                Some("rerequested") => (false, false, "rerun"),
+                Some("requested_action") => {
+                    match payload
+                        .requested_action
+                        .as_ref()
+                        .and_then(|a| a.identifier.as_deref())
+                    {
+                        Some("retry_ci" | "retry") => (false, false, "retry_ci"),
+                        Some("retry_deploy") => (true, true, "retry_deploy"),
+                        _ => {
+                            record_webhook(
+                                state,
+                                event_kind,
+                                full_name,
+                                delivery_id,
+                                "ignored requested_action",
+                                false,
+                            );
+                            return json_response(
+                                202,
+                                &json!({"queued": false, "reason": "ignored requested_action"}),
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    record_webhook(
+                        state,
+                        event_kind,
+                        full_name,
+                        delivery_id,
+                        "ignored action",
+                        false,
+                    );
+                    return json_response(
+                        202,
+                        &json!({"queued": false, "reason": "ignored action"}),
+                    );
+                }
+            };
+            let external_id = payload
+                .check_run
+                .as_ref()
+                .and_then(|c| c.external_id.clone())
+                .filter(|s| !s.is_empty());
             let sha = payload
                 .check_run
                 .and_then(|c| c.head_sha)
@@ -1899,49 +2129,81 @@ fn handle_webhook(state: &Arc<ApiState>, headers: &HeaderMap, body_bytes: &[u8])
             if !git::is_valid_sha(&sha) {
                 return error_response(400, "invalid head_sha");
             }
-            let targets: Vec<(String, Sender<Command>)> = {
+            let mut filtered_by_paused = false;
+            let (state_dir, targets): (PathBuf, Vec<(String, Sender<Command>)>) = {
                 let shared = state.shared.lock().expect("shared");
-                shared
-                    .projects
-                    .iter()
-                    .filter(|p| {
-                        let have = project_github_repo(p, &shared.config);
-                        match (&full_name, &have) {
-                            (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
-                            _ => false,
+                let mut out = Vec::new();
+                for p in &shared.projects {
+                    let have = project_github_repo(p, &shared.config);
+                    let repo_match = match (&full_name, &have) {
+                        (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
+                        _ => false,
+                    };
+                    if !repo_match {
+                        continue;
+                    }
+                    if let Some(cfg_p) = shared.config.project(&p.name) {
+                        if !cfg_p.is_enabled() {
+                            filtered_by_paused = true;
+                            continue;
                         }
-                    })
-                    .filter_map(|p| commands.get(&p.name).map(|tx| (p.name.clone(), tx.clone())))
-                    .collect()
+                    }
+                    if let Some(tx) = commands.get(&p.name) {
+                        out.push((p.name.clone(), tx.clone()));
+                    }
+                }
+                (shared.state_dir.clone(), out)
             };
             if targets.is_empty() {
+                let reason = if filtered_by_paused {
+                    "project is paused"
+                } else {
+                    "no matching project"
+                };
+                record_webhook(state, event_kind, full_name, delivery_id, reason, false);
+                return json_response(202, &json!({"queued": false, "reason": reason}));
+            }
+            let orig_run = external_id
+                .as_deref()
+                .filter(|id| is_valid_segment(id))
+                .and_then(|id| lookup_run(&state_dir, id));
+            let mut queued = Vec::new();
+            let mut blocked_pr_deploy = false;
+            for (name, tx) in targets {
+                let (git_ref, pr) = match orig_run.as_ref().filter(|orig| orig.project == name) {
+                    Some(orig) => run_retry_context(orig),
+                    None => (None, None),
+                };
+                if deploy_only && pr.is_some() {
+                    blocked_pr_deploy = true;
+                    continue;
+                }
+                let _ = tx.send(Command::Trigger {
+                    sha: Some(sha.clone()),
+                    force: true,
+                    trigger: Trigger::Webhook,
+                    git_ref,
+                    pr,
+                    deploy_only,
+                    force_deploy,
+                });
+                queued.push(name);
+            }
+            if queued.is_empty() && blocked_pr_deploy {
                 record_webhook(
                     state,
                     event_kind,
                     full_name,
                     delivery_id,
-                    "no matching project",
+                    "pull requests cannot deploy",
                     false,
                 );
                 return json_response(
                     202,
-                    &json!({"queued": false, "reason": "no matching project"}),
+                    &json!({"queued": false, "reason": "pull requests cannot deploy"}),
                 );
             }
-            let mut queued = Vec::new();
-            for (name, tx) in targets {
-                let _ = tx.send(Command::Trigger {
-                    sha: Some(sha.clone()),
-                    force: true,
-                    trigger: Trigger::Webhook,
-                    git_ref: None,
-                    pr: None,
-                    deploy_only: false,
-                    force_deploy: false,
-                });
-                queued.push(name);
-            }
-            let outcome = format!("queued rerun for {}", queued.join(", "));
+            let outcome = format!("queued {action_label} for {}", queued.join(", "));
             record_webhook(state, event_kind, full_name, delivery_id, &outcome, true);
             json_response(202, &json!({"queued": true, "projects": queued}))
         }
@@ -2169,6 +2431,7 @@ mod tests {
             commands: Arc::new(Mutex::new(BTreeMap::new())),
             config_path: dir.path().join("config.toml"),
             reloads: Arc::new(Mutex::new(0)),
+            discord_test_guard: Mutex::new(DiscordTestGuard::default()),
         });
 
         let listen = addr.to_string();

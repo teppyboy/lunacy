@@ -450,9 +450,10 @@ fn worker_loop(
         }
 
         let cfg = shared.lock().expect("shared").config.clone();
+        let paused = !project.is_enabled();
         let webhook_only = project.effective_trigger_mode(&cfg.general) == TriggerMode::Webhook;
         let interval = Duration::from_secs(project.poll_interval(&cfg.general).max(1));
-        if (webhook_only || last_poll.elapsed() < interval) && queued.is_empty() {
+        if (paused || webhook_only || last_poll.elapsed() < interval) && queued.is_empty() {
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(Command::Stop) => return,
                 Ok(Command::Reload) => {
@@ -968,7 +969,11 @@ fn execute_spec(
         spec.git_ref,
         spec.trigger
     );
-    let github = github_client(cfg, &project.name);
+    let github = if cfg.github_enabled_for(project) {
+        github_client(cfg, &project.name)
+    } else {
+        None
+    };
 
     let (state_dir, ws) = {
         let s = shared.lock().expect("shared");
@@ -1217,7 +1222,9 @@ mod tests {
             repo_path: repo.clone(),
             remote: "origin".into(),
             branch: "master".into(),
+            enabled: None,
             github_repo: None,
+            github_enabled: None,
             checkout: Checkout::None,
             poll_interval: None,
             trigger_mode: None,
@@ -1225,10 +1232,16 @@ mod tests {
             timeout: None,
             env: BTreeMap::new(),
             contexts: Default::default(),
+            discord_enabled: None,
             discord_webhook_url: None,
+            discord_webhook_url_file: None,
             notify_on_start: None,
+            discord_notify_on: None,
+            discord_username: None,
+            discord_mention_on_failure: None,
             shell: None,
             platforms: BTreeMap::new(),
+            act_args: Vec::new(),
             watch_prs: false,
             deploy_refs: Vec::new(),
             watch_tags: false,
@@ -1371,7 +1384,9 @@ mod tests {
             repo_path: work.clone(),
             remote: "origin".into(),
             branch: "master".into(),
+            enabled: None,
             github_repo: Some("teppyboy/demo".into()),
+            github_enabled: None,
             checkout: Checkout::None,
             poll_interval: Some(0),
             trigger_mode: Some(TriggerMode::Webhook),
@@ -1379,10 +1394,16 @@ mod tests {
             timeout: None,
             env: BTreeMap::new(),
             contexts: Default::default(),
+            discord_enabled: None,
             discord_webhook_url: None,
+            discord_webhook_url_file: None,
             notify_on_start: None,
+            discord_notify_on: None,
+            discord_username: None,
+            discord_mention_on_failure: None,
             shell: None,
             platforms: BTreeMap::new(),
+            act_args: Vec::new(),
             watch_prs: false,
             deploy_refs: Vec::new(),
             watch_tags: false,
@@ -1449,6 +1470,148 @@ mod tests {
             Some(sha1.as_str()),
             "webhook trigger should fetch upstream_sha"
         );
+
+        daemon.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paused_project_skips_polling_but_allows_manual_trigger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&origin, &["init", "--bare", "-b", "master"]);
+        let clone_out = std::process::Command::new("git")
+            .args(["clone", origin.to_str().unwrap(), work.to_str().unwrap()])
+            .output()
+            .expect("clone");
+        assert!(clone_out.status.success());
+        run_git(&work, &["config", "user.email", "lunacy@example.invalid"]);
+        run_git(&work, &["config", "user.name", "lunacy"]);
+        std::fs::write(work.join("a.txt"), "v1\n").unwrap();
+        run_git(&work, &["add", "a.txt"]);
+        run_git(&work, &["commit", "-m", "v1"]);
+        run_git(&work, &["push", "origin", "master"]);
+        let sha1 = run_git(&work, &["rev-parse", "HEAD"]);
+
+        let step = StepCfg {
+            name: "Echo".into(),
+            kind: StepKind::Shell,
+            run: Some("echo manual-ok".into()),
+            workflow: None,
+            job: None,
+            event: None,
+            platforms: BTreeMap::new(),
+            args: Vec::new(),
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            only_on: Vec::new(),
+            timeout: Some(30),
+            cwd: None,
+            shell: Some(vec!["bash".into(), "-c".into()]),
+            env: BTreeMap::new(),
+        };
+        let project = ProjectCfg {
+            name: "paused-demo".into(),
+            repo_path: work.clone(),
+            remote: "origin".into(),
+            branch: "master".into(),
+            enabled: Some(false),
+            github_repo: Some("teppyboy/demo".into()),
+            github_enabled: None,
+            checkout: Checkout::None,
+            poll_interval: Some(1),
+            trigger_mode: Some(TriggerMode::Both),
+            step_timeout: None,
+            timeout: None,
+            env: BTreeMap::new(),
+            contexts: Default::default(),
+            discord_enabled: None,
+            discord_webhook_url: None,
+            discord_webhook_url_file: None,
+            notify_on_start: None,
+            discord_notify_on: None,
+            discord_username: None,
+            discord_mention_on_failure: None,
+            shell: None,
+            platforms: BTreeMap::new(),
+            act_args: Vec::new(),
+            watch_prs: false,
+            deploy_refs: Vec::new(),
+            watch_tags: false,
+            cache: Some(false),
+            ci: vec![step],
+            deploy: Vec::new(),
+        };
+        let mut cfg = Config::default();
+        cfg.general.state_dir = Some(state_dir.clone());
+        cfg.general.poll_interval = 1;
+        cfg.projects = vec![project];
+
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, toml::to_string(&cfg).unwrap()).unwrap();
+
+        let mut daemon = Daemon::new(cfg_path, cfg);
+        daemon.reconcile();
+
+        // Paused project must NOT poll even when trigger_mode = Both and poll_interval = 1s.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            crate::model::list_runs(&state_dir, "paused-demo", 10).is_empty(),
+            "paused project must not auto-poll"
+        );
+        assert!(
+            daemon.shared.lock().unwrap().projects[0]
+                .upstream_sha
+                .is_none(),
+            "paused project must not fetch while idle"
+        );
+
+        // Manual trigger still runs on a paused project.
+        let tx = daemon.command_sender("paused-demo").expect("worker sender");
+        tx.send(Command::Trigger {
+            sha: Some(sha1.clone()),
+            force: true,
+            trigger: Trigger::Manual,
+            git_ref: Some("master".into()),
+            pr: None,
+            deploy_only: false,
+            force_deploy: false,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let runs = crate::model::list_runs(&state_dir, "paused-demo", 10);
+            if runs.first().is_some_and(|r| r.status == RunStatus::Success) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let runs = crate::model::list_runs(&state_dir, "paused-demo", 10);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Success);
+        assert_eq!(runs[0].trigger, Trigger::Manual);
+        assert_eq!(runs[0].sha, sha1);
 
         daemon.shutdown();
     }

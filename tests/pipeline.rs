@@ -37,7 +37,9 @@ fn project(fx: &common::Fixture, state_dir: &std::path::Path, ci_run: &str) -> P
         repo_path: fx.work.clone(),
         remote: "origin".into(),
         branch: "master".into(),
+        enabled: None,
         github_repo: None,
+        github_enabled: None,
         checkout: Checkout::None,
         poll_interval: None,
         trigger_mode: None,
@@ -45,10 +47,16 @@ fn project(fx: &common::Fixture, state_dir: &std::path::Path, ci_run: &str) -> P
         timeout: None,
         env: Default::default(),
         contexts: Default::default(),
+        discord_enabled: None,
         discord_webhook_url: None,
+        discord_webhook_url_file: None,
         notify_on_start: None,
+        discord_notify_on: None,
+        discord_username: None,
+        discord_mention_on_failure: None,
         shell: None,
         platforms: Default::default(),
+        act_args: Vec::new(),
         watch_prs: false,
         deploy_refs: Vec::new(),
         watch_tags: false,
@@ -311,7 +319,9 @@ fn reporting_is_disabled_without_token_or_webhook() {
         repo_path: PathBuf::from("/tmp"),
         remote: "origin".into(),
         branch: "master".into(),
+        enabled: None,
         github_repo: None,
+        github_enabled: None,
         checkout: Checkout::None,
         poll_interval: None,
         trigger_mode: None,
@@ -319,10 +329,16 @@ fn reporting_is_disabled_without_token_or_webhook() {
         timeout: None,
         env: Default::default(),
         contexts: Default::default(),
+        discord_enabled: None,
         discord_webhook_url: None,
+        discord_webhook_url_file: None,
         notify_on_start: None,
+        discord_notify_on: None,
+        discord_username: None,
+        discord_mention_on_failure: None,
         shell: None,
         platforms: Default::default(),
+        act_args: Vec::new(),
         watch_prs: false,
         deploy_refs: Vec::new(),
         watch_tags: false,
@@ -1250,4 +1266,348 @@ fn on_log_chunk_streams_shell_output_matching_log_file() {
         on_disk.len(),
         "streamed bytes match file length"
     );
+}
+
+#[test]
+fn project_github_enabled_false_suppresses_github_reporting() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let req_clone = requests.clone();
+
+    let mock = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        while !stop_clone.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .ok();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut first_line = String::new();
+                    let _ = reader.read_line(&mut first_line);
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    if content_length > 0 {
+                        let mut discard = vec![0u8; content_length];
+                        let _ = reader.read_exact(&mut discard);
+                    }
+                    req_clone
+                        .lock()
+                        .unwrap()
+                        .push(first_line.trim().to_string());
+                    let body = r#"{"id":1,"state":"success"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 201 Created\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let fx = common::Fixture::new();
+    let state = tempfile::tempdir().expect("state");
+    let state_dir = state.path().to_path_buf();
+    let sha = fx.commit("gh.txt", "v1\n", "feat: github override");
+    lunacy::git::fetch(&fx.work, "origin", "master").expect("fetch");
+
+    let gh_cfg = lunacy::config::GithubCfg {
+        mode: Some(lunacy::config::GithubMode::Status),
+        token: Some("ghp_test".into()),
+        token_file: None,
+        api_url: Some(format!("http://{addr}")),
+        webhook_secret: None,
+        webhook_secret_file: None,
+        app: None,
+    };
+    let gh = lunacy::report::Github::new(&gh_cfg).expect("github client");
+
+    let mut cfg = config(&fx, &state_dir);
+    cfg.github = Some(gh_cfg);
+
+    let mut p = project(&fx, &state_dir, "true");
+    p.github_repo = Some("owner/demo".into());
+    p.github_enabled = Some(false);
+    p.deploy.clear();
+
+    let on_update = |_run: &lunacy::model::Run| {};
+    let act_lock = state_dir.join("act.lock");
+    let ctx = Ctx {
+        cfg: &cfg,
+        state_dir: &state_dir,
+        os: Os::current(),
+        github: Some(&gh),
+        on_update: &on_update,
+        act_lock: &act_lock,
+        cancel: None,
+        on_log_chunk: None,
+    };
+
+    // With github_enabled = Some(false), zero GitHub API calls are made.
+    let run = pipeline::run_pipeline(&ctx, &p, &sha, Trigger::Manual);
+    assert_eq!(run.status, RunStatus::Success);
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "expected no GitHub API calls when github_enabled = false, got {:?}",
+        requests.lock().unwrap()
+    );
+
+    // Re-enabling github_enabled makes GitHub API calls normally.
+    p.github_enabled = None;
+    let run2 = pipeline::run_pipeline(&ctx, &p, &sha, Trigger::Manual);
+    assert_eq!(run2.status, RunStatus::Success);
+    assert!(
+        !requests.lock().unwrap().is_empty(),
+        "expected GitHub API calls when github_enabled is inherited"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    mock.join().unwrap();
+}
+
+#[test]
+fn pipeline_respects_discord_enabled_false_and_notify_on_failures() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let payloads: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let pay_clone = payloads.clone();
+
+    let mock = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        while !stop_clone.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .ok();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        pay_clone.lock().unwrap().push(v);
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let fx = common::Fixture::new();
+    let state = tempfile::tempdir().expect("state");
+    let state_dir = state.path().to_path_buf();
+    let sha = fx.commit("d.txt", "v1\n", "feat: discord pipeline");
+    lunacy::git::fetch(&fx.work, "origin", "master").expect("fetch");
+
+    let mut cfg = config(&fx, &state_dir);
+    cfg.discord = Some(lunacy::config::DiscordCfg {
+        webhook_url: Some(format!("http://{addr}/hook")),
+        webhook_url_file: None,
+        notify_on_start: true,
+        notify_on: Some(lunacy::config::DiscordNotifyOn::Failures),
+        username: Some("GlobalCI".into()),
+        mention_on_failure: Some("<@&777>".into()),
+    });
+
+    // 1. Project sets discord_enabled = Some(false) -> zero webhook posts even on failure.
+    let mut p_disabled = project(&fx, &state_dir, "false");
+    p_disabled.discord_enabled = Some(false);
+    p_disabled.deploy.clear();
+    let run = run_pipeline(&cfg, &state_dir, &p_disabled, &sha);
+    assert_eq!(run.status, RunStatus::Failure);
+    assert!(payloads.lock().unwrap().is_empty());
+
+    // 2. Project inherits notify_on = Failures with notify_on_start = Some(false):
+    //    Success -> 0 posts; Failure -> 1 post with custom username & mention_on_failure.
+    let mut p_ok = project(&fx, &state_dir, "true");
+    p_ok.notify_on_start = Some(false);
+    p_ok.discord_username = Some("RepoBot".into());
+    p_ok.deploy.clear();
+    let run_ok = run_pipeline(&cfg, &state_dir, &p_ok, &sha);
+    assert_eq!(run_ok.status, RunStatus::Success);
+    assert!(payloads.lock().unwrap().is_empty());
+
+    let mut p_fail = project(&fx, &state_dir, "false");
+    p_fail.notify_on_start = Some(false);
+    p_fail.discord_username = Some("RepoBot".into());
+    p_fail.deploy.clear();
+    let run_fail = run_pipeline(&cfg, &state_dir, &p_fail, &sha);
+    assert_eq!(run_fail.status, RunStatus::Failure);
+
+    stop.store(true, Ordering::SeqCst);
+    mock.join().unwrap();
+
+    let got = payloads.lock().unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0]["username"], "RepoBot");
+    assert_eq!(got[0]["content"], "<@&777>");
+    assert_eq!(
+        got[0]["allowed_mentions"]["parse"],
+        serde_json::json!(["users", "roles"])
+    );
+}
+
+#[test]
+fn pipeline_notify_on_start_fires_while_finish_skipped_on_success_with_notify_on_failures() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let payloads: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let pay_clone = payloads.clone();
+
+    let mock = std::thread::spawn(move || {
+        while !stop_clone.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .ok();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        pay_clone.lock().unwrap().push(v);
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let fx = common::Fixture::new();
+    let state = tempfile::tempdir().expect("state");
+    let state_dir = state.path().to_path_buf();
+    let sha = fx.commit("nb4.txt", "v1\n", "feat: start embed only on success");
+    lunacy::git::fetch(&fx.work, "origin", "master").expect("fetch");
+
+    let mut cfg = config(&fx, &state_dir);
+    cfg.discord = Some(lunacy::config::DiscordCfg {
+        webhook_url: Some(format!("http://{addr}/hook")),
+        webhook_url_file: None,
+        notify_on_start: true,
+        notify_on: Some(lunacy::config::DiscordNotifyOn::Failures),
+        username: Some("StartAndFailBot".into()),
+        mention_on_failure: Some("<@&888>".into()),
+    });
+
+    // Successful run with notify_on_start = true + notify_on = Failures:
+    // ONLY the start embed fires; finish embed is skipped.
+    let mut p_ok = project(&fx, &state_dir, "true");
+    p_ok.deploy.clear();
+    let run_ok = run_pipeline(&cfg, &state_dir, &p_ok, &sha);
+    assert_eq!(run_ok.status, RunStatus::Success);
+
+    {
+        let got = payloads.lock().unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "expected only start embed on success: {got:?}"
+        );
+        assert_eq!(got[0]["username"], "StartAndFailBot");
+        assert_eq!(got[0]["embeds"][0]["title"], "demo started");
+        assert!(got[0].get("content").is_none());
+    }
+
+    // Failing run with notify_on_start = true + notify_on = Failures:
+    // BOTH start embed and finish embed fire.
+    let mut p_fail = project(&fx, &state_dir, "false");
+    p_fail.deploy.clear();
+    let run_fail = run_pipeline(&cfg, &state_dir, &p_fail, &sha);
+    assert_eq!(run_fail.status, RunStatus::Failure);
+
+    stop.store(true, Ordering::SeqCst);
+    mock.join().unwrap();
+
+    let got = payloads.lock().unwrap();
+    assert_eq!(
+        got.len(),
+        3,
+        "expected 1 start (ok) + 1 start (fail) + 1 finish (fail): {got:?}"
+    );
+    assert_eq!(got[1]["embeds"][0]["title"], "demo started");
+    assert!(got[2]["embeds"][0]["title"]
+        .as_str()
+        .unwrap()
+        .contains("demo failure"));
+    assert_eq!(got[2]["content"], "<@&888>");
 }

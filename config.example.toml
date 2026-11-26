@@ -58,6 +58,9 @@ token = "ghp_REPLACE_ME"
 # # ... or read it from a file instead of the inline value:
 # webhook_url_file = "~/.config/lunacy/discord-webhook"
 notify_on_start = false
+# notify_on = "all"                 # all | failures ("failures" skips success/cancelled finish notifications)
+# username = "lunacy"               # optional custom Discord webhook display name (max 80 chars)
+# mention_on_failure = "<@&123456>" # optional mention text added on failure/error (parses users & roles only)
 
 [act]
 # Global act defaults. `kind = "act"` steps use these unless they override.
@@ -89,7 +92,9 @@ name = "lunarum"
 repo_path = "/home/tretrauit/workspace/lunarum"
 remote = "origin"
 branch = "master"
+# enabled = true         # set to false to pause automatic polling and webhooks (manual triggers still work)
 github_repo = "teppyboy/lunarum"
+# github_enabled = true  # set to false to suppress GitHub status/check reporting for this project
 # The deploy script publishes into the live checkout and recreates the web
 # container from it, so it must run in repo_path itself. CI runs in act's own
 # clone, so nothing else needs a checkout. That clone survives the CI phase:
@@ -103,6 +108,14 @@ poll_interval = 300
 # deploy_refs = ["master", "release/*", "tags/v*"]  # refs allowed to deploy (empty = [branch])
 # watch_tags = false     # watch remote tags even when deploy_refs has no tags/ pattern
 # cache = true           # override global [act] cache per project
+# act_args = ["--pull=false"]  # extra act CLI args (order: [act].args -> project.act_args -> step.args)
+# discord_enabled = true # set to false to suppress Discord for this project even with global [discord]
+# discord_webhook_url = "https://discord.com/api/webhooks/REPLACE/REPLACE"
+# discord_webhook_url_file = "~/.config/lunacy/lunarum-discord-webhook"
+# notify_on_start = false
+# discord_notify_on = "all"   # all | failures
+# discord_username = "lunarum-ci"
+# discord_mention_on_failure = "<@&123456>"
 env = { }
 
 [[project.ci]]
@@ -142,7 +155,7 @@ name = "Publish web"
 # scripts/local-web-deploy.sh still does its own act CI run; use it until it
 # reads LUNACY_CI_DIR, and keep this step to the publish half after that.
 # NOTE: the script sends its own Discord embed through deploy-notification.py.
-# Set discord_webhook_url = "" below (or here) if you want only one message.
+# Set discord_enabled = false on the project if you want only one message.
 run = "bash scripts/local-web-deploy.sh"
 timeout = 5400
 

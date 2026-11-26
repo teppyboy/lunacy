@@ -648,7 +648,7 @@ impl Github {
                     summary.push('\n');
                     summary.push_str(&log);
                 }
-                let body = json!({
+                let mut body = json!({
                     "status": "completed",
                     "conclusion": conclusion,
                     "completed_at": iso8601(run.finished_at.unwrap_or_else(github_app::unix_now)),
@@ -657,11 +657,44 @@ impl Github {
                         "summary": truncate_chars(&summary, 65_000),
                     },
                 });
+                if let Some(actions) = check_run_actions(r.phase, conclusion) {
+                    body["actions"] = Value::Array(actions);
+                }
                 self.update_check(&r.repo, id, body)?;
             }
         }
         Ok(())
     }
+}
+
+/// Action buttons shown on completed GitHub Check Runs when a phase did not succeed.
+///
+/// Strictly respects GitHub's Check Runs API limits: at most 3 actions, `label <= 20`,
+/// `description <= 40`, `identifier <= 20`.
+pub(crate) fn check_run_actions(phase: Phase, conclusion: &str) -> Option<Vec<Value>> {
+    if conclusion == "success" {
+        return None;
+    }
+    let actions = match phase {
+        Phase::Ci => vec![json!({
+            "label": "Retry CI",
+            "description": "Re-run CI for this commit in Lunacy",
+            "identifier": "retry_ci",
+        })],
+        Phase::Deploy => vec![
+            json!({
+                "label": "Retry Deploy",
+                "description": "Re-run deploy steps for this commit",
+                "identifier": "retry_deploy",
+            }),
+            json!({
+                "label": "Retry All",
+                "description": "Re-run full CI + deploy pipeline",
+                "identifier": "retry_ci",
+            }),
+        ],
+    };
+    Some(actions)
 }
 
 /// Human-readable description for a finished phase (used for commit statuses and check-run titles).
@@ -965,5 +998,133 @@ mod tests {
             pulls[0].base_sha,
             "0000000000000000000000000000000000000000"
         );
+    }
+
+    #[test]
+    fn check_run_actions_respect_github_limits_and_phase_conclusions() {
+        // Passing check runs omit actions to keep the GitHub UI clean.
+        assert!(check_run_actions(Phase::Ci, "success").is_none());
+        assert!(check_run_actions(Phase::Deploy, "success").is_none());
+
+        // Non-success CI conclusions expose a single "Retry CI" button.
+        for conclusion in ["failure", "timed_out", "cancelled"] {
+            let actions = check_run_actions(Phase::Ci, conclusion).expect("CI actions");
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0]["label"], "Retry CI");
+            assert_eq!(actions[0]["identifier"], "retry_ci");
+            for a in &actions {
+                assert!(a["label"].as_str().unwrap().chars().count() <= 20);
+                assert!(a["description"].as_str().unwrap().chars().count() <= 40);
+                assert!(a["identifier"].as_str().unwrap().chars().count() <= 20);
+            }
+        }
+
+        // Non-success Deploy conclusions expose "Retry Deploy" and "Retry All".
+        for conclusion in ["failure", "timed_out", "cancelled"] {
+            let actions = check_run_actions(Phase::Deploy, conclusion).expect("Deploy actions");
+            assert_eq!(actions.len(), 2);
+            assert_eq!(actions[0]["label"], "Retry Deploy");
+            assert_eq!(actions[0]["identifier"], "retry_deploy");
+            assert_eq!(actions[1]["label"], "Retry All");
+            assert_eq!(actions[1]["identifier"], "retry_ci");
+            assert!(actions.len() <= 3);
+            for a in &actions {
+                assert!(a["label"].as_str().unwrap().chars().count() <= 20);
+                assert!(a["description"].as_str().unwrap().chars().count() <= 40);
+                assert!(a["identifier"].as_str().unwrap().chars().count() <= 20);
+            }
+        }
+    }
+
+    #[test]
+    fn finish_phase_includes_actions_on_failure_and_omits_on_success() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap_clone = captured.clone();
+
+        // Accept 2 PATCH requests: 1 failing deploy check, 1 passing CI check.
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                if let Ok(val) = serde_json::from_slice::<Value>(&body) {
+                    cap_clone.lock().unwrap().push(val);
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                );
+            }
+        });
+
+        let cfg = GithubCfg {
+            mode: Some(GithubMode::Status),
+            token: Some("ghp_test".into()),
+            token_file: None,
+            api_url: Some(format!("http://{addr}")),
+            webhook_secret: None,
+            webhook_secret_file: None,
+            app: None,
+        };
+        let gh = Github::new(&cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let handle = CheckHandle { id: 42, url: None };
+
+        let fail_deploy_run = run_with(vec![step(Phase::Deploy, "Publish", StepStatus::Failure)]);
+        let deploy_rep = PhaseReporter {
+            repo: "owner/repo".into(),
+            sha: fail_deploy_run.sha.clone(),
+            context: "lunacy/deploy".into(),
+            phase: Phase::Deploy,
+            run_id: fail_deploy_run.id.clone(),
+            details_url: None,
+            state_dir: dir.path().to_path_buf(),
+        };
+        gh.finish_phase(&deploy_rep, &handle, &fail_deploy_run)
+            .unwrap();
+
+        let ok_ci_run = run_with(vec![step(Phase::Ci, "Test", StepStatus::Success)]);
+        let ci_rep = PhaseReporter {
+            repo: "owner/repo".into(),
+            sha: ok_ci_run.sha.clone(),
+            context: "lunacy/ci".into(),
+            phase: Phase::Ci,
+            run_id: ok_ci_run.id.clone(),
+            details_url: None,
+            state_dir: dir.path().to_path_buf(),
+        };
+        gh.finish_phase(&ci_rep, &handle, &ok_ci_run).unwrap();
+
+        server.join().unwrap();
+        let payloads = captured.lock().unwrap();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["conclusion"], "failure");
+        let actions = payloads[0]["actions"].as_array().expect("deploy actions");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0]["identifier"], "retry_deploy");
+        assert_eq!(actions[1]["identifier"], "retry_ci");
+
+        assert_eq!(payloads[1]["conclusion"], "success");
+        assert!(payloads[1].get("actions").is_none());
     }
 }

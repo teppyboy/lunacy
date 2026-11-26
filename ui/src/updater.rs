@@ -514,10 +514,13 @@ mod native {
             let mut entry = archive
                 .by_index(idx)
                 .map_err(|e| format!("corrupt zip entry: {e}"))?;
-            if entry.is_dir() {
+            if !entry.is_file() {
                 continue;
             }
-            let normalized = entry.name().replace('\\', "/");
+            let Some(enclosed) = entry.enclosed_name() else {
+                continue;
+            };
+            let normalized = enclosed.to_string_lossy().replace('\\', "/");
             if normalized == bin_name || normalized.ends_with(&format!("/{bin_name}")) {
                 let mut out = fs::File::create(dest_path)
                     .map_err(|e| format!("cannot create staged binary: {e}"))?;
@@ -777,6 +780,58 @@ mod tests {
         let dest = dir.join("lunacy-ui.exe");
         extract_zip_binary(&zip_buf.into_inner(), "lunacy-ui.exe", &dest).expect("extract zip");
         assert_eq!(std::fs::read(&dest).expect("read extracted"), payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_zip_binary_skips_symlinks_and_traversal_entries() {
+        let dir = temp_dir("zip-hardening");
+        let dest = dir.join("lunacy-ui.exe");
+
+        // Archive containing only a symlink and a path-traversal entry must fail cleanly.
+        let mut unsafe_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut unsafe_buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .add_symlink("lunacy-windows-x86_64/lunacy-ui.exe", "/etc/passwd", opts)
+                .expect("add symlink");
+            writer
+                .start_file("../lunacy-ui.exe", opts)
+                .expect("start traversal file");
+            writer.write_all(b"evil-traversal").expect("write payload");
+            writer.finish().expect("finish zip");
+        }
+        assert!(
+            extract_zip_binary(&unsafe_buf.into_inner(), "lunacy-ui.exe", &dest).is_err(),
+            "symlink and traversal entries must be skipped"
+        );
+        assert!(!dest.exists(), "skipped entries must not create dest file");
+
+        // When a safe regular file follows unsafe entries, only the safe file is extracted.
+        let good_payload = b"MZ-legit-binary";
+        let mut mixed_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut mixed_buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .add_symlink("lunacy-ui.exe", "/tmp/evil", opts)
+                .expect("add symlink");
+            writer
+                .start_file("../../lunacy-ui.exe", opts)
+                .expect("start traversal file");
+            writer.write_all(b"evil-traversal").expect("write payload");
+            writer
+                .start_file("lunacy-windows-x86_64/lunacy-ui.exe", opts)
+                .expect("start legit file");
+            writer.write_all(good_payload).expect("write legit payload");
+            writer.finish().expect("finish zip");
+        }
+        extract_zip_binary(&mixed_buf.into_inner(), "lunacy-ui.exe", &dest)
+            .expect("extract legit binary");
+        assert_eq!(std::fs::read(&dest).expect("read extracted"), good_payload);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

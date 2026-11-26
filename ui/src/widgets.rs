@@ -1,11 +1,27 @@
 //! Small pieces every screen draws: status dots and pills, section cards, key/value rows,
 //! timestamps, durations, and the log body.
 
-use rune::{col, el, icon, row, text, Align, Color, El, Tx};
+use rune::{col, el, icon, row, text, Align, Color, El, Icon, Tx};
 use rune_kit::{Badge, Kit};
 
 use crate::model::{ProjectState, RunStatus, StepStatus};
 use crate::theme::{self, Status};
+
+/// Lunacy brand mark: geometric crescent moon + 4-point orbital star spark on a 24×24 grid.
+pub static LUNACY_LOGO: Icon = Icon {
+    name: "lunacy-logo",
+    view: 24.0,
+    body: r#"<path d="M20.04 13.54A8.6 8.6 0 1 1 10.46 3.96A6.8 6.8 0 0 0 20.04 13.54Z" fill="currentColor"/><path d="M17.6 2.9C17.9 4.95 19.05 6.1 21.1 6.4C19.05 6.7 17.9 7.85 17.6 9.9C17.3 7.85 16.15 6.7 14.1 6.4C16.15 6.1 17.3 4.95 17.6 2.9Z" fill="currentColor"/>"#,
+};
+
+/// Minimal monochrome brand logo mark that adapts cleanly across Dark, Light, and OLED themes.
+pub fn brand_logo(k: &Kit, size: f32) -> El {
+    el().key("lunacy-logo")
+        .size(size, size)
+        .center()
+        .a11y_hidden()
+        .child(icon(&LUNACY_LOGO, size).color(k.c.text_base))
+}
 
 /// A status dot: a filled circle in the status ink.
 pub fn dot(ink: Color, size: f32) -> El {

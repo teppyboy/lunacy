@@ -344,6 +344,36 @@ class Handler(BaseHTTPRequestHandler):
             names = ["act-cache"] + [p["name"] for p in store.data.get("projects") or []]
             self._send(200, {"cleared": True, "removed": names})
             return
+        if path == "/api/discord/test":
+            if method != "POST":
+                self._error(405, "POST only")
+                return
+            req_project = (body or {}).get("project")
+            discord_cfg = store.config.get("discord") or {}
+            has_global = bool((discord_cfg.get("webhook_url") or "").strip())
+            if req_project:
+                proj_cfg = next(
+                    (p for p in (store.config.get("project") or []) if p.get("name") == req_project),
+                    None,
+                )
+                if proj_cfg is None:
+                    self._error(404, f"unknown project {req_project!r}")
+                    return
+                if proj_cfg.get("discord_enabled") is False:
+                    self._error(400, "discord notifications are disabled for this project")
+                    return
+                if (proj_cfg.get("discord_webhook_url") or "").strip():
+                    self._send(200, {"ok": True, "source": "project"})
+                elif has_global:
+                    self._send(200, {"ok": True, "source": "global"})
+                else:
+                    self._error(400, "no Discord webhook configured")
+                return
+            if has_global:
+                self._send(200, {"ok": True, "source": "global"})
+            else:
+                self._error(400, "no global Discord webhook configured")
+            return
 
         m = re.fullmatch(r"/api/projects/([^/]+)/runs", path)
         if m:
@@ -470,6 +500,29 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(202, {"queued": True, "sha": run.get("sha", ""), "deploy_only": True})
             return
+        m = re.fullmatch(r"/api/runs/([^/]+)/retry", path)
+        if m:
+            if method != "POST":
+                self._error(405, "POST only")
+                return
+            run = store.run_by_id(m.group(1))
+            if run is None:
+                self._error(404, "unknown run")
+                return
+            project = store.project(run.get("project", ""))
+            if project and project.get("running"):
+                self._error(409, "already running")
+                return
+            self._send(
+                202,
+                {
+                    "queued": True,
+                    "project": run.get("project", ""),
+                    "sha": run.get("sha", ""),
+                    "run_id": run.get("id", ""),
+                },
+            )
+            return
         m = re.fullmatch(r"/api/runs/([^/]+)", path)
         if m:
             run = store.run_by_id(m.group(1))
@@ -496,6 +549,13 @@ class Handler(BaseHTTPRequestHandler):
         if server is not None and not (server.get("listen") or "").strip():
             self._error(400, "must not be empty", "server.listen")
             return
+        discord = body.get("discord") or {}
+        if discord.get("notify_on") not in (None, "", "all", "failures"):
+            self._error(400, "must be 'all' or 'failures'", "discord.notify_on")
+            return
+        if len(discord.get("username") or "") > 80:
+            self._error(400, "must be at most 80 characters", "discord.username")
+            return
         projects: list[Json] = body.get("project") or []
         seen = set()
         for i, project in enumerate(projects):
@@ -518,6 +578,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if project.get("timeout") == 0:
                 self._error(400, "must be at least 1", f"project[{i}].timeout")
+                return
+            if project.get("discord_notify_on") not in (None, "", "all", "failures"):
+                self._error(400, "must be 'all' or 'failures'", f"project[{i}].discord_notify_on")
+                return
+            if len(project.get("discord_username") or "") > 80:
+                self._error(400, "must be at most 80 characters", f"project[{i}].discord_username")
                 return
             ci_steps: list[Json] = project.get("ci") or []
             deploy_steps: list[Json] = project.get("deploy") or []

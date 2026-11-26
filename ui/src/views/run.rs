@@ -7,7 +7,7 @@
 use rune::{col, el, icon, row, text, Cx, El, Icon, ScrollSpec, Spring, Transition, Tx};
 use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, Kit};
 
-use crate::model::{Phase, Run, RunStatus, Step, StepKind, StepStatus, Substep};
+use crate::model::{Phase, ProjectState, Run, RunStatus, Step, StepKind, StepStatus, Substep};
 use crate::state::{LogMode, LogState, State};
 use crate::theme;
 use crate::widgets::{self, ago, duration, mono_chip, short_sha};
@@ -422,7 +422,43 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
         .key("run-cancel")
     });
     let has_deploy_step = run.steps.iter().any(|st| st.phase == Phase::Deploy);
-    let project_running = s.current_project().is_some_and(|p| p.running);
+    let project_running = s
+        .current_project()
+        .is_some_and(|p| p.state() == ProjectState::Running);
+    let retry_btn = (!run.status.is_running()).then(|| {
+        let retrying_this = s.retrying.as_deref() == Some(run.id.as_str());
+        let failed_like = matches!(
+            run.status,
+            RunStatus::Failure | RunStatus::Error | RunStatus::Cancelled
+        );
+        let label = if retrying_this {
+            "Retrying…"
+        } else if failed_like {
+            "Retry"
+        } else {
+            "Re-run"
+        };
+        let variant = if failed_like {
+            ButtonVariant::Submit
+        } else {
+            ButtonVariant::Outline
+        };
+        let retry_id = run.id.clone();
+        Button::new(label)
+            .variant(variant)
+            .control_size(ControlSize::Small)
+            .disabled(s.retrying.is_some() || project_running)
+            .help(if project_running {
+                "Already running"
+            } else if failed_like {
+                "Re-run CI for this commit"
+            } else {
+                "Re-run pipeline for this commit"
+            })
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.retry_run(&retry_id, tx))
+            .build(k)
+            .key("run-retry")
+    });
     let force_deploy_btn = (!run.status.is_running() && run.pr_number.is_none() && has_deploy_step)
         .then(|| {
             let deploying = s.force_deploying.as_deref() == Some(run.id.as_str());
@@ -493,6 +529,9 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
 
         let mut actions = row().w_full().gap(8.0).flex_wrap();
         if let Some(btn) = cancel_btn {
+            actions = actions.child(btn.grow(1.0));
+        }
+        if let Some(btn) = retry_btn {
             actions = actions.child(btn.grow(1.0));
         }
         if let Some(btn) = force_deploy_btn {
@@ -605,6 +644,9 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool, layout_w: f32
         .child(el().grow(1.0));
 
     if let Some(btn) = cancel_btn {
+        meta = meta.child(btn);
+    }
+    if let Some(btn) = retry_btn {
         meta = meta.child(btn);
     }
     if let Some(btn) = force_deploy_btn {

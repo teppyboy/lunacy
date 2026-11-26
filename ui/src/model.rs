@@ -200,12 +200,18 @@ pub struct PrSummary {
     pub status: Option<RunStatus>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub branch: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub github_repo: Option<String>,
     #[serde(default)]
@@ -222,6 +228,24 @@ pub struct Project {
     pub last_error: Option<String>,
     #[serde(default)]
     pub open_prs: Vec<PrSummary>,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            branch: String::new(),
+            enabled: true,
+            github_repo: None,
+            upstream_sha: None,
+            last_sha: None,
+            running: false,
+            current_run: None,
+            last_run: None,
+            last_error: None,
+            open_prs: Vec::new(),
+        }
+    }
 }
 
 impl Project {
@@ -389,6 +413,19 @@ pub struct ForceDeployResult {
     pub deploy_only: bool,
 }
 
+/// Response from `POST /api/runs/{id}/retry`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetryResult {
+    #[serde(default)]
+    pub queued: bool,
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub sha: String,
+    #[serde(default)]
+    pub run_id: String,
+}
+
 /// Response from `POST /api/cache/clear` or `POST /api/projects/{name}/cache/clear`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheClearResult {
@@ -396,6 +433,15 @@ pub struct CacheClearResult {
     pub cleared: bool,
     #[serde(default)]
     pub removed: Vec<String>,
+}
+
+/// Response from `POST /api/discord/test`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiscordTestResult {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -449,6 +495,8 @@ pub struct DeployReporting {
     pub deploy_context: String,
     #[serde(default)]
     pub discord_source: String,
+    #[serde(default)]
+    pub discord_notify_on: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -493,10 +541,12 @@ pub struct LastDeploySummary {
     pub steps: Vec<LastDeployStep>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployProjectCheck {
     #[serde(default)]
     pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub repo_path: String,
     #[serde(default)]
@@ -541,6 +591,37 @@ pub struct DeployProjectCheck {
     pub cache_enabled: bool,
     #[serde(default)]
     pub trigger_mode: Option<String>,
+}
+
+impl Default for DeployProjectCheck {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            repo_path: String::new(),
+            remote: String::new(),
+            branch: String::new(),
+            checkout: String::new(),
+            github_repo: None,
+            poll_interval: None,
+            pipeline_timeout: None,
+            step_timeout: 0,
+            overall: CheckLevel::default(),
+            git: DeployGitStatus::default(),
+            reporting: DeployReporting::default(),
+            ci_active_steps: 0,
+            ci_total_steps: 0,
+            deploy_active_steps: 0,
+            deploy_total_steps: 0,
+            deploy_steps: Vec::new(),
+            checks: Vec::new(),
+            last_deploy: None,
+            watch_prs: false,
+            deploy_refs: Vec::new(),
+            cache_enabled: false,
+            trigger_mode: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

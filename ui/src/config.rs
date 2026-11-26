@@ -129,6 +129,12 @@ pub struct Discord {
     pub webhook_url: Option<String>,
     #[serde(default)]
     pub notify_on_start: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_on_failure: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -153,9 +159,21 @@ pub struct Act {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Contexts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Project {
     #[serde(default)]
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub repo_path: String,
     #[serde(default = "default_remote")]
@@ -164,6 +182,10 @@ pub struct Project {
     pub branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contexts: Option<Contexts>,
     /// `none`, `worktree` or `in-place`.
     #[serde(default = "default_checkout")]
     pub checkout: String,
@@ -186,7 +208,23 @@ pub struct Project {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord_webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_on_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_notify_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_mention_on_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<Vec<String>>,
+    #[serde(default)]
+    pub platforms: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub act_args: Vec<String>,
     #[serde(default)]
     pub ci: Vec<Step>,
     #[serde(default)]
@@ -389,7 +427,7 @@ mod tests {
     fn unknown_keys_survive_a_round_trip() {
         let json = serde_json::json!({
             "general": {"poll_interval": 60, "log_level": "debug"},
-            "project": [{"name": "p", "repo_path": "/srv/p", "contexts": {"ci": "x"}, "ci": [
+            "project": [{"name": "p", "repo_path": "/srv/p", "contexts": {"ci": "x"}, "future_project_flag": true, "ci": [
                 {"name": "Build", "kind": "shell", "run": "make", "some_future_field": 1}
             ]}]
         });
@@ -398,7 +436,20 @@ mod tests {
             cfg.general.extra.get("log_level").and_then(Value::as_str),
             Some("debug")
         );
-        assert!(cfg.projects[0].extra.get("contexts").is_some());
+        assert_eq!(
+            cfg.projects[0]
+                .contexts
+                .as_ref()
+                .and_then(|c| c.ci.as_deref()),
+            Some("x")
+        );
+        assert_eq!(
+            cfg.projects[0]
+                .extra
+                .get("future_project_flag")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert_eq!(
             cfg.projects[0].ci[0]
                 .extra
@@ -408,6 +459,8 @@ mod tests {
         );
         let back = serde_json::to_value(&cfg).unwrap();
         assert_eq!(back["general"]["log_level"], "debug");
+        assert_eq!(back["project"][0]["contexts"]["ci"], "x");
+        assert_eq!(back["project"][0]["future_project_flag"], true);
         assert_eq!(back["project"][0]["ci"][0]["some_future_field"], 1);
     }
 
@@ -517,6 +570,69 @@ mod tests {
         );
         assert_eq!(v["project"][0]["watch_tags"], true);
         assert_eq!(v["project"][0]["cache"], false);
+        let parsed: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn discord_and_per_repo_override_fields_round_trip() {
+        let mut platforms = BTreeMap::new();
+        platforms.insert(
+            "ubuntu-latest".into(),
+            "catthehacker/ubuntu:act-latest".into(),
+        );
+        let cfg = Config {
+            discord: Some(Discord {
+                webhook_url: Some(MASK.into()),
+                notify_on_start: true,
+                notify_on: Some("failures".into()),
+                username: Some("lunacy-bot".into()),
+                mention_on_failure: Some("<@&12345>".into()),
+                ..Discord::default()
+            }),
+            projects: vec![Project {
+                enabled: Some(false),
+                github_enabled: Some(false),
+                contexts: Some(Contexts {
+                    ci: Some("custom/ci".into()),
+                    deploy: Some("custom/deploy".into()),
+                    ..Contexts::default()
+                }),
+                discord_enabled: Some(true),
+                discord_webhook_url: Some(MASK.into()),
+                notify_on_start: Some(false),
+                discord_notify_on: Some("failures".into()),
+                discord_username: Some("alpha-bot".into()),
+                discord_mention_on_failure: Some("<@999>".into()),
+                shell: Some(vec!["bash".into(), "-lc".into()]),
+                platforms,
+                act_args: vec!["--pull=false".into()],
+                ..Project::new("alpha")
+            }],
+            ..Config::default()
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["discord"]["notify_on"], "failures");
+        assert_eq!(v["discord"]["username"], "lunacy-bot");
+        assert_eq!(v["discord"]["mention_on_failure"], "<@&12345>");
+        assert_eq!(v["project"][0]["enabled"], false);
+        assert_eq!(v["project"][0]["github_enabled"], false);
+        assert_eq!(v["project"][0]["contexts"]["ci"], "custom/ci");
+        assert_eq!(v["project"][0]["contexts"]["deploy"], "custom/deploy");
+        assert_eq!(v["project"][0]["discord_enabled"], true);
+        assert_eq!(v["project"][0]["notify_on_start"], false);
+        assert_eq!(v["project"][0]["discord_notify_on"], "failures");
+        assert_eq!(v["project"][0]["discord_username"], "alpha-bot");
+        assert_eq!(v["project"][0]["discord_mention_on_failure"], "<@999>");
+        assert_eq!(v["project"][0]["shell"], serde_json::json!(["bash", "-lc"]));
+        assert_eq!(
+            v["project"][0]["platforms"]["ubuntu-latest"],
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            v["project"][0]["act_args"],
+            serde_json::json!(["--pull=false"])
+        );
         let parsed: Config = serde_json::from_value(v).unwrap();
         assert_eq!(parsed, cfg);
     }

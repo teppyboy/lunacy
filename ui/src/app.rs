@@ -396,7 +396,7 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
                         s.drawer_open = !s.drawer_open;
                     }),
             )
-            .child(widgets::dot(k.c.text_accent, 9.0))
+            .child(widgets::brand_logo(k, 16.0))
             .child(
                 text(title)
                     .key("titlebar-title")
@@ -413,7 +413,7 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
                     .key("brand")
                     .gap(7.0)
                     .center_y()
-                    .child(widgets::dot(k.c.text_accent, 9.0))
+                    .child(widgets::brand_logo(k, 16.0))
                     .child(text("lunacy").font(k.ty.ui_medium).color(k.c.text_base)),
             )
             .child(text("/").font(k.ty.ui).color(k.c.text_faint).a11y_hidden())
@@ -900,7 +900,7 @@ fn drawer_overlays(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4])
         .gap(8.0)
         .center_y()
         .border_sides([0.0, 0.0, theme::SECTION_BORDER, 0.0], k.c.border_strong)
-        .child(widgets::dot(k.c.text_accent, 9.0))
+        .child(widgets::brand_logo(k, 16.0))
         .child(
             text("lunacy")
                 .font(k.ty.ui_medium)
@@ -1268,6 +1268,18 @@ mod tests {
                     }
                 }
             });
+            if let Some(failed) = crate::demo::failed_run() {
+                let fid = failed.id;
+                assert_responsive_scene("run-failed", w, h, move |s| {
+                    crate::demo::load(s, View::Run { id: fid });
+                });
+            }
+            if let Some(finished) = crate::demo::finished_run() {
+                let sid = finished.id;
+                assert_responsive_scene("run-finished", w, h, move |s| {
+                    crate::demo::load(s, View::Run { id: sid });
+                });
+            }
             assert_responsive_scene("settings-general", w, h, |s| {
                 crate::demo::load(
                     s,
@@ -1281,6 +1293,22 @@ mod tests {
                     s,
                     View::Settings {
                         page: SettingsPage::Github,
+                    },
+                )
+            });
+            assert_responsive_scene("settings-discord", w, h, |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Discord,
+                    },
+                )
+            });
+            assert_responsive_scene("settings-projects", w, h, |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Projects,
                     },
                 )
             });
@@ -2821,17 +2849,14 @@ mod tests {
                 .iter()
                 .find(|e| e.key.as_deref() == Some("settings-body") && !e.exiting)
                 .expect("settings-body");
-            let target = els
-                .iter()
-                .find(|e| e.key.as_deref() == Some(key) && !e.exiting)
+            let (_cx, cy) = rt
+                .find(key)
                 .unwrap_or_else(|| panic!("{label}: missing {key}"));
-            let cy = target.rect[1] + target.rect[3] * 0.5;
             assert!(
                 cy >= body.rect[1] + 2.0 && cy <= body.rect[1] + body.rect[3] - 2.0,
-                "{label}: {key} center y={cy:.1} outside settings-body [{:.1}, {:.1}] (target rect={:?})",
+                "{label}: {key} center y={cy:.1} outside settings-body [{:.1}, {:.1}]",
                 body.rect[1],
                 body.rect[1] + body.rect[3],
-                target.rect
             );
         };
 
@@ -2878,6 +2903,51 @@ mod tests {
         }
         assert_in_viewport(&rt_new, "add-shell-ci", "T6 add-shell-ci 1280x840");
 
+        // Simulate T6 add_project_act_workflows_and_save step-edit & reorder scroll sequence at 1280x840.
+        let click_in_view = |rt: &mut Runtime<State>, key: &str, label: &str| {
+            assert_in_viewport(rt, key, label);
+            let (x, y) = rt
+                .find(key)
+                .unwrap_or_else(|| panic!("{label}: missing {key}"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            for _ in 0..10 {
+                rt.frame(0.016);
+                rt.settle_all();
+            }
+        };
+        click_in_view(&mut rt_new, "add-shell-ci", "T6 tap add-shell-ci");
+        let (bx, by) = rt_new.find("settings-body").expect("settings-body");
+        rt_new.wheel_xy(bx, by, 0.0, -350.0);
+        for _ in 0..20 {
+            rt_new.frame(0.016);
+            rt_new.settle_all();
+        }
+        click_in_view(&mut rt_new, "step-done", "T6 tap step-done 0");
+        click_in_view(&mut rt_new, "add-act-ci", "T6 tap add-act-ci");
+        let (bx, by) = rt_new.find("settings-body").expect("settings-body");
+        rt_new.wheel_xy(bx, by, 0.0, -100.0);
+        for _ in 0..20 {
+            rt_new.frame(0.016);
+            rt_new.settle_all();
+        }
+        assert_in_viewport(&rt_new, "step-workflows", "T6 step-workflows 1280x840");
+        click_in_view(
+            &mut rt_new,
+            "step-kind/segment0",
+            "T6 tap step-kind/segment0",
+        );
+        click_in_view(
+            &mut rt_new,
+            "step-kind/segment1",
+            "T6 tap step-kind/segment1",
+        );
+        click_in_view(&mut rt_new, "step-done", "T6 tap step-done 1");
+        assert_in_viewport(&rt_new, "step-down-ci-0", "T6 step-down-ci-0 1280x840");
+        click_in_view(&mut rt_new, "step-down-ci-0", "T6 tap step-down-ci-0");
+        click_in_view(&mut rt_new, "step-up-ci-1", "T6 tap step-up-ci-1");
+        click_in_view(&mut rt_new, "step-remove-ci-1", "T6 tap step-remove-ci-1");
+
         // Responsive layouts: step-row-ci-0 visible after scroll across all 4 viewports.
         for (w, h, wheels) in [
             (390.0, 844.0, vec![-800.0, -800.0]),
@@ -2907,5 +2977,628 @@ mod tests {
             }
             assert_in_viewport(&rt, "step-row-ci-0", &format!("resp {w}x{h}"));
         }
+    }
+
+    #[test]
+    fn global_discord_settings_render_and_interact() {
+        let mut rt = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Discord,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt.find("field-discord.webhook_url").is_some());
+        assert!(rt.find("discord-notify-on-start").is_some());
+        assert!(rt.find("field-discord.notify_on").is_some());
+        assert!(rt.find("discord-notify-on").is_some());
+        assert!(rt.find("field-discord.username").is_some());
+        assert!(rt.find("field-discord.mention_on_failure").is_some());
+        assert!(rt.find("discord-test-global").is_some());
+
+        // When clean, clicking "Send test message" starts the test request.
+        let (tx_x, tx_y) = rt.find("discord-test-global").expect("discord-test-global");
+        rt.pointer_down(tx_x, tx_y);
+        rt.pointer_up(tx_x, tx_y);
+        for _ in 0..3 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(rt.state.testing_discord);
+
+        // Reset testing_discord, then change Notify on -> Failures only (makes editor dirty).
+        rt.state.testing_discord = false;
+        rt.invalidate();
+        for _ in 0..3 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        let (fx, fy) = rt
+            .find("discord-notify-on/segment1")
+            .expect("Failures only segment");
+        rt.pointer_down(fx, fy);
+        rt.pointer_up(fx, fy);
+        for _ in 0..3 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "discord.notify_on").and_then(|v| v.as_str()),
+            Some("failures")
+        );
+        assert!(rt.state.editor.dirty());
+
+        // While dirty, discord-test-global must be disabled and ignore clicks.
+        let (tx_x, tx_y) = rt.find("discord-test-global").expect("discord-test-global");
+        rt.pointer_down(tx_x, tx_y);
+        rt.pointer_up(tx_x, tx_y);
+        for _ in 0..3 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(!rt.state.testing_discord);
+    }
+
+    #[test]
+    fn per_repo_discord_github_enabled_and_runner_controls_write_draft() {
+        let click = |rt: &mut Runtime<State>, key: &str| {
+            let (x, y) = rt
+                .find(key)
+                .unwrap_or_else(|| panic!("missing element {key}"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            for _ in 0..4 {
+                rt.frame(0.016);
+                rt.settle_all();
+            }
+        };
+        let scroll_to = |rt: &mut Runtime<State>, key: &str| {
+            // Scroll settings-body incrementally until the whole target fits inside the viewport.
+            for step in 0..24 {
+                let els = rt.elements();
+                let body = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some("settings-body") && !e.exiting)
+                    .expect("settings-body");
+                if let Some(target) = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key) && !e.exiting)
+                {
+                    let top = target.rect[1];
+                    let bottom = target.rect[1] + target.rect[3];
+                    let view_top = body.rect[1] + 4.0;
+                    let view_bottom = body.rect[1] + body.rect[3] - 4.0;
+                    if top >= view_top && bottom <= view_bottom {
+                        return;
+                    }
+                    let dy = if bottom > view_bottom { -240.0 } else { 240.0 };
+                    let (bx, by) = rt.find("settings-body").expect("settings-body");
+                    rt.wheel_xy(bx, by, 0.0, dy);
+                    for _ in 0..12 {
+                        rt.frame(0.016);
+                        rt.settle_all();
+                    }
+                } else {
+                    panic!("missing {key} on scroll step {step}");
+                }
+            }
+            panic!("could not scroll {key} into settings-body viewport");
+        };
+
+        let mut rt = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Projects,
+                    },
+                )
+            },
+            1180.0,
+            760.0,
+        );
+
+        // Verify all new per-repo fields exist in the tree.
+        for key in [
+            "field-project[0].enabled",
+            "field-project[0].discord_enabled",
+            "field-project[0].discord_webhook_url",
+            "field-project[0].notify_on_start",
+            "field-project[0].discord_notify_on",
+            "field-project[0].discord_username",
+            "field-project[0].discord_mention_on_failure",
+            "project-discord-test",
+            "field-project[0].github_enabled",
+            "field-project[0].contexts.ci",
+            "field-project[0].contexts.deploy",
+            "field-project[0].shell",
+            "field-project[0].platforms",
+            "field-project[0].act_args",
+        ] {
+            assert!(rt.find(key).is_some(), "expected {key} in project form");
+        }
+
+        // Clean project: Test Discord webhook fires test_discord.
+        scroll_to(&mut rt, "project-discord-test");
+        click(&mut rt, "project-discord-test");
+        assert!(rt.state.testing_discord);
+        rt.state.testing_discord = false;
+        rt.invalidate();
+        for _ in 0..3 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+
+        // Toggle project[0].enabled off -> false, then back on -> true.
+        scroll_to(&mut rt, "field-project[0].enabled");
+        click(&mut rt, "field-project[0].enabled");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].enabled"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        click(&mut rt, "field-project[0].enabled");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].enabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        // Tri-state discord_enabled: On -> true, Off -> false, Inherit -> removed (None).
+        scroll_to(&mut rt, "project-discord-enabled-0");
+        click(&mut rt, "project-discord-enabled-0/segment1");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].discord_enabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        click(&mut rt, "project-discord-enabled-0/segment2");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].discord_enabled"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        // Even if base matched draft with discord_enabled=false, Test Discord webhook stays disabled.
+        rt.state.editor.base = rt.state.editor.draft.clone();
+        rt.invalidate();
+        for _ in 0..3 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        scroll_to(&mut rt, "project-discord-test");
+        click(&mut rt, "project-discord-test");
+        assert!(
+            !rt.state.testing_discord,
+            "project-discord-test must be disabled when discord_enabled == false"
+        );
+        scroll_to(&mut rt, "project-discord-enabled-0");
+        click(&mut rt, "project-discord-enabled-0/segment0");
+        assert!(crate::paths::get(&rt.state.editor.draft, "project[0].discord_enabled").is_none());
+
+        // Tri-state notify_on_start: On -> true, Off -> false, Inherit -> None.
+        scroll_to(&mut rt, "project-notify-on-start-0");
+        click(&mut rt, "project-notify-on-start-0/segment1");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].notify_on_start"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        click(&mut rt, "project-notify-on-start-0/segment2");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].notify_on_start"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        click(&mut rt, "project-notify-on-start-0/segment0");
+        assert!(crate::paths::get(&rt.state.editor.draft, "project[0].notify_on_start").is_none());
+
+        // discord_notify_on: All runs -> "all", Failures only -> "failures", Inherit -> None.
+        scroll_to(&mut rt, "project-discord-notify-on-0");
+        click(&mut rt, "project-discord-notify-on-0/segment1");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].discord_notify_on")
+                .and_then(|v| v.as_str()),
+            Some("all")
+        );
+        click(&mut rt, "project-discord-notify-on-0/segment2");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].discord_notify_on")
+                .and_then(|v| v.as_str()),
+            Some("failures")
+        );
+        click(&mut rt, "project-discord-notify-on-0/segment0");
+        assert!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].discord_notify_on").is_none()
+        );
+
+        // Tri-state github_enabled: On -> true, Off -> false, Inherit -> None.
+        scroll_to(&mut rt, "project-github-enabled-0");
+        click(&mut rt, "project-github-enabled-0/segment1");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].github_enabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        click(&mut rt, "project-github-enabled-0/segment2");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].github_enabled"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        click(&mut rt, "project-github-enabled-0/segment0");
+        assert!(crate::paths::get(&rt.state.editor.draft, "project[0].github_enabled").is_none());
+
+        // Type into contexts.ci, shell, platforms, and act_args via keyboard paste.
+        let type_into = |rt: &mut Runtime<State>, field_key: &str, value: &str| {
+            let ctrl = format!("{field_key}/control");
+            scroll_to(rt, field_key);
+            click(rt, &ctrl);
+            rt.key(KeyEvent {
+                key: Key::Command('a'),
+                mods: Mods {
+                    cmd: true,
+                    ..Mods::default()
+                },
+            });
+            rt.key(KeyEvent {
+                key: Key::Backspace,
+                mods: Mods::default(),
+            });
+            if !value.is_empty() {
+                rt.paste(value);
+            }
+            for _ in 0..4 {
+                rt.frame(0.016);
+                rt.settle_all();
+            }
+        };
+
+        type_into(&mut rt, "field-project[0].contexts.ci", "custom/ci");
+        assert_eq!(
+            crate::paths::get_str(&rt.state.editor.draft, "project[0].contexts.ci"),
+            "custom/ci"
+        );
+        type_into(&mut rt, "field-project[0].contexts.ci", "");
+        assert!(crate::paths::get(&rt.state.editor.draft, "project[0].contexts.ci").is_none());
+
+        type_into(&mut rt, "field-project[0].shell", "bash -lc");
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].shell"),
+            Some(&serde_json::json!(["bash", "-lc"]))
+        );
+
+        type_into(
+            &mut rt,
+            "field-project[0].platforms",
+            "ubuntu-latest=-self-hosted",
+        );
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].platforms"),
+            Some(&serde_json::json!({"ubuntu-latest": "-self-hosted"}))
+        );
+
+        type_into(
+            &mut rt,
+            "field-project[0].act_args",
+            "--pull=false\n--verbose",
+        );
+        assert_eq!(
+            crate::paths::get(&rt.state.editor.draft, "project[0].act_args"),
+            Some(&serde_json::json!(["--pull=false", "--verbose"]))
+        );
+    }
+
+    #[test]
+    fn paused_badge_and_deploy_discord_disabled_status_render() {
+        // Projects list shows Paused badge when project.enabled == false.
+        let rt_list = setup_runtime(
+            |s| {
+                crate::demo::load(s, View::Projects);
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == "dotfiles") {
+                    p.enabled = false;
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_list
+            .elements()
+            .into_iter()
+            .any(|e| e.text.as_deref() == Some("Paused")));
+
+        // Project detail header shows Paused badge when project.enabled == false.
+        let rt_detail = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Project {
+                        name: "dotfiles".into(),
+                    },
+                );
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == "dotfiles") {
+                    p.enabled = false;
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        assert!(rt_detail
+            .elements()
+            .into_iter()
+            .any(|e| e.text.as_deref() == Some("Paused")));
+
+        // Deploy checks shows Paused badge, Discord: Disabled, and Discord: project (failures only).
+        let rt_deploy = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::Deploy,
+                    },
+                );
+                if let Some(report) = &mut s.deploy_checks {
+                    if let Some(p0) = report.projects.get_mut(0) {
+                        p0.reporting.discord_source = "project".into();
+                        p0.reporting.discord_notify_on = "failures".into();
+                    }
+                    if let Some(p1) = report.projects.get_mut(1) {
+                        p1.enabled = false;
+                        p1.reporting.discord_source = "disabled".into();
+                        p1.reporting.discord_notify_on = "all".into();
+                    }
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        let texts: Vec<String> = rt_deploy
+            .elements()
+            .into_iter()
+            .filter_map(|e| e.text)
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "Paused"),
+            "expected Paused badge on deploy checks"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Discord: Disabled")),
+            "expected Discord: Disabled, got: {:?}",
+            texts
+                .iter()
+                .filter(|t| t.contains("Discord"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("Discord: project (failures only)")),
+            "expected Discord: project (failures only), got: {:?}",
+            texts
+                .iter()
+                .filter(|t| t.contains("Discord"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn retry_button_renders_variants_disables_when_busy_and_dispatches() {
+        use crate::model::RunStatus;
+
+        let button_text = |rt: &Runtime<State>, key: &str| -> Option<String> {
+            let els = rt.elements();
+            let idx = els
+                .iter()
+                .position(|e| e.key.as_deref() == Some(key) && !e.exiting)?;
+            els.iter()
+                .enumerate()
+                .find(|(i, e)| {
+                    !e.exiting
+                        && e.text.is_some()
+                        && (*i == idx || ancestors_have_key(&els, *i, key))
+                })
+                .and_then(|(_, e)| e.text.clone())
+        };
+
+        // 1) Running run: no Retry button.
+        let running_id = crate::demo::running_run().expect("running demo run").id;
+        let rt_running = setup_runtime(
+            move |s| crate::demo::load(s, View::Run { id: running_id }),
+            1180.0,
+            760.0,
+        );
+        assert!(rt_running.find("run-retry").is_none());
+
+        // 2) Failed run with idle project: prominent Submit "Retry" button, clicks -> sets retrying.
+        let failed = crate::demo::failed_run().expect("failed demo run");
+        let failed_id = failed.id.clone();
+        let failed_proj = failed.project.clone();
+        let mut rt_failed = setup_runtime(
+            move |s| {
+                crate::demo::load(
+                    s,
+                    View::Run {
+                        id: failed_id.clone(),
+                    },
+                );
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == failed_proj) {
+                    p.running = false;
+                    p.current_run = None;
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        assert_eq!(
+            button_text(&rt_failed, "run-retry").as_deref(),
+            Some("Retry")
+        );
+        let dark = theme::kit_mode(theme::ThemeMode::Dark, true, false);
+        let failed_fill = rt_failed
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("run-retry") && !e.exiting)
+            .expect("run-retry")
+            .fill;
+        assert_eq!(
+            failed_fill, dark.c.bg_inverse,
+            "failed run Retry button should use Submit (primary) variant"
+        );
+
+        let (rx, ry) = rt_failed.find("run-retry").expect("run-retry");
+        rt_failed.pointer_down(rx, ry);
+        rt_failed.pointer_up(rx, ry);
+        for _ in 0..4 {
+            rt_failed.frame(0.016);
+            rt_failed.settle_all();
+        }
+        assert_eq!(
+            rt_failed.state.retrying.as_deref(),
+            Some(failed.id.as_str())
+        );
+        assert_eq!(
+            button_text(&rt_failed, "run-retry").as_deref(),
+            Some("Retrying…")
+        );
+
+        // 3) Cancelled run also renders "Retry" with Submit variant.
+        let cancelled_id = failed.id.clone();
+        let cancelled_proj = failed.project.clone();
+        let rt_cancelled = setup_runtime(
+            move |s| {
+                crate::demo::load(s, View::Run { id: cancelled_id });
+                if let Some(r) = s.run.as_mut() {
+                    r.status = RunStatus::Cancelled;
+                }
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == cancelled_proj) {
+                    p.running = false;
+                    p.current_run = None;
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        assert_eq!(
+            button_text(&rt_cancelled, "run-retry").as_deref(),
+            Some("Retry")
+        );
+
+        // 4) Succeeded run: Outline "Re-run" button, disabled when project is running.
+        let finished = crate::demo::finished_run().expect("finished demo run");
+        let finished_id = finished.id.clone();
+        let finished_proj = finished.project.clone();
+        let mut rt_ok = setup_runtime(
+            move |s| {
+                crate::demo::load(
+                    s,
+                    View::Run {
+                        id: finished_id.clone(),
+                    },
+                );
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == finished_proj) {
+                    p.running = true;
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        assert_eq!(button_text(&rt_ok, "run-retry").as_deref(), Some("Re-run"));
+        let ok_fill = rt_ok
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("run-retry") && !e.exiting)
+            .expect("run-retry")
+            .fill;
+        assert_ne!(
+            ok_fill, dark.c.bg_inverse,
+            "succeeded run Re-run button should use Outline variant, not Submit"
+        );
+        // Clicking while project_running must be ignored (disabled).
+        let (ox, oy) = rt_ok.find("run-retry").expect("run-retry");
+        rt_ok.pointer_down(ox, oy);
+        rt_ok.pointer_up(ox, oy);
+        for _ in 0..4 {
+            rt_ok.frame(0.016);
+            rt_ok.settle_all();
+        }
+        assert_eq!(rt_ok.state.retrying, None);
+
+        // 5) Project history row Retry button on desktop triggers retry without navigating to Run.
+        let failed_id_row = failed.id.clone();
+        let failed_proj_row = failed.project.clone();
+        let mut rt_proj = setup_runtime(
+            move |s| {
+                crate::demo::load(
+                    s,
+                    View::Project {
+                        name: failed_proj_row.clone(),
+                    },
+                );
+                if let Some(p) = s.projects.iter_mut().find(|p| p.name == failed_proj_row) {
+                    p.running = false;
+                    p.current_run = None;
+                }
+            },
+            1180.0,
+            760.0,
+        );
+        let row_btn_key = format!("run-retry-{failed_id_row}");
+        let (bx, by) = rt_proj
+            .find(&row_btn_key)
+            .expect("desktop failed row Retry button");
+        rt_proj.pointer_down(bx, by);
+        rt_proj.pointer_up(bx, by);
+        for _ in 0..4 {
+            rt_proj.frame(0.016);
+            rt_proj.settle_all();
+        }
+        assert_eq!(
+            rt_proj.state.retrying.as_deref(),
+            Some(failed_id_row.as_str())
+        );
+        assert!(
+            matches!(rt_proj.state.view, View::Project { .. }),
+            "clicking row Retry button must not navigate into run detail"
+        );
+    }
+
+    #[test]
+    fn custom_lunacy_logo_renders_and_app_icon_png_is_valid() {
+        // Desktop titlebar renders lunacy-logo inside brand.
+        let rt_desktop = setup_runtime(|s| crate::demo::load(s, View::Projects), 1180.0, 760.0);
+        assert!(
+            rt_desktop.find("brand/lunacy-logo").is_some(),
+            "expected lunacy-logo in desktop titlebar brand"
+        );
+
+        // Compact titlebar renders lunacy-logo.
+        let rt_compact = setup_runtime(|s| crate::demo::load(s, View::Projects), 390.0, 844.0);
+        assert!(
+            rt_compact.find("titlebar/lunacy-logo").is_some(),
+            "expected lunacy-logo in compact titlebar"
+        );
+
+        // Compact drawer header renders lunacy-logo.
+        let rt_drawer = setup_runtime(
+            |s| {
+                crate::demo::load(s, View::Projects);
+                s.drawer_open = true;
+            },
+            390.0,
+            844.0,
+        );
+        assert!(
+            rt_drawer.find("rail-drawer/lunacy-logo").is_some(),
+            "expected lunacy-logo in compact drawer header"
+        );
+
+        // Embedded desktop app icon is a valid 256x256 RGBA PNG accepted by rune::set_app_icon.
+        let png = include_bytes!("../assets/lunacy-icon.png");
+        assert!(png.len() > 32 && &png[..8] == b"\x89PNG\r\n\x1a\n");
+        let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+        let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+        assert_eq!((w, h), (256, 256), "app icon must be 256x256");
+        assert_eq!(png[25], 6, "app icon color type must be RGBA (6)");
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(
+            rune::set_app_icon(png.to_vec()).is_ok(),
+            "rune::set_app_icon should accept ui/assets/lunacy-icon.png"
+        );
     }
 }

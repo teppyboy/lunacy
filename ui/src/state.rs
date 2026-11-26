@@ -372,10 +372,12 @@ pub enum Slot {
     Cancel,
     DeployChecks,
     ForceDeploy,
+    Retry,
     ClearCache,
+    TestDiscord,
 }
 
-const SLOTS: usize = 12;
+const SLOTS: usize = 14;
 
 fn slot_of(slot: Slot) -> usize {
     match slot {
@@ -390,7 +392,9 @@ fn slot_of(slot: Slot) -> usize {
         Slot::Cancel => 8,
         Slot::DeployChecks => 9,
         Slot::ForceDeploy => 10,
-        Slot::ClearCache => 11,
+        Slot::Retry => 11,
+        Slot::ClearCache => 12,
+        Slot::TestDiscord => 13,
     }
 }
 
@@ -873,8 +877,12 @@ pub struct State {
     pub cancelling: Option<String>,
     /// A "Force deploy" in flight, by project name or run id.
     pub force_deploying: Option<String>,
+    /// A "Retry" in flight, by run id.
+    pub retrying: Option<String>,
     /// A cache-clear request in flight.
     pub clearing_cache: bool,
+    /// A Discord test-webhook request in flight.
+    pub testing_discord: bool,
     /// The force toggle beside "Run now".
     pub force: bool,
 
@@ -970,7 +978,9 @@ impl State {
             triggering: None,
             cancelling: None,
             force_deploying: None,
+            retrying: None,
             clearing_cache: false,
+            testing_discord: false,
             force: false,
             bus: Bus::default(),
             ws: crate::ws::WsClient::default(),
@@ -1163,7 +1173,9 @@ impl State {
         self.deploy_checks_error = None;
         self.cancelling = None;
         self.force_deploying = None;
+        self.retrying = None;
         self.clearing_cache = false;
+        self.testing_discord = false;
         if self.live.server != prev_server {
             self.projects.clear();
             self.runs.clear();
@@ -1617,7 +1629,9 @@ impl State {
             | Call::CancelProject { .. }
             | Call::ForceDeployProject { .. }
             | Call::ForceDeployRun { .. }
+            | Call::RetryRun { .. }
             | Call::ClearCache { .. }
+            | Call::TestDiscord { .. }
             | Call::SaveConfig(_) => true,
         }
     }
@@ -1778,6 +1792,17 @@ impl State {
         self.refresh(tx);
     }
 
+    pub fn retry_run(&mut self, id: &str, tx: &mut Tx) {
+        if self.retrying.is_some() {
+            return;
+        }
+        self.retrying = Some(id.to_string());
+        if !self.demo {
+            self.send(Slot::Retry, Call::RetryRun { id: id.to_string() });
+        }
+        self.refresh(tx);
+    }
+
     pub fn clear_cache(&mut self, project: Option<&str>, tx: &mut Tx) {
         if self.clearing_cache {
             return;
@@ -1790,6 +1815,17 @@ impl State {
                     project: project.map(str::to_string),
                 },
             );
+        }
+        self.refresh(tx);
+    }
+
+    pub fn test_discord(&mut self, project: Option<String>, tx: &mut Tx) {
+        if self.testing_discord {
+            return;
+        }
+        self.testing_discord = true;
+        if !self.demo {
+            self.send(Slot::TestDiscord, Call::TestDiscord { project });
         }
         self.refresh(tx);
     }
@@ -2070,11 +2106,48 @@ impl State {
                     ));
                 }
             }
+            Call::RetryRun { .. } => {
+                self.retrying = None;
+                match &failure {
+                    Failure::Api {
+                        status: 409,
+                        message,
+                        ..
+                    } if message.trim().is_empty()
+                        || message.to_ascii_lowercase().contains("running") =>
+                    {
+                        toast = Some((
+                            ToastKind::Info,
+                            "Already running".into(),
+                            if message.trim().is_empty() {
+                                "This project already has a run in progress.".into()
+                            } else {
+                                message.clone()
+                            },
+                        ));
+                    }
+                    _ => {
+                        toast = Some((
+                            ToastKind::Error,
+                            "Could not retry run".into(),
+                            failure.message(),
+                        ));
+                    }
+                }
+            }
             Call::ClearCache { .. } => {
                 self.clearing_cache = false;
                 toast = Some((
                     ToastKind::Error,
                     "Could not clear cache".into(),
+                    failure.message(),
+                ));
+            }
+            Call::TestDiscord { .. } => {
+                self.testing_discord = false;
+                toast = Some((
+                    ToastKind::Error,
+                    "Discord test failed".into(),
                     failure.message(),
                 ));
             }
@@ -2321,6 +2394,36 @@ impl State {
                 self.refresh(tx);
                 true
             }
+            Answer::Retried { id, result } => {
+                self.retrying = None;
+                let project = if result.project.is_empty() {
+                    self.current_project_name().unwrap_or_else(|| id.clone())
+                } else {
+                    result.project.clone()
+                };
+                let body = if result.sha.is_empty() {
+                    format!("{project}: re-running run.")
+                } else {
+                    format!(
+                        "{project}: re-running {}.",
+                        crate::widgets::short_sha(&result.sha)
+                    )
+                };
+                self.toast(tx, ToastKind::Success, "Retry queued", &body);
+                self.next_projects = 0.0;
+                self.next_runs = 0.0;
+                self.next_run = 0.0;
+                if !self.demo && !self.ws_connected {
+                    self.request_projects();
+                    match self.view.clone() {
+                        View::Run { id: open_id } => self.request_run(&open_id),
+                        View::Project { name } => self.request_runs(&name),
+                        _ => {}
+                    }
+                }
+                self.refresh(tx);
+                true
+            }
             Answer::CacheCleared { project, result } => {
                 self.clearing_cache = false;
                 let scope = project.as_deref().unwrap_or("All projects");
@@ -2334,6 +2437,22 @@ impl State {
                     )
                 };
                 self.toast(tx, ToastKind::Success, "Cache cleared", &body);
+                true
+            }
+            Answer::DiscordTested { project, result } => {
+                self.testing_discord = false;
+                let scope = project.as_deref().unwrap_or("Global");
+                let source = if result.source.is_empty() {
+                    "webhook"
+                } else {
+                    result.source.as_str()
+                };
+                self.toast(
+                    tx,
+                    ToastKind::Success,
+                    "Discord test sent",
+                    &format!("{scope}: sent via {source} webhook."),
+                );
                 true
             }
             Answer::Config(cfg) => {
@@ -3792,6 +3911,130 @@ mod tests {
             s.toasts.last().map(|t| t.title.as_str()),
             Some("Cache cleared")
         );
+    }
+
+    #[test]
+    fn test_discord_sets_flag_and_handles_success_and_error_toasts() {
+        use crate::model::DiscordTestResult;
+
+        let mut s = State::new(Conn::default());
+        s.demo = true;
+        let mut tx = Tx::default();
+
+        s.test_discord(Some("lunarum".into()), &mut tx);
+        assert!(s.testing_discord);
+        s.apply(
+            Call::TestDiscord {
+                project: Some("lunarum".into()),
+            },
+            Answer::DiscordTested {
+                project: Some("lunarum".into()),
+                result: DiscordTestResult {
+                    ok: true,
+                    source: "project".into(),
+                },
+            },
+            &mut tx,
+        );
+        assert!(!s.testing_discord);
+        let ok_toast = s.toasts.last().expect("success toast");
+        assert_eq!(ok_toast.kind, ToastKind::Success);
+        assert_eq!(ok_toast.title, "Discord test sent");
+        assert!(
+            ok_toast.body.contains("project"),
+            "expected source in toast body, got {:?}",
+            ok_toast.body
+        );
+
+        s.test_discord(None, &mut tx);
+        assert!(s.testing_discord);
+        s.fail(
+            Call::TestDiscord { project: None },
+            Failure::Api {
+                status: 400,
+                message: "no global Discord webhook configured".into(),
+                field: None,
+            },
+            &mut tx,
+        );
+        assert!(!s.testing_discord);
+        let err_toast = s.toasts.last().expect("error toast");
+        assert_eq!(err_toast.kind, ToastKind::Error);
+        assert_eq!(err_toast.title, "Discord test failed");
+        assert_eq!(err_toast.body, "no global Discord webhook configured");
+    }
+
+    #[test]
+    fn retry_run_sets_flag_and_handles_success_conflict_and_error() {
+        use crate::model::RetryResult;
+
+        let mut s = State::new(Conn::default());
+        s.demo = true;
+        let mut tx = Tx::default();
+
+        s.retry_run("run-42", &mut tx);
+        assert_eq!(s.retrying.as_deref(), Some("run-42"));
+        // Second call while in flight is ignored.
+        s.retry_run("run-99", &mut tx);
+        assert_eq!(s.retrying.as_deref(), Some("run-42"));
+
+        s.apply(
+            Call::RetryRun {
+                id: "run-42".into(),
+            },
+            Answer::Retried {
+                id: "run-42".into(),
+                result: RetryResult {
+                    queued: true,
+                    project: "lunarum".into(),
+                    sha: "3c4d5e6f7a8b9c0d".into(),
+                    run_id: "run-42".into(),
+                },
+            },
+            &mut tx,
+        );
+        assert_eq!(s.retrying, None);
+        let ok_toast = s.toasts.last().expect("retry toast");
+        assert_eq!(ok_toast.kind, ToastKind::Success);
+        assert_eq!(ok_toast.title, "Retry queued");
+        assert_eq!(ok_toast.body, "lunarum: re-running 3c4d5e6.");
+
+        // 409 already running -> Info "Already running"
+        s.retry_run("run-42", &mut tx);
+        s.fail(
+            Call::RetryRun {
+                id: "run-42".into(),
+            },
+            Failure::Api {
+                status: 409,
+                message: "already running".into(),
+                field: None,
+            },
+            &mut tx,
+        );
+        assert_eq!(s.retrying, None);
+        let conflict_toast = s.toasts.last().expect("conflict toast");
+        assert_eq!(conflict_toast.kind, ToastKind::Info);
+        assert_eq!(conflict_toast.title, "Already running");
+
+        // 404 unknown run -> Error "Could not retry run"
+        s.retry_run("run-missing", &mut tx);
+        s.fail(
+            Call::RetryRun {
+                id: "run-missing".into(),
+            },
+            Failure::Api {
+                status: 404,
+                message: "unknown run".into(),
+                field: None,
+            },
+            &mut tx,
+        );
+        assert_eq!(s.retrying, None);
+        let err_toast = s.toasts.last().expect("error toast");
+        assert_eq!(err_toast.kind, ToastKind::Error);
+        assert_eq!(err_toast.title, "Could not retry run");
+        assert_eq!(err_toast.body, "unknown run");
     }
 }
 

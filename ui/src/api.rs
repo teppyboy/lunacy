@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::config::{Config, ConfigOutcome};
 use crate::model::{
-    ApiError, CacheClearResult, CancelResult, DeployChecksReport, ForceDeployResult, Health,
-    Project, Run, SystemInfo, Workflow,
+    ApiError, CacheClearResult, CancelResult, DeployChecksReport, DiscordTestResult,
+    ForceDeployResult, Health, Project, RetryResult, Run, SystemInfo, Workflow,
 };
 use crate::net::{self, Failure, Reply, Result};
 
@@ -40,7 +40,13 @@ pub enum Call {
     ForceDeployRun {
         id: String,
     },
+    RetryRun {
+        id: String,
+    },
     ClearCache {
+        project: Option<String>,
+    },
+    TestDiscord {
         project: Option<String>,
     },
     Config,
@@ -94,6 +100,7 @@ fn path(base: &str, call: &Call) -> String {
         Call::ForceDeployRun { id } => {
             net::join(base, &format!("/api/runs/{}/deploy", net::seg(id)))
         }
+        Call::RetryRun { id } => net::join(base, &format!("/api/runs/{}/retry", net::seg(id))),
         Call::ClearCache {
             project: Some(name),
         } => net::join(
@@ -101,6 +108,7 @@ fn path(base: &str, call: &Call) -> String {
             &format!("/api/projects/{}/cache/clear", net::seg(name)),
         ),
         Call::ClearCache { project: None } => net::join(base, "/api/cache/clear"),
+        Call::TestDiscord { .. } => net::join(base, "/api/discord/test"),
         Call::Config => net::join(base, "/api/config"),
         Call::SaveConfig(_) => net::join(base, "/api/config"),
         Call::System => net::join(base, "/api/system"),
@@ -151,9 +159,17 @@ pub enum Answer {
         target: String,
         result: ForceDeployResult,
     },
+    Retried {
+        id: String,
+        result: RetryResult,
+    },
     CacheCleared {
         project: Option<String>,
         result: CacheClearResult,
+    },
+    DiscordTested {
+        project: Option<String>,
+        result: DiscordTestResult,
     },
     Config(Box<Config>),
     Saved(Box<ConfigOutcome>),
@@ -190,7 +206,11 @@ impl Answer {
             Answer::ForceDeployed { target, .. } => Call::ForceDeployProject {
                 name: target.clone(),
             },
+            Answer::Retried { id, .. } => Call::RetryRun { id: id.clone() },
             Answer::CacheCleared { project, .. } => Call::ClearCache {
+                project: project.clone(),
+            },
+            Answer::DiscordTested { project, .. } => Call::TestDiscord {
                 project: project.clone(),
             },
             Answer::Config(_) => Call::Config,
@@ -263,10 +283,24 @@ fn parse(call: &Call, reply: Reply) -> std::result::Result<Answer, Failure> {
                     result,
                 })
         }
+        Call::RetryRun { id } => reply
+            .into_json::<RetryResult>()
+            .map(|result| Answer::Retried {
+                id: id.clone(),
+                result,
+            }),
         Call::ClearCache { project } => {
             reply
                 .into_json::<CacheClearResult>()
                 .map(|result| Answer::CacheCleared {
+                    project: project.clone(),
+                    result,
+                })
+        }
+        Call::TestDiscord { project } => {
+            reply
+                .into_json::<DiscordTestResult>()
+                .map(|result| Answer::DiscordTested {
                     project: project.clone(),
                     result,
                 })
@@ -296,7 +330,11 @@ fn body(call: &Call) -> Option<(String, Value)> {
         | Call::CancelProject { .. }
         | Call::ForceDeployProject { .. }
         | Call::ForceDeployRun { .. }
+        | Call::RetryRun { .. }
         | Call::ClearCache { .. } => Some(("POST".into(), serde_json::json!({}))),
+        Call::TestDiscord { project } => {
+            Some(("POST".into(), serde_json::json!({ "project": project })))
+        }
         Call::SaveConfig(cfg) => match serde_json::from_str::<Value>(cfg) {
             Ok(v) => Some(("PUT".into(), v)),
             // The caller validates before asking; anything else is a bug worth surfacing.
@@ -461,6 +499,14 @@ mod tests {
             Some(("POST".into(), serde_json::json!({})))
         );
         assert_eq!(
+            path(b, &Call::RetryRun { id: "r-1".into() }),
+            "http://127.0.0.1:7878/api/runs/r-1/retry"
+        );
+        assert_eq!(
+            body(&Call::RetryRun { id: "r-1".into() }),
+            Some(("POST".into(), serde_json::json!({})))
+        );
+        assert_eq!(
             path(b, &Call::ClearCache { project: None }),
             "http://127.0.0.1:7878/api/cache/clear"
         );
@@ -476,6 +522,20 @@ mod tests {
         assert_eq!(
             body(&Call::ClearCache { project: None }),
             Some(("POST".into(), serde_json::json!({})))
+        );
+        assert_eq!(
+            path(b, &Call::TestDiscord { project: None }),
+            "http://127.0.0.1:7878/api/discord/test"
+        );
+        assert_eq!(
+            body(&Call::TestDiscord { project: None }),
+            Some(("POST".into(), serde_json::json!({ "project": null })))
+        );
+        assert_eq!(
+            body(&Call::TestDiscord {
+                project: Some("alpha".into())
+            }),
+            Some(("POST".into(), serde_json::json!({ "project": "alpha" })))
         );
     }
 }

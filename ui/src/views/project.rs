@@ -176,6 +176,10 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
                                     .min_w(0.0)
                                     .grow(1.0),
                             )
+                            .children(
+                                (!project.enabled)
+                                    .then(|| widgets::pill(k, "Paused", k.c.text_faint)),
+                            )
                             .child(widgets::project_pill(k, state)),
                     )
                     .child(subtitle.wrap_anywhere()),
@@ -223,6 +227,9 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
                                 .nowrap()
                                 .truncate()
                                 .min_w(0.0),
+                        )
+                        .children(
+                            (!project.enabled).then(|| widgets::pill(k, "Paused", k.c.text_faint)),
                         )
                         .child(widgets::project_pill(k, state)),
                 )
@@ -291,11 +298,14 @@ fn body(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
             .border(1.0, k.c.border_base)
             .border_layout()
             .clip_rounded(k.radius.lg);
+        let project_running = project.state() == ProjectState::Running;
         for (i, run) in s.runs.iter().enumerate() {
             rows = rows.child(run_row(
+                s,
                 k,
                 &project.branch,
                 run,
+                project_running,
                 i + 1 == s.runs.len(),
                 compact,
             ));
@@ -513,7 +523,15 @@ fn step_line(k: &Kit, step: &crate::model::Step, index: usize, compact: bool) ->
         )
 }
 
-fn run_row(k: &Kit, default_branch: &str, run: &Run, last: bool, compact: bool) -> El {
+fn run_row(
+    s: &State,
+    k: &Kit,
+    default_branch: &str,
+    run: &Run,
+    project_running: bool,
+    last: bool,
+    compact: bool,
+) -> El {
     let ink = theme::status(k).for_run(run.status);
     let id = run.id.clone();
     let timing = match widgets::span(run.started_at, run.finished_at) {
@@ -594,6 +612,27 @@ fn run_row(k: &Kit, default_branch: &str, run: &Run, last: bool, compact: bool) 
                     .wrap()
             }))
     } else {
+        let retry_btn = (!project_running
+            && matches!(
+                run.status,
+                RunStatus::Failure | RunStatus::Error | RunStatus::Cancelled
+            ))
+        .then(|| {
+            let retrying_this = s.retrying.as_deref() == Some(run.id.as_str());
+            let retry_id = run.id.clone();
+            Button::new(if retrying_this {
+                "Retrying…"
+            } else {
+                "Retry"
+            })
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Mini)
+            .disabled(s.retrying.is_some())
+            .help("Re-run CI for this commit")
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.retry_run(&retry_id, tx))
+            .build(k)
+            .key(format!("run-retry-{}", run.id))
+        });
         row()
             .key(format!("run-{}", run.id))
             .w_full()
@@ -640,6 +679,7 @@ fn run_row(k: &Kit, default_branch: &str, run: &Run, last: bool, compact: bool) 
             )
             .child(text(timing).font(k.ty.small).color(k.c.text_faint).nowrap())
             .child(widgets::run_pill(k, run.status))
+            .children(retry_btn)
     };
     if let Some(failed) = &run.failed_step {
         if matches!(run.status, RunStatus::Failure | RunStatus::Error) {

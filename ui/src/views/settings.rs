@@ -646,6 +646,68 @@ fn discord(s: &State, k: &Kit, compact: bool) -> El {
             crate::paths::set_bool(&mut s.editor.draft, "discord.notify_on_start", !on);
         },
     ));
+    let notify_on = e.s("discord.notify_on");
+    let notify_idx = match notify_on.as_str() {
+        "failures" => Some(1),
+        _ => Some(0),
+    };
+    c = c.child(
+        widgets::labelled(
+            k,
+            "Notify on",
+            Some("Choose whether to post on every finished run or only failed/errored runs."),
+            widgets::segmented(
+                k,
+                compact,
+                &["All runs", "Failures only"],
+                notify_idx,
+                |s: &mut State, picked: usize, _tx: &mut Tx| {
+                    let val = if picked == 1 { "failures" } else { "all" };
+                    s.editor.set_str("discord.notify_on", val);
+                },
+            )
+            .key("discord-notify-on"),
+        )
+        .key("field-discord.notify_on"),
+    );
+    c = c.child(text_field_placeholder(
+        s,
+        k,
+        "discord.username",
+        "Bot username",
+        "lunacy",
+        Some("Optional display name for the Discord webhook bot (max 80 characters)."),
+    ));
+    c = c.child(text_field_placeholder(
+        s,
+        k,
+        "discord.mention_on_failure",
+        "Mention on failure",
+        "<@&role_id> or <@user_id>",
+        Some("Prepended to failure and error notifications (e.g. `<@&role_id>` or `<@user_id>`)."),
+    ));
+    let dirty = e.dirty();
+    let can_test = !s.testing_discord && !dirty && e.loaded;
+    c = c.child(
+        row().w_full().gap(8.0).flex_wrap().child(
+            Button::new(if s.testing_discord {
+                "Sending test…"
+            } else {
+                "Send test message"
+            })
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .disabled(!can_test)
+            .help(if dirty {
+                "Save your config changes before sending a test message"
+            } else {
+                "Send a test message to the configured global Discord webhook"
+            })
+            .on_press_tx(|s: &mut State, tx: &mut Tx| s.test_discord(None, tx))
+            .build(k)
+            .key("discord-test-global"),
+        ),
+    );
     c
 }
 
@@ -730,6 +792,18 @@ fn act(s: &State, k: &Kit, compact: bool) -> El {
 
 /// A text field bound to a config path, with inline error and help.
 pub(crate) fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>) -> El {
+    text_field_placeholder(s, k, path, label, label, help)
+}
+
+/// A text field bound to a config path with a custom placeholder, inline error and help.
+pub(crate) fn text_field_placeholder(
+    s: &State,
+    k: &Kit,
+    path: &str,
+    label: &str,
+    placeholder: &str,
+    help: Option<&str>,
+) -> El {
     let seeded = crate::paths::get_str(&s.editor.draft, path);
     let edit = s
         .editor
@@ -743,7 +817,7 @@ pub(crate) fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
     let field = path.to_string();
     let input = TextInput::new(&edit)
         .label(label)
-        .placeholder(label)
+        .placeholder(placeholder)
         .width(None)
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
@@ -759,6 +833,7 @@ pub(crate) fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
                 .unwrap_or_default();
             let optional = is_optional(&owner);
             s.editor.set_str_mode(&owner, &text, optional);
+            prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -822,7 +897,7 @@ pub(crate) fn u64_field(
                     serde_json::Value::String(trimmed.to_string()),
                 );
             }
-            prune_github_if_empty(&mut s.editor.draft, &owner);
+            prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -976,7 +1051,7 @@ fn secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>)
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             s.editor.set_str(&owner, &text);
-            prune_github_if_empty(&mut s.editor.draft, &owner);
+            prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -1017,7 +1092,7 @@ fn pem_secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&s
                 .map(|e| e.text.clone())
                 .unwrap_or_default();
             s.editor.set_str(&owner, &text);
-            prune_github_if_empty(&mut s.editor.draft, &owner);
+            prune_empty_parents(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
         })
@@ -1055,13 +1130,57 @@ fn secret_field_wrap(
     f.build(k).key(format!("field-{path}"))
 }
 
-fn prune_github_if_empty(draft: &mut serde_json::Value, path: &str) {
+fn prune_empty_parents(draft: &mut serde_json::Value, path: &str) {
     if path.starts_with("github.app.") {
         crate::paths::prune_empty_object(draft, "github.app");
     }
     if path.starts_with("github.") {
         crate::paths::prune_empty_object(draft, "github");
     }
+    if path.starts_with("discord.") {
+        crate::paths::prune_empty_object(draft, "discord");
+    }
+    if let Some((parent, _leaf)) = path.rsplit_once('.') {
+        if parent.ends_with(".contexts") {
+            crate::paths::prune_empty_object(draft, parent);
+        }
+    }
+}
+
+/// A tri-state `Option<bool>` segmented picker: Inherit (`null`), On (`true`), Off (`false`).
+fn tri_bool_segmented(
+    s: &State,
+    k: &Kit,
+    compact: bool,
+    path: &str,
+    seg_key: &str,
+    label: &str,
+    help: Option<&str>,
+) -> El {
+    let selected = match crate::paths::get(&s.editor.draft, path) {
+        Some(serde_json::Value::Bool(true)) => Some(1),
+        Some(serde_json::Value::Bool(false)) => Some(2),
+        _ => Some(0),
+    };
+    let owner = path.to_string();
+    widgets::labelled(
+        k,
+        label,
+        help,
+        widgets::segmented(
+            k,
+            compact,
+            &["Inherit", "On", "Off"],
+            selected,
+            move |s: &mut State, picked: usize, _tx: &mut Tx| match picked {
+                1 => s.editor.set(&owner, serde_json::Value::Bool(true)),
+                2 => s.editor.set(&owner, serde_json::Value::Bool(false)),
+                _ => s.editor.set(&owner, serde_json::Value::Null),
+            },
+        )
+        .key(seg_key),
+    )
+    .key(format!("field-{path}"))
 }
 
 /// Optional config fields: an empty value is removed rather than stored as `""`.
@@ -1169,6 +1288,7 @@ fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
     let e = &s.editor;
     let name = e.s(&format!("project[{i}].name"));
     let branch = e.s(&format!("project[{i}].branch"));
+    let enabled = crate::paths::get_bool_or(&e.draft, &format!("project[{i}].enabled"), true);
     let ci = e.count(&format!("project[{i}].ci"));
     let deploy = e.count(&format!("project[{i}].deploy"));
     let invalid = e.invalid(&format!("project[{i}].name"));
@@ -1177,18 +1297,26 @@ fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
         .grow(1.0)
         .min_w(0.0)
         .child(
-            text(if name.is_empty() {
-                "(unnamed)".to_string()
-            } else {
-                name.clone()
-            })
-            .font(k.ty.small_medium)
-            .color(if name.is_empty() {
-                k.c.text_faint
-            } else {
-                k.c.text_base
-            })
-            .wrap_anywhere(),
+            row()
+                .w_full()
+                .gap(8.0)
+                .flex_wrap()
+                .center_y()
+                .child(
+                    text(if name.is_empty() {
+                        "(unnamed)".to_string()
+                    } else {
+                        name.clone()
+                    })
+                    .font(k.ty.small_medium)
+                    .color(if name.is_empty() {
+                        k.c.text_faint
+                    } else {
+                        k.c.text_base
+                    })
+                    .wrap_anywhere(),
+                )
+                .children((!enabled).then(|| widgets::pill(k, "Paused", k.c.text_faint))),
         )
         .child(
             text(format!("{branch} · {ci} CI · {deploy} deploy"))
@@ -1497,12 +1625,18 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
             false,
         ),
     ));
-    c = c.child(secret_field(
-        s,
+    let enabled_path = format!("{base}.enabled");
+    c = c.child(toggle_row(
         k,
-        &format!("{base}.discord_webhook_url"),
-        "Discord webhook",
-        Some("Overrides the global webhook for this project."),
+        compact,
+        &format!("field-{enabled_path}"),
+        "Enabled (automatic polling & webhooks)",
+        Some("Turn off to pause automatic polling and webhook runs for this repo. Manual triggers stay available."),
+        crate::paths::get_bool_or(&e.draft, &enabled_path, true),
+        move |s: &mut State, _tx: &mut Tx| {
+            let on = crate::paths::get_bool_or(&s.editor.draft, &enabled_path, true);
+            crate::paths::set_bool(&mut s.editor.draft, &enabled_path, !on);
+        },
     ));
     c = c.child(table_field(
         s,
@@ -1597,6 +1731,7 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
         },
     ));
     let project_name = e.s(&format!("{base}.name"));
+    let test_project_name = project_name.clone();
     let unsaved_project = e.new_project || project_name.trim().is_empty();
     let can_clear = !s.clearing_cache && !unsaved_project;
     c = c.child(
@@ -1624,6 +1759,188 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
     c = c.child(steps::phase(s, k, i, false, compact));
     c = c.child(widgets::divider(k));
     c = c.child(steps::phase(s, k, i, true, compact));
+
+    // Discord notifications (per-repo)
+    c = c.child(widgets::divider(k));
+    c = c.child(widgets::section(
+        k,
+        "Discord notifications",
+        Some("Override global Discord settings or mute notifications for this repository."),
+    ));
+    let discord_enabled_path = format!("{base}.discord_enabled");
+    c = c.child(tri_bool_segmented(
+        s,
+        k,
+        compact,
+        &discord_enabled_path,
+        &format!("project-discord-enabled-{i}"),
+        "Discord notifications",
+        Some(
+            "Off disables Discord messages for this repo even when a global webhook is configured.",
+        ),
+    ));
+    c = c.child(secret_field(
+        s,
+        k,
+        &format!("{base}.discord_webhook_url"),
+        "Discord webhook URL",
+        Some("Overrides the global webhook URL for this repo."),
+    ));
+    c = c.child(tri_bool_segmented(
+        s,
+        k,
+        compact,
+        &format!("{base}.notify_on_start"),
+        &format!("project-notify-on-start-{i}"),
+        "Notify on start",
+        Some("Post when a run begins, or inherit the global Discord setting."),
+    ));
+    let discord_notify_on_path = format!("{base}.discord_notify_on");
+    let discord_notify_on_val = e.s(&discord_notify_on_path);
+    let discord_notify_on_idx = match discord_notify_on_val.as_str() {
+        "all" => Some(1),
+        "failures" => Some(2),
+        _ => Some(0),
+    };
+    let discord_notify_on_owner = discord_notify_on_path.clone();
+    c = c.child(
+        widgets::labelled(
+            k,
+            "Notify on",
+            Some("Override whether this repo posts on every finished run or only failures (start notifications are controlled above)."),
+            widgets::segmented(
+                k,
+                compact,
+                &["Inherit", "All runs", "Failures only"],
+                discord_notify_on_idx,
+                move |s: &mut State, picked: usize, _tx: &mut Tx| match picked {
+                    1 => s.editor.set_str(&discord_notify_on_owner, "all"),
+                    2 => s.editor.set_str(&discord_notify_on_owner, "failures"),
+                    _ => s
+                        .editor
+                        .set(&discord_notify_on_owner, serde_json::Value::Null),
+                },
+            )
+            .key(format!("project-discord-notify-on-{i}")),
+        )
+        .key(format!("field-{discord_notify_on_path}")),
+    );
+    c = c.child(widgets::pair_for(
+        compact,
+        text_field_placeholder(
+            s,
+            k,
+            &format!("{base}.discord_username"),
+            "Bot username",
+            "lunacy",
+            Some("Overrides the global Discord bot display name (max 80 characters)."),
+        ),
+        text_field_placeholder(
+            s,
+            k,
+            &format!("{base}.discord_mention_on_failure"),
+            "Mention on failure",
+            "<@&role_id> or <@user_id>",
+            Some("Prepended to failure notifications for this repo. Empty inherits global."),
+        ),
+    ));
+    let discord_disabled = matches!(
+        crate::paths::get(&e.draft, &discord_enabled_path),
+        Some(serde_json::Value::Bool(false))
+    );
+    let dirty = e.dirty();
+    let can_test_discord = !s.testing_discord && !unsaved_project && !dirty && !discord_disabled;
+    c = c.child(
+        row().w_full().gap(8.0).flex_wrap().child(
+            Button::new(if s.testing_discord {
+                "Sending test…"
+            } else {
+                "Test Discord webhook"
+            })
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .disabled(!can_test_discord)
+            .help(if unsaved_project {
+                "Save this project before testing its Discord webhook"
+            } else if dirty {
+                "Save your config changes before sending a test message"
+            } else if discord_disabled {
+                "Discord notifications are turned off for this repo"
+            } else {
+                "Send a test message using this repo's effective Discord webhook"
+            })
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                s.test_discord(Some(test_project_name.clone()), tx)
+            })
+            .build(k)
+            .key("project-discord-test"),
+        ),
+    );
+
+    // GitHub reporting (per-repo)
+    c = c.child(widgets::divider(k));
+    c = c.child(widgets::section(
+        k,
+        "GitHub reporting",
+        Some("Control whether runs report back to GitHub and customize check or status context names."),
+    ));
+    c = c.child(tri_bool_segmented(
+        s,
+        k,
+        compact,
+        &format!("{base}.github_enabled"),
+        &format!("project-github-enabled-{i}"),
+        "GitHub reporting",
+        Some("Off skips GitHub check runs and commit statuses for this repo."),
+    ));
+    c = c.child(widgets::pair_for(
+        compact,
+        text_field_placeholder(
+            s,
+            k,
+            &format!("{base}.contexts.ci"),
+            "CI check / status context",
+            "lunacy/ci",
+            Some("Check run or commit status name for CI. Empty uses `lunacy/ci`."),
+        ),
+        text_field_placeholder(
+            s,
+            k,
+            &format!("{base}.contexts.deploy"),
+            "Deploy check / status context",
+            "lunacy/deploy",
+            Some("Check run or commit status name for deploy. Empty uses `lunacy/deploy`."),
+        ),
+    ));
+
+    // Runner overrides (per-repo)
+    c = c.child(widgets::divider(k));
+    c = c.child(widgets::section(
+        k,
+        "Runner overrides",
+        Some("Override the default shell or act runner settings for steps in this repository."),
+    ));
+    c = c.child(argv_field(
+        s,
+        k,
+        &format!("{base}.shell"),
+        "Default shell",
+        Some("Per-repo shell override, e.g. `bash -lc`. Empty inherits the global shell."),
+    ));
+    c = c.child(table_field(
+        s,
+        k,
+        &format!("{base}.platforms"),
+        "act platforms",
+        Some("`runs-on=image`, one per line. Overrides global `[act.platforms]` for this repo."),
+    ));
+    c = c.child(list_field(
+        s,
+        k,
+        &format!("{base}.act_args"),
+        "Extra act arguments",
+        Some("Extra arguments passed to `act` for this repo, one per line."),
+    ));
     c
 }
 

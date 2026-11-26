@@ -962,7 +962,7 @@ def test_native_flows(sb: Sandbox, alpha_run_id: str) -> None:
         .replace("field-project[3].ci[0].run", "echo smoke", 0.25)
         .tap("step-done", 0.3)
         .tap("add-act-ci", 0.9)
-        .wheel("settings-body", -350.0, 0.3)
+        .wheel("settings-body", -100.0, 0.3)
         .tap("step-workflows/choice-.github/workflows/release.yml", 0.3)
         .tap("step-kind/segment0", 0.25)
         .tap("step-kind/segment1", 0.25)

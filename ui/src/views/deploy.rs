@@ -305,7 +305,8 @@ fn project_card(
                 .wrap()
                 .min_w(0.0),
         )
-        .child(overall_pill(k, proj.overall));
+        .child(overall_pill(k, proj.overall))
+        .children((!proj.enabled).then(|| widgets::pill(k, "Paused", k.c.text_faint)));
     if !compact {
         header = header.child(el().grow(1.0));
     }
@@ -345,10 +346,16 @@ fn project_card(
         } else {
             "GitHub: off".to_string()
         };
-        let dc = if proj.reporting.discord_source.is_empty() {
-            "none"
-        } else {
-            proj.reporting.discord_source.as_str()
+        let dc = match proj.reporting.discord_source.as_str() {
+            "disabled" => "Disabled".to_string(),
+            "" | "none" => "None".to_string(),
+            other => {
+                if proj.reporting.discord_notify_on == "failures" {
+                    format!("{other} (failures only)")
+                } else {
+                    other.to_string()
+                }
+            }
         };
         format!("{gh} · Discord: {dc}")
     };

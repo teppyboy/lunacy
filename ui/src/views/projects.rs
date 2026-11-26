@@ -300,6 +300,9 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
                 .truncate()
         }));
     }
+    if !project.enabled {
+        title_row = title_row.child(widgets::pill(k, "Paused", k.c.text_faint));
+    }
     title_row = title_row.child(widgets::project_pill(k, state));
 
     let mut card = col()

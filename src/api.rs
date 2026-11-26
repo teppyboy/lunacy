@@ -886,12 +886,16 @@ fn serve_static(state: &Arc<ApiState>, request: tiny_http::Request, path: &str) 
     };
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
-    let mut file = root.join(rel);
-    if rel.contains("..") || file.components().any(|c| c.as_os_str() == "..") {
+    if rel.contains('\\')
+        || !std::path::Path::new(rel)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
         return request
             .respond(error_response(400, "bad path"))
             .map_err(Into::into);
     }
+    let mut file = root.join(rel);
     if !file.is_file() {
         // SPA fallback.
         file = root.join("index.html");
@@ -901,11 +905,10 @@ fn serve_static(state: &Arc<ApiState>, request: tiny_http::Request, path: &str) 
                 .map_err(Into::into);
         }
     }
-    let mime = match file
+    let ext = file
         .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .as_deref()
-    {
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    let mime = match ext.as_deref() {
         Some("html") => "text/html; charset=utf-8",
         Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
@@ -915,11 +918,17 @@ fn serve_static(state: &Arc<ApiState>, request: tiny_http::Request, path: &str) 
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
         _ => "application/octet-stream",
     };
     let body = std::fs::read(&file)?;
     let mut response = Response::from_data(body)
         .with_header(Header::from_bytes("Content-Type", mime).expect("static header"));
+    if ext.as_deref() == Some("html") {
+        if let Ok(h) = Header::from_bytes("Cache-Control", "no-cache") {
+            response.add_header(h);
+        }
+    }
     if let Ok(h) = Header::from_bytes("Access-Control-Allow-Origin", "*") {
         response.add_header(h);
     }
@@ -968,5 +977,110 @@ mod tests {
             params.get("repo_path").map(String::as_str),
             Some("/home/me/repo")
         );
+    }
+
+    #[test]
+    fn serve_static_mime_and_cache_control() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), b"<html>root</html>").unwrap();
+        std::fs::write(dir.path().join("Inter-Regular.ttf"), b"font-bytes").unwrap();
+        std::fs::write(dir.path().join("app.js"), b"console.log(1);").unwrap();
+
+        let cfg = Config {
+            server: Some(crate::config::ServerCfg {
+                listen: "127.0.0.1:0".into(),
+                token: String::new(),
+                token_file: None,
+                web_root: Some(dir.path().to_path_buf()),
+                public_url: None,
+            }),
+            ..Config::default()
+        };
+        let state = Arc::new(ApiState {
+            shared: Arc::new(Mutex::new(Shared {
+                config: cfg,
+                ..Shared::default()
+            })),
+            commands: Arc::new(Mutex::new(BTreeMap::new())),
+            config_path: dir.path().join("config.toml"),
+            reloads: Arc::new(Mutex::new(0)),
+        });
+
+        let server = Server::http("127.0.0.1:0").expect("bind tiny_http");
+        let addr = server.server_addr().to_ip().expect("socket addr");
+        let worker_state = Arc::clone(&state);
+        let thread = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let req = server.recv().expect("recv");
+                handle(&worker_state, req).expect("handle static");
+            }
+        });
+
+        let fetch_headers = |path: &str| -> BTreeMap<String, String> {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut status = String::new();
+            reader.read_line(&mut status).unwrap();
+            assert!(
+                status.starts_with("HTTP/1.1 200"),
+                "status for {path}: {status}"
+            );
+            let mut headers = BTreeMap::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                }
+            }
+            headers
+        };
+
+        let root_hdrs = fetch_headers("/");
+        assert_eq!(
+            root_hdrs.get("content-type").map(String::as_str),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            root_hdrs.get("cache-control").map(String::as_str),
+            Some("no-cache")
+        );
+
+        let fallback_hdrs = fetch_headers("/runs/42");
+        assert_eq!(
+            fallback_hdrs.get("content-type").map(String::as_str),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            fallback_hdrs.get("cache-control").map(String::as_str),
+            Some("no-cache")
+        );
+
+        let ttf_hdrs = fetch_headers("/Inter-Regular.ttf");
+        assert_eq!(
+            ttf_hdrs.get("content-type").map(String::as_str),
+            Some("font/ttf")
+        );
+        assert!(!ttf_hdrs.contains_key("cache-control"));
+
+        let js_hdrs = fetch_headers("/app.js?v=0123456789ab");
+        assert_eq!(
+            js_hdrs.get("content-type").map(String::as_str),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert!(!js_hdrs.contains_key("cache-control"));
+
+        thread.join().expect("server thread");
     }
 }

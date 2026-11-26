@@ -3,7 +3,7 @@
 use rune::{col, el, row, text, Cx, El, ScrollSpec, Tx};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
-use crate::model::{Project, ProjectState, Run, RunStatus};
+use crate::model::{Project, ProjectState, Run, RunStatus, StepStatus};
 use crate::state::State;
 use crate::theme;
 use crate::widgets::{self, ago, duration, mono_chip, short_sha};
@@ -14,7 +14,8 @@ pub fn view(s: &State, k: &Kit, name: &str, _cx: &mut Cx<State>, hair: f32, comp
             k,
             "Project not found",
             "It is not in the daemon's config any more.",
-        );
+        )
+        .key("project-missing");
     };
     col()
         .key("project")
@@ -28,7 +29,8 @@ pub fn view(s: &State, k: &Kit, name: &str, _cx: &mut Cx<State>, hair: f32, comp
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .px(if compact { 14.0 } else { 22.0 })
+                .pl(if compact { 14.0 } else { 22.0 })
+                .pr(if compact { 18.0 } else { 22.0 })
                 .pt(16.0)
                 .scroll(ScrollSpec::default())
                 .child(body(s, k, project, compact)),
@@ -63,7 +65,13 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
 
     let subtitle = text(format!("{} · {}", project.branch, project.repo_facts()))
         .font(k.ty.small)
-        .color(k.c.text_muted);
+        .color(k.c.text_muted)
+        .min_w(0.0);
+    let indicator = if busy {
+        rune_kit::Loader::new().size(14.0).color(ink).build(k)
+    } else {
+        widgets::dot(ink, 9.0)
+    };
 
     if compact {
         return col()
@@ -76,6 +84,7 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
             .child(
                 col()
                     .w_full()
+                    .min_w(0.0)
                     .gap(4.0)
                     .child(
                         row()
@@ -83,16 +92,18 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
                             .gap(8.0)
                             .flex_wrap()
                             .center_y()
-                            .child(widgets::dot(ink, 9.0))
+                            .child(indicator)
                             .child(
                                 text(project.name.clone())
                                     .font(k.ty.ui_medium)
                                     .color(k.c.text_base)
+                                    .wrap()
+                                    .min_w(0.0)
                                     .grow(1.0),
                             )
                             .child(widgets::project_pill(k, state)),
                     )
-                    .child(subtitle.wrap()),
+                    .child(subtitle.wrap_anywhere()),
             )
             .child(
                 row()
@@ -115,21 +126,27 @@ fn header(s: &State, k: &Kit, project: &Project, hair: f32, compact: bool) -> El
         .child(
             col()
                 .gap(3.0)
+                .min_w(0.0)
                 .grow(1.0)
                 .child(
                     row()
+                        .w_full()
                         .gap(9.0)
                         .center_y()
-                        .child(widgets::dot(ink, 9.0))
+                        .child(indicator)
                         .child(
                             text(project.name.clone())
                                 .font(k.ty.ui_medium)
-                                .color(k.c.text_base),
+                                .color(k.c.text_base)
+                                .nowrap()
+                                .truncate()
+                                .min_w(0.0),
                         )
                         .child(widgets::project_pill(k, state)),
                 )
                 .child(
                     row()
+                        .w_full()
                         .gap(8.0)
                         .center_y()
                         .child(subtitle.nowrap().truncate()),
@@ -191,7 +208,7 @@ fn body(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
 fn current_run(k: &Kit, run: &Run, compact: bool) -> El {
     let mut steps = col().w_full().gap(0.0);
     for (i, step) in run.steps.iter().enumerate() {
-        steps = steps.child(step_line(k, step, i));
+        steps = steps.child(step_line(k, step, i, compact));
     }
     let subj = text(run.subject.clone())
         .font(k.ty.small)
@@ -223,7 +240,7 @@ fn current_run(k: &Kit, run: &Run, compact: bool) -> El {
             .center_y()
             .child(widgets::run_pill(k, run.status))
             .child(mono_chip(k, &short_sha(&run.sha)))
-            .child(subj.nowrap().truncate().grow(1.0))
+            .child(subj.nowrap().truncate().min_w(0.0).grow(1.0))
             .child(
                 text("Running now")
                     .font(k.ty.small)
@@ -241,23 +258,30 @@ fn current_run(k: &Kit, run: &Run, compact: bool) -> El {
         .child(steps)
 }
 
-fn step_line(k: &Kit, step: &crate::model::Step, index: usize) -> El {
+fn step_line(k: &Kit, step: &crate::model::Step, index: usize, compact: bool) -> El {
     let ink = theme::status(k).for_step(step.status);
+    let indicator = if step.status == StepStatus::Running {
+        rune_kit::Loader::new().size(12.0).color(ink).build(k)
+    } else {
+        widgets::dot(ink, 6.0)
+    };
+    let name_el = text(step.name.clone())
+        .font(k.ty.small)
+        .color(k.c.text_base)
+        .min_w(0.0);
     row()
         .key(format!("pstep-{index}"))
         .w_full()
-        .h(26.0)
+        .min_h(26.0)
+        .py(if compact { 3.0 } else { 0.0 })
         .gap(8.0)
         .center_y()
-        .child(widgets::dot(ink, 6.0))
-        .child(
-            text(step.name.clone())
-                .font(k.ty.small)
-                .color(k.c.text_base)
-                .nowrap()
-                .truncate()
-                .grow(1.0),
-        )
+        .child(indicator)
+        .child(if compact {
+            name_el.wrap().grow(1.0)
+        } else {
+            name_el.nowrap().truncate().grow(1.0)
+        })
         .child(
             text(step.status.label())
                 .font(k.ty.small)
@@ -278,6 +302,11 @@ fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
     } else {
         run.subject.clone()
     };
+    let indicator = if run.status == RunStatus::Running {
+        rune_kit::Loader::new().size(13.0).color(ink).build(k)
+    } else {
+        widgets::dot(ink, 8.0)
+    };
     let mut r = if compact {
         col()
             .key(format!("run-{}", run.id))
@@ -287,6 +316,7 @@ fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
             .py(10.0)
             .gap(6.0)
             .hover(k.c.hover)
+            .press_scale(0.992)
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_run(&id, tx))
             .cursor(rune::Cursor::Pointer)
             .child(
@@ -294,12 +324,17 @@ fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
                     .w_full()
                     .gap(8.0)
                     .items_start()
-                    .child(widgets::dot(ink, 8.0).mt(5.0))
+                    .child(if run.status == RunStatus::Running {
+                        indicator.mt(3.0)
+                    } else {
+                        indicator.mt(5.0)
+                    })
                     .child(
                         text(subject)
                             .font(k.ty.small)
                             .color(k.c.text_base)
                             .wrap()
+                            .min_w(0.0)
                             .grow(1.0),
                     )
                     .child(widgets::run_pill(k, run.status)),
@@ -328,15 +363,17 @@ fn run_row(k: &Kit, run: &Run, last: bool, compact: bool) -> El {
             .gap(10.0)
             .center_y()
             .hover(k.c.hover)
+            .press_scale(0.992)
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_run(&id, tx))
             .cursor(rune::Cursor::Pointer)
-            .child(widgets::dot(ink, 8.0))
+            .child(indicator)
             .child(
                 text(subject)
                     .font(k.ty.small)
                     .color(k.c.text_base)
                     .nowrap()
                     .truncate()
+                    .min_w(0.0)
                     .grow(1.0),
             )
             .child(mono_chip(k, &short_sha(&run.sha)))

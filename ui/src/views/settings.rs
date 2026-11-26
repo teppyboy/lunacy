@@ -3,7 +3,7 @@
 //! The daemon's config is edited as the JSON it already is (`Editor::draft`), so unknown keys
 //! survive a save and a rejected field is addressed by the daemon's own path.
 
-use rune::{col, el, row, text, Cx, El, ScrollSpec, TextEdit, Tx};
+use rune::{col, el, row, text, Cx, El, ScrollSpec, Spring, TextEdit, Transition, Tx};
 use rune_kit::{Button, ButtonVariant, ControlSize, Field, Kit, TextArea, TextInput};
 
 use crate::state::{SettingsPage, State};
@@ -19,6 +19,30 @@ pub fn view(
     hair: f32,
     compact: bool,
 ) -> El {
+    let page_key = match page {
+        SettingsPage::Projects if s.editor.project.is_some() => {
+            format!("settings-page-Projects-{}", s.editor.project.unwrap_or(0))
+        }
+        _ => format!("settings-page-{}", page.title()),
+    };
+    let inner_page = match page {
+        SettingsPage::Diagnostics => diagnostics::view(s, k, cx, compact),
+        SettingsPage::Connection => connection_page(s, k, compact),
+        SettingsPage::Appearance => appearance_page(s, k, cx, compact),
+        SettingsPage::Projects if s.editor.project.is_some() => projects_detail(s, k, cx, compact),
+        SettingsPage::Projects => projects_list(s, k, compact),
+        other => config_page(s, k, other, cx, compact),
+    };
+    let page_shell = col()
+        .key(page_key)
+        .w_full()
+        .transition(Transition::asymmetric(
+            Transition::opacity().combined(Transition::offset(0.0, 5.0)),
+            Transition::none(),
+        ))
+        .transition_motion(rune::tok::motion::SNAP, Spring::NONE)
+        .child(inner_page);
+
     let content = widgets::scroll_bar(
         col()
             .key("settings-body")
@@ -27,16 +51,7 @@ pub fn view(
             .min_h(0.0)
             .h_full()
             .scroll(ScrollSpec::default())
-            .child(match page {
-                SettingsPage::Diagnostics => diagnostics::view(s, k, cx, compact),
-                SettingsPage::Connection => connection_page(s, k, compact),
-                SettingsPage::Appearance => appearance_page(s, k, cx, compact),
-                SettingsPage::Projects if s.editor.project.is_some() => {
-                    projects_detail(s, k, cx, compact)
-                }
-                SettingsPage::Projects => projects_list(s, k, compact),
-                other => config_page(s, k, other, cx, compact),
-            }),
+            .child(page_shell),
         k,
     );
 
@@ -49,28 +64,24 @@ pub fn view(
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(
+            .child(widgets::scroll_bar_x(
                 row()
                     .key("settings-nav-strip")
                     .w_full()
                     .px(14.0)
-                    .py(8.0)
+                    .pt(8.0)
+                    .pb(18.0)
                     .fill(k.c.layer_01)
                     .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
                     .scroll_x()
+                    .scroll_edge_fade(14.0)
                     .child(strip),
-            )
+                k,
+            ))
             .child(content)
     } else {
-        let mut pages = col()
-            .w(212.0)
-            .shrink()
-            .h_full()
-            .gap(1.0)
-            .py(10.0)
-            .fill(k.c.layer_01)
-            .border_sides([0.0, 0.0, 0.0, hair], k.c.border_base);
-        pages = pages.child(
+        let mut pages_list = col().w_full().gap(1.0).py(10.0);
+        pages_list = pages_list.child(
             row()
                 .w_full()
                 .px(16.0)
@@ -78,9 +89,9 @@ pub fn view(
                 .child(widgets::caption(k, "CONFIG")),
         );
         for p in SettingsPage::CONFIG {
-            pages = pages.child(page_row(k, s, p));
+            pages_list = pages_list.child(page_row(k, s, p));
         }
-        pages = pages.child(
+        pages_list = pages_list.child(
             row()
                 .w_full()
                 .px(16.0)
@@ -89,8 +100,25 @@ pub fn view(
                 .child(widgets::caption(k, "THIS WINDOW")),
         );
         for p in SettingsPage::WINDOW {
-            pages = pages.child(page_row(k, s, p));
+            pages_list = pages_list.child(page_row(k, s, p));
         }
+        let pages = col()
+            .w(212.0)
+            .shrink()
+            .h_full()
+            .min_h(0.0)
+            .fill(k.c.layer_01)
+            .border_sides([0.0, 0.0, 0.0, hair], k.c.border_base)
+            .child(widgets::scroll_bar(
+                col()
+                    .key("settings-pages-scroll")
+                    .w_full()
+                    .grow(1.0)
+                    .min_h(0.0)
+                    .scroll(ScrollSpec::default())
+                    .child(pages_list),
+                k,
+            ));
         row()
             .w_full()
             .grow(1.0)
@@ -129,6 +157,7 @@ fn page_chip(k: &Kit, s: &State, page: SettingsPage) -> El {
             },
         )
         .hover(k.c.hover)
+        .press_scale(0.985)
         .child(
             text(page.title())
                 .font(k.ty.small_medium)
@@ -149,7 +178,8 @@ fn page_row(k: &Kit, s: &State, page: SettingsPage) -> El {
         .key(format!("settings-nav-{}", page.title()))
         .w_full()
         .h(30.0)
-        .px(16.0)
+        .pl(16.0)
+        .pr(18.0)
         .center_y()
         .fill(if selected {
             k.c.layer_03
@@ -157,6 +187,7 @@ fn page_row(k: &Kit, s: &State, page: SettingsPage) -> El {
             rune::Color::TRANSPARENT
         })
         .hover(k.c.hover)
+        .press_scale(0.985)
         .child(text(page.title()).font(k.ty.ui).color(if selected {
             k.c.text_base
         } else {
@@ -237,7 +268,7 @@ fn save_bar(s: &State, k: &Kit, page: SettingsPage, hair: f32, compact: bool) ->
         .center_y()
         .border_sides([0.0, 0.0, hair, 0.0], k.c.border_base)
         .child(
-            col().gap(1.0).grow(1.0).child(title_row).child(
+            col().gap(1.0).grow(1.0).min_w(0.0).child(title_row).child(
                 text(page.blurb())
                     .font(k.ty.small)
                     .color(k.c.text_muted)
@@ -269,7 +300,8 @@ fn config_page(s: &State, k: &Kit, page: SettingsPage, cx: &mut Cx<State>, compa
     let mut body = col()
         .key("config-page")
         .w_full()
-        .px(if compact { 14.0 } else { 22.0 })
+        .pl(if compact { 14.0 } else { 22.0 })
+        .pr(if compact { 18.0 } else { 22.0 })
         .py(if compact { 14.0 } else { 18.0 })
         .gap(22.0);
     if let Some(field) = &e.field {
@@ -385,10 +417,9 @@ fn github(s: &State, k: &Kit, compact: bool) -> El {
             compact,
             &["Checks (App)", "Status (token)"],
             mode_index,
-            |s: &mut State, picked: usize, tx: &mut Tx| {
+            |s: &mut State, picked: usize, _tx: &mut Tx| {
                 s.editor
                     .set_str("github.mode", if picked == 0 { "checks" } else { "status" });
-                tx.instant();
             },
         )
         .key("github-mode"),
@@ -451,10 +482,9 @@ fn discord(s: &State, k: &Kit, compact: bool) -> El {
         "Notify on start",
         Some("Also post when a run begins, not only when it ends."),
         crate::paths::get_bool(&e.draft, "discord.notify_on_start"),
-        |s: &mut State, tx: &mut Tx| {
+        |s: &mut State, _tx: &mut Tx| {
             let on = crate::paths::get_bool(&s.editor.draft, "discord.notify_on_start");
             crate::paths::set_bool(&mut s.editor.draft, "discord.notify_on_start", !on);
-            tx.instant();
         },
     ));
     c
@@ -521,7 +551,7 @@ pub(crate) fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
             let seeded = crate::paths::get_str(&s.editor.draft, &field);
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -532,7 +562,6 @@ pub(crate) fn text_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
             s.editor.set_str_mode(&owner, &text, optional);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     let mut f = Field::new().label(label).control(input.key("control"));
@@ -574,7 +603,7 @@ pub(crate) fn u64_field(
             let seeded = crate::paths::get_str(&s.editor.draft, &field);
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -597,7 +626,6 @@ pub(crate) fn u64_field(
             prune_github_if_empty(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     let mut f = Field::new().label(label).control(input.key("control"));
@@ -632,7 +660,7 @@ pub(crate) fn argv_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
             let seeded = crate::config::join_argv(&argv_vec(&s.editor.draft, &field));
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -648,7 +676,6 @@ pub(crate) fn argv_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
             }
             let now_seeded = crate::config::join_argv(&argv_vec(&s.editor.draft, &owner));
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     let mut f = Field::new().label(label).control(input.key("control"));
@@ -686,12 +713,13 @@ pub(crate) fn list_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
         .width(None)
         .rows(2)
         .auto_grow(crate::theme::area_min_rows(k), 8)
+        .scroll_bar_styled(widgets::scroll_bar_style(k))
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
             let seeded = crate::paths::get_list_text(&s.editor.draft, &field);
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -701,7 +729,6 @@ pub(crate) fn list_field(s: &State, k: &Kit, path: &str, label: &str, help: Opti
             crate::paths::set_list(&mut s.editor.draft, &owner, &text);
             let now_seeded = crate::paths::get_list_text(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     let mut f = Field::new().label(label).control(input.key("control"));
@@ -742,7 +769,7 @@ fn secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>)
             let seeded = crate::paths::get_str(&s.editor.draft, &field);
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -753,7 +780,6 @@ fn secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&str>)
             prune_github_if_empty(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     secret_field_wrap(k, path, label, help, stored, error, input)
@@ -778,12 +804,13 @@ fn pem_secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&s
         .width(None)
         .rows(3)
         .auto_grow(crate::theme::area_min_rows(k), 10)
+        .scroll_bar_styled(widgets::scroll_bar_style(k))
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
             let seeded = crate::paths::get_str(&s.editor.draft, &field);
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -794,7 +821,6 @@ fn pem_secret_field(s: &State, k: &Kit, path: &str, label: &str, help: Option<&s
             prune_github_if_empty(&mut s.editor.draft, &owner);
             let now_seeded = crate::paths::get_str(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     secret_field_wrap(k, path, label, help, stored, error, input)
@@ -854,7 +880,7 @@ fn toggle_row(
     on: bool,
     flip: fn(&mut State, &mut Tx),
 ) -> El {
-    let mut col_body = col().gap(2.0).grow(1.0).child(
+    let mut col_body = col().gap(2.0).min_w(0.0).grow(1.0).child(
         text(label.to_string())
             .font(k.ty.small_medium)
             .color(k.c.text_base),
@@ -898,7 +924,8 @@ fn projects_list(s: &State, k: &Kit, compact: bool) -> El {
     }
     let mut c = col()
         .w_full()
-        .px(if compact { 14.0 } else { 22.0 })
+        .pl(if compact { 14.0 } else { 22.0 })
+        .pr(if compact { 18.0 } else { 22.0 })
         .py(if compact { 14.0 } else { 18.0 })
         .gap(12.0);
     if let Some(field) = &e.field {
@@ -949,6 +976,7 @@ fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
     let info = col()
         .gap(2.0)
         .grow(1.0)
+        .min_w(0.0)
         .child(
             text(if name.is_empty() {
                 "(unnamed)".to_string()
@@ -961,13 +989,13 @@ fn project_card(s: &State, k: &Kit, i: usize, compact: bool) -> El {
             } else {
                 k.c.text_base
             })
-            .wrap(),
+            .wrap_anywhere(),
         )
         .child(
             text(format!("{branch} · {ci} CI · {deploy} deploy"))
                 .font(k.ty.small)
                 .color(k.c.text_muted)
-                .wrap(),
+                .wrap_anywhere(),
         );
     let edit_btn = Button::new("Edit")
         .variant(ButtonVariant::Ghost)
@@ -1066,7 +1094,8 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
     let mut c = col()
         .key("project-form")
         .w_full()
-        .px(if compact { 14.0 } else { 22.0 })
+        .pl(if compact { 14.0 } else { 22.0 })
+        .pr(if compact { 18.0 } else { 22.0 })
         .py(if compact { 14.0 } else { 18.0 })
         .gap(20.0);
 
@@ -1094,9 +1123,8 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
     let del_btn = Button::new("Delete")
         .variant(ButtonVariant::Danger)
         .control_size(ControlSize::Small)
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+        .on_press_tx(move |s: &mut State, _tx: &mut Tx| {
             s.editor.confirm_delete = Some(i);
-            tx.instant();
         })
         .build(k)
         .key("project-delete");
@@ -1135,9 +1163,8 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
         let cancel_btn = Button::new("Cancel")
             .variant(ButtonVariant::Ghost)
             .control_size(ControlSize::Small)
-            .on_press_tx(|s: &mut State, tx: &mut Tx| {
+            .on_press_tx(|s: &mut State, _tx: &mut Tx| {
                 s.editor.confirm_delete = None;
-                tx.instant();
             })
             .build(k)
             .key("project-delete-cancel");
@@ -1147,8 +1174,9 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.delete_project(i, tx))
             .build(k)
             .key("project-delete-confirm");
-        c = c.child(if compact {
+        let delete_banner = if compact {
             col()
+                .key("project-delete-banner")
                 .w_full()
                 .padding(12.0)
                 .gap(10.0)
@@ -1165,16 +1193,23 @@ fn projects_detail(s: &State, k: &Kit, cx: &mut Cx<State>, compact: bool) -> El 
                 )
         } else {
             row()
+                .key("project-delete-banner")
                 .w_full()
                 .padding(12.0)
                 .gap(10.0)
                 .center_y()
                 .radius(k.radius.md)
                 .fill(theme::status(k).tint(theme::status(k).failure))
-                .child(msg.grow(1.0))
+                .child(msg.wrap().min_w(0.0).grow(1.0))
                 .child(cancel_btn)
                 .child(confirm_btn)
-        });
+        }
+        .transition(Transition::asymmetric(
+            Transition::opacity().combined(Transition::offset(0.0, -4.0)),
+            Transition::none(),
+        ))
+        .transition_motion(rune::tok::motion::SNAP, Spring::NONE);
+        c = c.child(delete_banner);
     }
 
     c = c.child(widgets::section(k, "Repository", None));
@@ -1285,9 +1320,8 @@ fn select_field(
         &pairs,
         Some(current.as_str()),
         None,
-        move |s: &mut State, picked: &str, tx: &mut Tx| {
+        move |s: &mut State, picked: &str, _tx: &mut Tx| {
             s.editor.set_str(&owner, picked);
-            tx.instant();
         },
     )
     .key(format!("select-{path}"));
@@ -1310,11 +1344,12 @@ pub(crate) fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Opt
         .width(None)
         .rows(3)
         .auto_grow(crate::theme::area_min_rows(k), 8)
+        .scroll_bar_styled(widgets::scroll_bar_style(k))
         .on_edit(move |s: &mut State| {
             let seeded = crate::paths::get_table_text(&s.editor.draft, &field);
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -1324,7 +1359,6 @@ pub(crate) fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Opt
             crate::paths::set_table(&mut s.editor.draft, &owner, &text);
             let now_seeded = crate::paths::get_table_text(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     let mut f = Field::new().label(label).control(input.key("control"));
@@ -1340,7 +1374,8 @@ pub(crate) fn table_field(s: &State, k: &Kit, path: &str, label: &str, help: Opt
 fn connection_page(s: &State, k: &Kit, compact: bool) -> El {
     let mut c = col()
         .w_full()
-        .px(if compact { 14.0 } else { 22.0 })
+        .pl(if compact { 14.0 } else { 22.0 })
+        .pr(if compact { 18.0 } else { 22.0 })
         .py(if compact { 14.0 } else { 18.0 })
         .gap(18.0);
     c = c.child(widgets::section(k, "Connection", Some("Where this window looks for the daemon. Not written to config.toml; in a browser the token is remembered for this site.")));
@@ -1375,9 +1410,8 @@ fn connection_page(s: &State, k: &Kit, compact: bool) -> El {
                     Button::new("Use this page's origin")
                         .variant(ButtonVariant::Outline)
                         .control_size(ControlSize::Regular)
-                        .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                        .on_press_tx(|s: &mut State, _tx: &mut Tx| {
                             s.ui_server = TextEdit::new(crate::state::default_server());
-                            tx.instant();
                         })
                         .build(k)
                         .key("conn-origin"),
@@ -1468,7 +1502,8 @@ fn format_zoom_value(z: f32) -> String {
 fn appearance_page(s: &State, k: &Kit, cx: &Cx<State>, compact: bool) -> El {
     let mut c = col()
         .w_full()
-        .px(if compact { 14.0 } else { 22.0 })
+        .pl(if compact { 14.0 } else { 22.0 })
+        .pr(if compact { 18.0 } else { 22.0 })
         .py(if compact { 14.0 } else { 18.0 })
         .gap(18.0);
 
@@ -1576,5 +1611,16 @@ fn appearance_page(s: &State, k: &Kit, cx: &Cx<State>, compact: bool) -> El {
                     .wrap(),
             ),
     );
+
+    c = c.child(widgets::divider(k));
+    c = c.child(toggle_row(
+        k,
+        compact,
+        "appearance-log-wrap",
+        "Word wrap logs",
+        Some("Wrap long log lines to fit the pane instead of scrolling horizontally."),
+        s.log_wrap,
+        |s: &mut State, tx: &mut Tx| s.toggle_log_wrap(tx),
+    ));
     c
 }

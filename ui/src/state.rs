@@ -154,12 +154,16 @@ const TOKEN_KEY: &str = "lunacy.token";
 const THEME_STORAGE_KEY: &str = "lunacy.theme";
 #[cfg(target_arch = "wasm32")]
 const ZOOM_STORAGE_KEY: &str = "lunacy.zoom";
+#[cfg(target_arch = "wasm32")]
+const LOG_WRAP_STORAGE_KEY: &str = "lunacy.log_wrap";
 #[cfg(not(target_arch = "wasm32"))]
 const PREFS_APP_ID: &str = "lunacy";
 #[cfg(not(target_arch = "wasm32"))]
 const PREF_THEME_KEY: &str = "theme";
 #[cfg(not(target_arch = "wasm32"))]
 const PREF_ZOOM_KEY: &str = "zoom";
+#[cfg(not(target_arch = "wasm32"))]
+const PREF_LOG_WRAP_KEY: &str = "log_wrap";
 
 /// Supported discrete UI zoom stops shown in Appearance and stepped by `Ctrl/Cmd` `=`/`-`.
 pub const ZOOM_STEPS: [f32; 5] = [0.9, 1.0, 1.1, 1.25, 1.5];
@@ -204,13 +208,14 @@ fn store_token(_: &str) {}
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn load_prefs_from(
     prefs: &rune::prefs::Prefs,
-) -> (Option<crate::theme::ThemeMode>, Option<f32>) {
+) -> (Option<crate::theme::ThemeMode>, Option<f32>, Option<bool>) {
     let theme = prefs
         .get::<String>(PREF_THEME_KEY)
         .as_deref()
         .and_then(crate::theme::ThemeMode::parse);
     let zoom = prefs.get::<f32>(PREF_ZOOM_KEY).and_then(sanitize_zoom);
-    (theme, zoom)
+    let log_wrap = prefs.get::<bool>(PREF_LOG_WRAP_KEY);
+    (theme, zoom, log_wrap)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -230,11 +235,16 @@ pub(crate) fn save_zoom_to(prefs: &mut rune::prefs::Prefs, zoom: Option<f32>) {
     }
 }
 
-fn load_window_prefs() -> (Option<crate::theme::ThemeMode>, Option<f32>) {
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_log_wrap_to(prefs: &mut rune::prefs::Prefs, wrap: bool) {
+    let _ = prefs.set(PREF_LOG_WRAP_KEY, &wrap);
+}
+
+fn load_window_prefs() -> (Option<crate::theme::ThemeMode>, Option<f32>, Option<bool>) {
     #[cfg(target_arch = "wasm32")]
     {
         let Some(s) = local_storage() else {
-            return (None, None);
+            return (None, None, None);
         };
         let theme = s
             .get_item(THEME_STORAGE_KEY)
@@ -248,7 +258,16 @@ fn load_window_prefs() -> (Option<crate::theme::ThemeMode>, Option<f32>) {
             .flatten()
             .and_then(|v| v.parse::<f32>().ok())
             .and_then(sanitize_zoom);
-        (theme, zoom)
+        let log_wrap = s
+            .get_item(LOG_WRAP_STORAGE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| match v.trim() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            });
+        (theme, zoom, log_wrap)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -281,6 +300,18 @@ fn save_zoom_pref(zoom: Option<f32>) {
     {
         let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
         save_zoom_to(&mut prefs, zoom);
+    }
+}
+
+fn save_log_wrap_pref(wrap: bool) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(s) = local_storage() {
+        let _ = s.set_item(LOG_WRAP_STORAGE_KEY, if wrap { "true" } else { "false" });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut prefs = rune::prefs::Prefs::open(PREFS_APP_ID);
+        save_log_wrap_to(&mut prefs, wrap);
     }
 }
 
@@ -800,6 +831,8 @@ pub struct State {
     pub theme_mode: crate::theme::ThemeMode,
     /// User-chosen UI zoom factor (`None` = responsive default: 1.0 compact, 1.1 desktop).
     pub user_zoom: Option<f32>,
+    /// Whether step logs wrap long lines to fit the pane (persisted; default `true`).
+    pub log_wrap: bool,
     /// Tracks `(commit_gen, target_zoom)` so responsive default zoom never oscillates.
     pub(crate) zoom_track: std::cell::Cell<(u64, f32)>,
     /// Re-scroll run log to bottom once the next active `Answer::Log` arrives (run open / Tail<->Full).
@@ -852,6 +885,7 @@ impl State {
             drawer_open: false,
             theme_mode: crate::theme::ThemeMode::System,
             user_zoom: None,
+            log_wrap: true,
             zoom_track: std::cell::Cell::new((0, 1.0)),
             stick_log_pending: false,
         };
@@ -864,22 +898,37 @@ impl State {
         state
     }
 
-    /// Loads persisted window appearance and zoom preferences (`localStorage` on web, `Prefs` natively).
+    /// Loads persisted window appearance, zoom, and log-wrap preferences (`localStorage` on web, `Prefs` natively).
     pub fn load_prefs(&mut self) {
-        let (theme, zoom) = load_window_prefs();
+        let (theme, zoom, log_wrap) = load_window_prefs();
         if let Some(mode) = theme {
             self.theme_mode = mode;
         }
         if let Some(z) = zoom {
             self.user_zoom = Some(z);
         }
+        if let Some(wrap) = log_wrap {
+            self.log_wrap = wrap;
+        }
     }
 
-    /// Updates window theme mode and persists it immediately.
+    /// Updates window theme mode and persists it immediately, smoothly crossfading colors.
     pub fn set_theme_mode(&mut self, mode: crate::theme::ThemeMode, tx: &mut Tx) {
         self.theme_mode = mode;
         save_theme_pref(mode);
-        tx.instant();
+        tx.color_motion(rune::tok::motion::SETTLE);
+    }
+
+    /// Updates log word wrapping and persists it immediately.
+    pub fn set_log_wrap(&mut self, wrap: bool, tx: &mut Tx) {
+        self.log_wrap = wrap;
+        save_log_wrap_pref(wrap);
+        let _ = tx;
+    }
+
+    /// Toggles log word wrapping and persists it immediately.
+    pub fn toggle_log_wrap(&mut self, tx: &mut Tx) {
+        self.set_log_wrap(!self.log_wrap, tx);
     }
 
     /// Updates explicit UI zoom (`None` resets to the responsive default) and persists it.
@@ -1123,6 +1172,7 @@ impl State {
             self.link = Link::Ok;
         }
         if was_broken {
+            tx.animated();
             self.toast(
                 tx,
                 ToastKind::Success,
@@ -1137,6 +1187,7 @@ impl State {
     }
 
     fn fail(&mut self, call: Call, failure: Failure, tx: &mut Tx) -> bool {
+        let was_broken = self.link.is_broken();
         let mut toast: Option<(ToastKind, String, String)> = None;
         match &failure {
             Failure::Down(why) => {
@@ -1164,6 +1215,9 @@ impl State {
                 }
             }
             Failure::Api { .. } => {}
+        }
+        if self.link.is_broken() != was_broken {
+            tx.animated();
         }
         match call {
             Call::Projects => {
@@ -1485,6 +1539,19 @@ impl State {
         }
     }
 
+    fn open_step_needs_log_poll(&self) -> bool {
+        let Some(run) = self.run.as_ref() else {
+            return false;
+        };
+        let Some(index) = self.open_step else {
+            return false;
+        };
+        let Some(step) = run.steps.get(index) else {
+            return false;
+        };
+        step.status.is_live() || !self.logs.contains_key(&(run.id.clone(), index))
+    }
+
     fn request_next_log(&mut self) {
         let Some(run) = self.run.clone() else { return };
         let Some(index) = self.open_step else { return };
@@ -1513,15 +1580,29 @@ impl State {
             if !self.toasts.is_empty() {
                 let before = self.toasts.len();
                 self.toasts.retain(|t| t.until > self.clock);
-                changed |= before != self.toasts.len();
+                if before != self.toasts.len() {
+                    tx.animated();
+                    changed = true;
+                }
+                if let Some(earliest) = self.toasts.iter().map(|t| t.until).reduce(f64::min) {
+                    tx.wake_at(if earliest > self.clock {
+                        earliest
+                    } else {
+                        self.clock + 0.02
+                    });
+                }
             }
             return changed;
         }
 
+        let was_broken = self.link.is_broken();
         for (call, result) in self.bus.drain() {
             if self.wants(&call) {
                 changed |= self.answer(call, result, tx);
             }
+        }
+        if self.link.is_broken() != was_broken {
+            tx.animated();
         }
 
         // `poll` runs only after the first frame, which is exactly when a live window may start
@@ -1562,17 +1643,29 @@ impl State {
             }
         }
 
+        if !self.toasts.is_empty() {
+            let before = self.toasts.len();
+            self.toasts.retain(|t| t.until > self.clock);
+            if before != self.toasts.len() {
+                tx.animated();
+                changed = true;
+            }
+        }
+
         // One wake for the nearest deadline, so an idle window draws nothing.
         let mut due = self.next_projects;
         match &self.view {
             View::Run { .. } => {
                 due = due.min(self.next_run);
-                if self.open_step.is_some() {
+                if self.open_step_needs_log_poll() {
                     due = due.min(self.next_log);
                 }
             }
             View::Project { .. } => due = due.min(self.next_runs),
             _ => {}
+        }
+        if let Some(toast_due) = self.toasts.iter().map(|t| t.until).reduce(f64::min) {
+            due = due.min(toast_due);
         }
         if due.is_finite() {
             tx.wake_at(if due > self.clock {
@@ -1581,18 +1674,12 @@ impl State {
                 self.clock + 0.02
             });
         }
-
-        if !self.toasts.is_empty() {
-            let before = self.toasts.len();
-            self.toasts.retain(|t| t.until > self.clock);
-            changed |= before != self.toasts.len();
-        }
         changed
     }
 
-    /// Asks for the next frame now (navigation, a toast, a save).
+    /// Wakes `poll` right away without suppressing UI transitions.
     pub fn refresh(&mut self, tx: &mut Tx) {
-        tx.instant();
+        tx.wake_after(std::time::Duration::ZERO);
     }
 
     // -- navigation ------------------------------------------------------------------------
@@ -1714,17 +1801,19 @@ impl State {
         } else {
             5.0
         };
+        let until = self.clock.max(tx.clock()) + life;
         self.toasts.push(Toast {
             id,
             title: title.to_string(),
             body: body.to_string(),
             kind,
-            until: self.clock + life,
+            until,
         });
         while self.toasts.len() > 3 {
             self.toasts.remove(0);
         }
-        tx.instant();
+        tx.animated();
+        tx.wake_at(until);
     }
 
     pub fn dismiss_toast(&mut self, id: u64) {
@@ -2140,7 +2229,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_and_zoom_prefs_round_trip() {
+    fn theme_zoom_and_log_wrap_prefs_round_trip() {
         let dir = std::env::temp_dir().join(format!("lunacy-ui-prefs-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -2150,24 +2239,37 @@ mod tests {
             let mut prefs = rune::prefs::Prefs::at(&path);
             save_theme_to(&mut prefs, crate::theme::ThemeMode::Oled);
             save_zoom_to(&mut prefs, Some(1.25));
+            save_log_wrap_to(&mut prefs, false);
         }
 
         let reopened = rune::prefs::Prefs::at(&path);
         assert_eq!(
             load_prefs_from(&reopened),
-            (Some(crate::theme::ThemeMode::Oled), Some(1.25))
+            (Some(crate::theme::ThemeMode::Oled), Some(1.25), Some(false))
         );
 
         {
             let mut prefs = rune::prefs::Prefs::at(&path);
             save_zoom_to(&mut prefs, None);
+            save_log_wrap_to(&mut prefs, true);
         }
         let reset = rune::prefs::Prefs::at(&path);
         assert_eq!(
             load_prefs_from(&reset),
-            (Some(crate::theme::ThemeMode::Oled), None)
+            (Some(crate::theme::ThemeMode::Oled), None, Some(true))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_wrap_defaults_true_and_toggles() {
+        let mut s = State::new(Conn::default());
+        assert!(s.log_wrap);
+        let mut tx = Tx::default();
+        s.toggle_log_wrap(&mut tx);
+        assert!(!s.log_wrap);
+        s.set_log_wrap(true, &mut tx);
+        assert!(s.log_wrap);
     }
 
     #[test]
@@ -2198,6 +2300,32 @@ mod tests {
 
         s.set_user_zoom(None, &mut tx);
         assert_eq!(s.user_zoom, None);
+    }
+
+    #[test]
+    fn finished_cached_step_does_not_keep_polling_logs() {
+        let mut s = State::new(Conn::default());
+        let run = crate::demo::runs()
+            .into_iter()
+            .find(|r| !r.status.is_running() && !r.steps.is_empty())
+            .expect("finished demo run");
+        let run_id = run.id.clone();
+        s.view = View::Run { id: run_id.clone() };
+        s.run = Some(run);
+        s.open_step = Some(0);
+        // Uncached finished step still needs an initial fetch.
+        assert!(s.open_step_needs_log_poll());
+        // Once cached, finished step must not keep clamping `due` to `next_log`.
+        s.logs.insert(
+            (run_id, 0),
+            LogState {
+                text: "done\n".into(),
+                loading: false,
+                error: None,
+                mode: Some(LogMode::Tail),
+            },
+        );
+        assert!(!s.open_step_needs_log_poll());
     }
 }
 

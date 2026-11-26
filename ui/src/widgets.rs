@@ -12,6 +12,11 @@ pub fn dot(ink: Color, size: f32) -> El {
     el().size(size, size).radius(size * 0.5).fill(ink)
 }
 
+/// A pulsing status dot for active/connecting indicators.
+pub fn live_dot(ink: Color, size: f32) -> El {
+    dot(ink, size).looping(rune::LoopSpec::opacity(1.4, 0.0, 0.35, 1.0))
+}
+
 /// A ring for a running step, so "in progress" reads differently from "done".
 pub fn ring(ink: Color, size: f32, width: f32) -> El {
     el().size(size, size).radius(size * 0.5).border(width, ink)
@@ -53,10 +58,37 @@ pub fn project_pill(k: &Kit, state: ProjectState) -> El {
     pill(k, label, ink)
 }
 
-/// Always-visible draggable scrollbar styling for scrollable panels.
+/// High-contrast, always-visible scrollbar style legible across Light, Dark, and OLED themes.
+pub fn scroll_bar_style(k: &Kit) -> rune_kit::ScrollBarStyle {
+    rune_kit::ScrollBarStyle::from_kit(k)
+        .always_visible()
+        .thumb(k.c.icon_faint)
+        .thumb_hover(k.c.icon_muted)
+        .track(k.c.layer_02.alpha(0.65))
+        .track_hover(k.c.layer_03.alpha(0.9))
+        .width(7.0)
+        .hover_width(10.0)
+        .min_thumb(28.0)
+        .track_inset(3.0)
+}
+
+/// Always-visible draggable vertical scrollbar for scrollable panels.
 pub fn scroll_bar(viewport: El, k: &Kit) -> El {
     use rune_kit::ScrollBar;
-    viewport.scroll_bar_styled(rune_kit::ScrollBarStyle::from_kit(k).always_visible())
+    viewport.scroll_bar_styled(scroll_bar_style(k))
+}
+
+/// Always-visible draggable horizontal scrollbar for sideways strips.
+pub fn scroll_bar_x(viewport: El, k: &Kit) -> El {
+    use rune_kit::ScrollBar;
+    viewport.scroll_bar_styled(scroll_bar_style(k).horizontal())
+}
+
+/// Always-visible vertical and horizontal scrollbars for two-axis scrollable panels.
+pub fn scroll_bars_xy(viewport: El, k: &Kit) -> El {
+    use rune_kit::ScrollBar;
+    let style = scroll_bar_style(k);
+    viewport.scroll_bars_xy_styled(style, style.horizontal())
 }
 
 /// A card: a rounded, bordered surface with an optional title and body.
@@ -154,7 +186,7 @@ pub fn value(k: &Kit, v: &str) -> El {
 pub fn value_for(k: &Kit, compact: bool, v: &str) -> El {
     let t = text(v.to_string()).font(k.ty.mono).color(k.c.text_base);
     if compact {
-        t.wrap()
+        t.wrap_anywhere()
     } else {
         t.nowrap().truncate()
     }
@@ -351,7 +383,13 @@ pub fn notice(k: &Kit, ink: Color, message: &str) -> El {
         .fill(theme::status(k).tint(ink))
         .items_start()
         .child(dot(ink, 7.0).mt(5.0))
-        .child(text(message.to_string()).font(k.ty.small).color(ink).wrap())
+        .child(
+            text(message.to_string())
+                .font(k.ty.small)
+                .color(ink)
+                .wrap()
+                .shrink(),
+        )
 }
 
 /// A badge whose label the caller reads.
@@ -359,17 +397,46 @@ pub fn badge(k: &Kit, label: impl Into<String>) -> El {
     Badge::new(label).standard().build(k)
 }
 
-/// The log body: monospace, selectable, no wrapping surprises, one line per row.
-pub fn log_body(k: &Kit, text: &str) -> El {
+/// The log body: monospace, selectable, with optional per-line word wrapping.
+pub fn log_body(k: &Kit, text: &str, wrap: bool) -> El {
     let style = k.ty.mono;
-    col().w_full().gap(0.0).px(12.0).py(8.0).child(
-        rune::text(text.to_string())
-            .font(style)
-            .color(k.c.text_base)
-            .nowrap()
-            .selectable(true)
-            .elide_head(),
-    )
+    if wrap {
+        col()
+            .w_full()
+            .min_w(0.0)
+            .gap(0.0)
+            .pl(12.0)
+            .pr(18.0)
+            .py(8.0)
+            .child(
+                rune::text(text.to_string())
+                    .key("log-text")
+                    .font(style)
+                    .color(k.c.text_base)
+                    .wrap_anywhere()
+                    .wrap_greedy()
+                    .by_line()
+                    .selectable(true)
+                    .selection_color(k.selection()),
+            )
+    } else {
+        col()
+            .w_full()
+            .gap(0.0)
+            .pl(12.0)
+            .pr(18.0)
+            .pt(8.0)
+            .pb(18.0)
+            .child(
+                rune::text(text.to_string())
+                    .key("log-text")
+                    .font(style)
+                    .color(k.c.text_base)
+                    .nowrap()
+                    .selectable(true)
+                    .selection_color(k.selection()),
+            )
+    }
 }
 
 /// A separator line.

@@ -4,7 +4,7 @@
 //! write `["linux"|"windows"|"macos"]`, and a step excluded on the daemon's host is recorded as
 //! skipped rather than failed.
 
-use rune::{col, el, icon, row, text, El, TextEdit, Tx};
+use rune::{col, el, icon, row, text, El, Spring, TextEdit, Transition, Tx};
 use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, Field, Kit, TextArea};
 
 use crate::state::{phase_key, step_path, State};
@@ -36,13 +36,16 @@ pub fn phase(s: &State, k: &Kit, project: usize, deploy: bool, compact: bool) ->
 
     if count == 0 {
         c = c.child(widgets::notice(k, k.c.text_faint, "No steps yet."));
-    }
-    for i in 0..count {
-        c = c.child(step_row(s, k, project, deploy, i, compact));
-        // The editor opens under its own row, so the step it edits is still on screen.
-        if e.step == Some((project, deploy, i)) {
-            c = c.child(step_form(s, k, project, deploy, i, compact));
+    } else {
+        let mut steps_list = col().w_full().gap(10.0).animate_layout();
+        for i in 0..count {
+            steps_list = steps_list.child(step_row(s, k, project, deploy, i, compact));
+            // The editor opens under its own row, so the step it edits is still on screen.
+            if e.step == Some((project, deploy, i)) {
+                steps_list = steps_list.child(step_form(s, k, project, deploy, i, compact));
+            }
         }
+        c = c.child(steps_list);
     }
     let phase_name = crate::state::phase_key(deploy);
     c = c.child(
@@ -141,7 +144,7 @@ fn step_row(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact:
             title_text.nowrap().truncate()
         })
         .child(if compact {
-            summary_text.wrap()
+            summary_text.wrap_anywhere()
         } else {
             summary_text.nowrap().truncate()
         });
@@ -258,7 +261,12 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact
         .gap(16.0)
         .radius(k.radius.lg)
         .fill(k.c.layer_02)
-        .border(1.0, k.c.border_strong);
+        .border(1.0, k.c.border_strong)
+        .transition(Transition::asymmetric(
+            Transition::opacity().combined(Transition::offset(0.0, -4.0)),
+            Transition::none(),
+        ))
+        .transition_motion(rune::tok::motion::SNAP, Spring::NONE);
 
     c = c.child(
         row()
@@ -277,9 +285,8 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact
                 Button::new("Done")
                     .variant(ButtonVariant::Ghost)
                     .control_size(ControlSize::Small)
-                    .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                    .on_press_tx(|s: &mut State, _tx: &mut Tx| {
                         s.editor.step = None;
-                        tx.instant();
                     })
                     .build(k)
                     .key("step-done"),
@@ -320,9 +327,9 @@ fn step_form(s: &State, k: &Kit, project: usize, deploy: bool, i: usize, compact
                             repo_project,
                             (!repo_path.trim().is_empty()).then_some(repo_path),
                         );
+                        s.refresh(tx);
                     }
                 }
-                tx.instant();
             },
         )
         .key("step-kind"),
@@ -431,12 +438,13 @@ fn shell_fields(s: &State, k: &Kit, path: &str) -> El {
         .width(None)
         .rows(3)
         .auto_grow(crate::theme::area_min_rows(k), 14)
+        .scroll_bar_styled(widgets::scroll_bar_style(k))
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
             let seeded = s.editor.s(&field);
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -446,7 +454,6 @@ fn shell_fields(s: &State, k: &Kit, path: &str) -> El {
             s.editor.set_str(&owner, &text);
             let now_seeded = s.editor.s(&owner);
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     let mut f = Field::new()
@@ -511,7 +518,7 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str, compact: bool) -> 
                         project_name.clone(),
                         (!project_repo.trim().is_empty()).then_some(project_repo.clone()),
                     );
-                    tx.instant();
+                    s.refresh(tx);
                 })
                 .build(k)
                 .key("workflows-refresh"),
@@ -524,9 +531,8 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str, compact: bool) -> 
             &workflow_pairs,
             Some(current_workflow.as_str()),
             None,
-            move |s: &mut State, picked: &str, tx: &mut Tx| {
+            move |s: &mut State, picked: &str, _tx: &mut Tx| {
                 s.editor.set_str(&workflow_field, picked);
-                tx.instant();
             },
         )
         .key("step-workflows"),
@@ -585,9 +591,8 @@ fn act_fields(s: &State, k: &Kit, project: usize, path: &str, compact: bool) -> 
                 &pairs,
                 Some(current_job.as_str()),
                 Some("Every job"),
-                move |s: &mut State, picked: &str, tx: &mut Tx| {
+                move |s: &mut State, picked: &str, _tx: &mut Tx| {
                     s.editor.set_str(&pick_path, picked);
-                    tx.instant();
                 },
             )
             .key("step-jobs"),
@@ -620,12 +625,13 @@ fn secrets_table(s: &State, k: &Kit, path: &str) -> El {
         .width(None)
         .rows(3)
         .auto_grow(crate::theme::area_min_rows(k), 8)
+        .scroll_bar_styled(widgets::scroll_bar_style(k))
         .invalid(invalid)
         .on_edit(move |s: &mut State| {
             let seeded = crate::paths::get_table_text(&s.editor.draft, &field);
             s.editor.text_for(&field, seeded)
         })
-        .on_change(move |s: &mut State, tx: &mut Tx| {
+        .on_change(move |s: &mut State, _tx: &mut Tx| {
             let text = s
                 .editor
                 .text
@@ -635,7 +641,6 @@ fn secrets_table(s: &State, k: &Kit, path: &str) -> El {
             crate::paths::set_table(&mut s.editor.draft, &owner, &text);
             let now_seeded = crate::paths::get_table_text(&s.editor.draft, &owner);
             s.editor.sync_seeded(&owner, now_seeded);
-            tx.instant();
         })
         .build(k);
     let mut f = Field::new()
@@ -689,12 +694,11 @@ fn only_on_chips(
                 .fill(fill)
                 .border(1.0, if on { fill } else { k.c.border_base })
                 .hover(k.c.hover)
-                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                .on_press_tx(move |s: &mut State, _tx: &mut Tx| {
                     let list_path = only_on_path.clone();
                     let host = value_owned.clone();
                     toggle_host(&mut s.editor, &list_path, &host);
                     let _ = (project, deploy, index);
-                    tx.instant();
                 })
                 .cursor(rune::Cursor::Pointer)
                 .child(
@@ -754,22 +758,26 @@ fn host_note(s: &State, k: &Kit, path: &str) -> El {
     match (&host, selected.is_empty()) {
         (_, true) => text("Runs on every host.")
             .font(k.ty.small)
-            .color(k.c.text_faint),
+            .color(k.c.text_faint)
+            .wrap(),
         (Some(host), false) if selected.iter().any(|h| h == host) => text(format!(
             "Runs on this daemon's host ({}).",
             widgets::os_name(host)
         ))
         .font(k.ty.small)
-        .color(theme::status(k).success),
+        .color(theme::status(k).success)
+        .wrap(),
         (Some(host), false) => text(format!(
             "This daemon runs on {}, so the step is recorded as skipped here.",
             widgets::os_name(host)
         ))
         .font(k.ty.small)
-        .color(k.c.warning.fg),
+        .color(k.c.warning.fg)
+        .wrap(),
         (None, false) => text("Runs only on the hosts selected above.")
             .font(k.ty.small)
-            .color(k.c.text_faint),
+            .color(k.c.text_faint)
+            .wrap(),
     }
 }
 

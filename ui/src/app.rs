@@ -2,11 +2,12 @@
 //! toast layer. Screens fill the content area; this file only decides which one shows.
 
 use rune::{
-    col, el, icon, row, text, Align, AppSpec, Color, Cx, El, Key, KeyEvent, Mods, ScrollSpec,
-    TextEdit, Tx,
+    col, el, icon, row, text, Align, AppSpec, Color, Cx, Edge, El, Key, KeyEvent, Mods, ScrollSpec,
+    Spring, TextEdit, Transition, Tx,
 };
 use rune_kit::{glyphs, Kit};
 
+use crate::model::ProjectState;
 use crate::state::{Link, SettingsPage, State, ToastKind, View};
 use crate::theme;
 use crate::views;
@@ -207,6 +208,15 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.set_user_zoom(None, tx);
         return true;
     }
+    if ev.mods.alt
+        && !ev.mods.ctrl
+        && !ev.mods.cmd
+        && matches!(&ev.key, Key::Text(t) if t.eq_ignore_ascii_case("z") || t == "Ω")
+        && matches!(s.view, View::Run { .. })
+    {
+        s.toggle_log_wrap(tx);
+        return true;
+    }
     match ev.key {
         // Ctrl/Cmd+S saves the config, wherever the form is scrolled to.
         Key::Command('s') => {
@@ -229,12 +239,10 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Escape => {
             if s.drawer_open {
                 s.drawer_open = false;
-                tx.instant();
                 return true;
             }
             if s.editor.step.is_some() {
                 s.editor.step = None;
-                tx.instant();
                 return true;
             }
             if !matches!(s.view, View::Projects) {
@@ -325,10 +333,13 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .children(banner(s, &k, hair, compact))
         .child(content);
 
-    let drawer = (compact && s.drawer_open).then(|| drawer_overlay(s, &k, hair, layout_w, safe));
+    let drawer = (compact && s.drawer_open).then(|| drawer_overlays(s, &k, hair, layout_w, safe));
     // Drawer sits below toasts so error notices remain readable if the drawer opens.
     let toasts = toast_layer(s, &k, compact, layout_w, safe);
-    rune_kit::root(body, drawer.into_iter().chain(toasts))
+    rune_kit::root(
+        body,
+        drawer.into_iter().flatten().chain(std::iter::once(toasts)),
+    )
 }
 
 /// The window's title row: the app name, the current screen's title, and the connection state.
@@ -365,12 +376,12 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
                     .size(44.0, 44.0)
                     .radius(k.radius.md)
                     .hover(k.c.hover)
+                    .press_scale(0.985)
                     .center()
                     .cursor(rune::Cursor::Pointer)
                     .child(widgets::hamburger(k.c.icon_base))
-                    .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                    .on_press_tx(|s: &mut State, _tx: &mut Tx| {
                         s.drawer_open = !s.drawer_open;
-                        tx.instant();
                     }),
             )
             .child(widgets::dot(k.c.text_accent, 9.0))
@@ -431,11 +442,19 @@ fn titlebar(s: &State, k: &Kit, cx: &Cx<State>, hair: f32, compact: bool) -> El 
 
 /// The connection chip: dot and label on desktop; compact 44×44 dot pill on phones.
 fn connection_chip(s: &State, k: &Kit, compact: bool) -> El {
+    let connecting = matches!(s.link, Link::Connecting);
     let (ink, label) = match &s.link {
         Link::Connecting => (k.c.text_muted, "Connecting".to_string()),
         Link::Ok => (theme::status(k).success, "Connected".to_string()),
         Link::Down { .. } => (theme::status(k).failure, "Offline".to_string()),
         Link::Unauthorized => (theme::status(k).error, "Unauthorized".to_string()),
+    };
+    let indicator = |size| {
+        if connecting {
+            widgets::live_dot(ink, size)
+        } else {
+            widgets::dot(ink, size)
+        }
     };
     if compact {
         return el()
@@ -452,7 +471,7 @@ fn connection_chip(s: &State, k: &Kit, compact: bool) -> El {
                     .center()
                     .radius(k.radius.md)
                     .fill(k.c.layer_02)
-                    .child(widgets::dot(ink, 8.0)),
+                    .child(indicator(8.0)),
             )
             .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_settings(SettingsPage::Connection, tx))
             .cursor(rune::Cursor::Pointer);
@@ -466,7 +485,7 @@ fn connection_chip(s: &State, k: &Kit, compact: bool) -> El {
         .center_y()
         .radius(k.radius.md)
         .fill(k.c.layer_02)
-        .child(widgets::dot(ink, 7.0))
+        .child(indicator(7.0))
         .child(text(label).font(k.ty.small).color(ink))
         .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_settings(SettingsPage::Connection, tx))
         .cursor(rune::Cursor::Pointer)
@@ -500,6 +519,11 @@ fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
         .build(k)
         .key("banner-retry");
 
+    let banner_enter = Transition::asymmetric(
+        Transition::move_edge(Edge::Top).combined(Transition::opacity()),
+        Transition::none(),
+    );
+
     if compact {
         return Some(
             col()
@@ -510,6 +534,8 @@ fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
                 .py(10.0)
                 .fill(theme::status(k).tint(ink))
                 .border_sides([0.0, 0.0, hair, 0.0], ink.alpha(0.35))
+                .transition(banner_enter)
+                .transition_motion(rune::tok::motion::SNAP, Spring::NONE)
                 .child(
                     row()
                         .w_full()
@@ -519,6 +545,7 @@ fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
                         .child(
                             col()
                                 .grow(1.0)
+                                .min_w(0.0)
                                 .gap(2.0)
                                 .child(text(title).font(k.ty.small_medium).color(ink))
                                 .child(
@@ -551,6 +578,8 @@ fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
             .center_y()
             .fill(theme::status(k).tint(ink))
             .border_sides([0.0, 0.0, hair, 0.0], ink.alpha(0.35))
+            .transition(banner_enter)
+            .transition_motion(rune::tok::motion::SNAP, Spring::NONE)
             .child(widgets::dot(ink, 8.0))
             .child(text(title).font(k.ty.small_medium).color(ink).nowrap())
             .child(
@@ -560,6 +589,7 @@ fn banner(s: &State, k: &Kit, hair: f32, compact: bool) -> Option<El> {
                     .color(ink)
                     .nowrap()
                     .truncate()
+                    .min_w(0.0)
                     .grow(1.0),
             )
             .child(conn_btn)
@@ -596,15 +626,22 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
                 .child(widgets::caption(k, "PROJECTS")),
         );
         for project in &s.projects {
-            let st = theme::status(k).for_project(project.state());
+            let pstate = project.state();
+            let st = theme::status(k).for_project(pstate);
             let name = project.name.clone();
             let selected = matches!(&s.view, View::Project { name: open } if open == &name);
+            let indicator = if pstate == ProjectState::Running {
+                widgets::live_dot(st, 7.0)
+            } else {
+                widgets::dot(st, 7.0)
+            };
             list = list.child(
                 row()
                     .key(format!("rail-{}", project.name))
                     .w_full()
                     .h(row_h)
-                    .px(14.0)
+                    .pl(14.0)
+                    .pr(18.0)
                     .gap(8.0)
                     .center_y()
                     .fill(if selected {
@@ -613,7 +650,8 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
                         Color::TRANSPARENT
                     })
                     .hover(k.c.hover)
-                    .child(widgets::dot(st, 7.0))
+                    .press_scale(0.985)
+                    .child(indicator)
                     .child(
                         text(project.name.clone())
                             .font(if compact { k.ty.ui } else { k.ty.small })
@@ -677,7 +715,7 @@ fn rail(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
         )
 }
 
-fn drawer_overlay(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4]) -> El {
+fn drawer_overlays(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4]) -> [El; 2] {
     let drawer_w = (layout_w - safe[3] - 48.0).clamp(220.0, 272.0);
     let drawer_head = row()
         .w_full()
@@ -696,14 +734,25 @@ fn drawer_overlay(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4]) 
         .child(widgets::compact_icon(
             rune_kit::IconButton::new(&glyphs::CLOSE)
                 .label("Close menu")
-                .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                .on_press_tx(|s: &mut State, _tx: &mut Tx| {
                     s.drawer_open = false;
-                    tx.instant();
                 })
                 .build(k)
                 .key("drawer-close"),
             true,
         ));
+    let drawer_exit = Spring::new(0.15, 0.0);
+    let scrim = el()
+        .key("drawer-scrim")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(Color::BLACK.alpha(0.45))
+        .transition(Transition::opacity())
+        .transition_motion(rune::tok::motion::GLIDE, drawer_exit)
+        .on_press_tx(|s: &mut State, _tx: &mut Tx| {
+            s.drawer_open = false;
+        });
     let drawer = col()
         .key("rail-drawer")
         .absolute(0.0, 0.0)
@@ -714,24 +763,12 @@ fn drawer_overlay(s: &State, k: &Kit, hair: f32, layout_w: f32, safe: [f32; 4]) 
         .pl(safe[3])
         .fill(k.c.layer_01)
         .border_sides([0.0, 0.0, 0.0, hair], k.c.border_strong)
+        .transition(Transition::move_edge(Edge::Leading).combined(Transition::opacity()))
+        .transition_motion(rune::tok::motion::GLIDE, drawer_exit)
+        .on_press(|_: &mut State| {})
         .child(drawer_head)
         .child(rail(s, k, hair, true).w_full().grow(1.0).min_h(0.0));
-    el().key("drawer-layer")
-        .absolute(0.0, 0.0)
-        .w_full()
-        .h_full()
-        .child(
-            el().key("drawer-scrim")
-                .absolute(0.0, 0.0)
-                .w_full()
-                .h_full()
-                .fill(Color::BLACK.alpha(0.45))
-                .on_press_tx(|s: &mut State, tx: &mut Tx| {
-                    s.drawer_open = false;
-                    tx.instant();
-                }),
-        )
-        .child(drawer)
+    [scrim, drawer]
 }
 
 fn nav_row(k: &Kit, label: &str, selected: bool, h: f32, press: fn(&mut State, &mut Tx)) -> El {
@@ -739,7 +776,8 @@ fn nav_row(k: &Kit, label: &str, selected: bool, h: f32, press: fn(&mut State, &
         .key(format!("nav-{label}"))
         .w_full()
         .h(h)
-        .px(14.0)
+        .pl(14.0)
+        .pr(18.0)
         .center_y()
         .fill(if selected {
             k.c.layer_03
@@ -747,6 +785,7 @@ fn nav_row(k: &Kit, label: &str, selected: bool, h: f32, press: fn(&mut State, &
             Color::TRANSPARENT
         })
         .hover(k.c.hover)
+        .press_scale(0.985)
         .child(text(label).font(k.ty.ui).color(if selected {
             k.c.text_base
         } else {
@@ -758,25 +797,34 @@ fn nav_row(k: &Kit, label: &str, selected: bool, h: f32, press: fn(&mut State, &
 
 /// The screen body for the current view.
 fn screen(s: &State, k: &Kit, cx: &mut Cx<State>, hair: f32, compact: bool) -> El {
-    match &s.view {
+    let view = match &s.view {
         View::Projects => views::projects::view(s, k, cx, hair, compact),
         View::Project { name } => views::project::view(s, k, name, cx, hair, compact),
         View::Run { id } => views::run::view(s, k, id, cx, hair, compact),
         View::Settings { page } => views::settings::view(s, k, *page, cx, hair, compact),
-    }
+    };
+    view.transition(Transition::asymmetric(
+        Transition::opacity().combined(Transition::offset(0.0, 6.0)),
+        Transition::none(),
+    ))
+    .transition_motion(rune::tok::motion::SNAP, Spring::NONE)
 }
 
 /// The toast layer.
-fn toast_layer(s: &State, k: &Kit, compact: bool, layout_w: f32, safe: [f32; 4]) -> Option<El> {
-    if s.toasts.is_empty() {
-        return None;
-    }
+fn toast_layer(s: &State, k: &Kit, compact: bool, layout_w: f32, safe: [f32; 4]) -> El {
     let toast_w = if compact {
         (layout_w - safe[1] - safe[3] - 24.0).clamp(240.0, 360.0)
     } else {
         360.0
     };
-    let mut stack = col().gap(8.0).items_end();
+    let toast_transition = Transition::offset(0.0, 14.0)
+        .combined(Transition::opacity())
+        .combined(Transition::scale(0.96));
+    let mut stack = col()
+        .key("toast-stack")
+        .gap(8.0)
+        .items_end()
+        .animate_layout();
     for toast in &s.toasts {
         let (_ink, glyph) = match toast.kind {
             ToastKind::Info => (k.c.text_accent, k.c.text_accent),
@@ -814,10 +862,14 @@ fn toast_layer(s: &State, k: &Kit, compact: bool, layout_w: f32, safe: [f32; 4])
                     color: Color::BLACK.alpha(0.28),
                     ..rune::Shadow::default()
                 })
+                .transition(toast_transition)
+                .transition_motion(rune::tok::motion::POP, Spring::new(0.15, 0.0))
+                .on_press(|_: &mut State| {})
                 .child(widgets::dot(glyph, 8.0).mt(5.0))
                 .child(
                     col()
                         .grow(1.0)
+                        .min_w(0.0)
                         .gap(2.0)
                         .child(
                             text(toast.title.clone())
@@ -836,18 +888,16 @@ fn toast_layer(s: &State, k: &Kit, compact: bool, layout_w: f32, safe: [f32; 4])
                 .child(close_btn),
         );
     }
-    Some(
-        el().key("toast-layer")
-            .absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            .pr(if compact { 12.0 } else { 18.0 } + safe[1])
-            .pb(if compact { 12.0 } else { 18.0 } + safe[2])
-            .pl(if compact { 12.0 + safe[3] } else { 0.0 })
-            .justify_end()
-            .items_end()
-            .child(stack),
-    )
+    el().key("toast-layer")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .pr(if compact { 12.0 } else { 18.0 } + safe[1])
+        .pb(if compact { 12.0 } else { 18.0 } + safe[2])
+        .pl(if compact { 12.0 + safe[3] } else { 0.0 })
+        .justify_end()
+        .items_end()
+        .child(stack)
 }
 
 // `Align` and `Mods` are used by screens; keeping the imports here documents the key contract.
@@ -1010,7 +1060,12 @@ mod tests {
     #[test]
     fn compact_screens_fit_viewport_without_clipping_or_small_targets() {
         let run_id = crate::demo::runs().into_iter().next().expect("demo run").id;
-        for (w, h) in [(390.0, 844.0), (360.0, 780.0), (768.0, 1024.0)] {
+        for (w, h) in [
+            (390.0, 844.0),
+            (360.0, 780.0),
+            (768.0, 1024.0),
+            (1180.0, 760.0),
+        ] {
             assert_responsive_scene("projects", w, h, |s| crate::demo::load(s, View::Projects));
             assert_responsive_scene("project", w, h, |s| {
                 crate::demo::load(
@@ -1022,7 +1077,13 @@ mod tests {
             });
             let rid = run_id.clone();
             assert_responsive_scene("run", w, h, move |s| {
-                crate::demo::load(s, View::Run { id: rid })
+                crate::demo::load(s, View::Run { id: rid.clone() });
+                if let Some(step) = s.open_step {
+                    if let Some(entry) = s.logs.get_mut(&(rid, step)) {
+                        entry.text.push('\n');
+                        entry.text.push_str(&"x".repeat(260));
+                    }
+                }
             });
             assert_responsive_scene("settings-general", w, h, |s| {
                 crate::demo::load(
@@ -1050,7 +1111,13 @@ mod tests {
                     View::Settings {
                         page: SettingsPage::Diagnostics,
                     },
-                )
+                );
+                if let Some(sys) = &mut s.system {
+                    sys.docker.ok = false;
+                    sys.docker.error = Some(
+                        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?".into(),
+                    );
+                }
             });
             assert_responsive_scene("settings-appearance", w, h, |s| {
                 crate::demo::load(
@@ -1066,10 +1133,12 @@ mod tests {
             assert_responsive_scene("unauthorized", w, h, |s| {
                 crate::demo::unauthorized(s);
             });
-            assert_responsive_scene("drawer-open", w, h, |s| {
-                crate::demo::load(s, View::Projects);
-                s.drawer_open = true;
-            });
+            if w < 720.0 {
+                assert_responsive_scene("drawer-open", w, h, |s| {
+                    crate::demo::load(s, View::Projects);
+                    s.drawer_open = true;
+                });
+            }
         }
     }
 
@@ -1293,6 +1362,24 @@ mod tests {
             760.0,
         );
         assert!(rt_set.find("settings-body-scroll-area").is_some());
+        assert!(rt_set.find("settings-pages-scroll-scroll-area").is_some());
+
+        let rt_set_compact = setup_runtime(
+            |s| {
+                crate::demo::load(
+                    s,
+                    View::Settings {
+                        page: SettingsPage::General,
+                    },
+                )
+            },
+            390.0,
+            844.0,
+        );
+        assert!(rt_set_compact.find("settings-body-scroll-area").is_some());
+        assert!(rt_set_compact
+            .find("settings-nav-strip-scroll-area")
+            .is_some());
 
         let rid = crate::demo::runs().into_iter().next().expect("demo run").id;
         let rt_run = setup_runtime(
@@ -1424,5 +1511,227 @@ mod tests {
             &mut tx
         ));
         assert_eq!(rt.state.user_zoom, None);
+    }
+
+    #[test]
+    fn log_word_wrap_toggles_height_and_scrollbars() {
+        use crate::model::{Phase, Run, RunStatus, Step, StepKind, StepStatus};
+        use crate::state::{LogMode, LogState};
+
+        let long_line = "token_".repeat(60);
+        let log_text = (0..60)
+            .map(|i| format!("line-{i:02} {long_line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut rt = setup_runtime(
+            |s| {
+                let run = Run {
+                    id: "r-wrap".into(),
+                    project: "alpha".into(),
+                    sha: "abcdef1".into(),
+                    status: RunStatus::Success,
+                    steps: vec![Step {
+                        phase: Phase::Ci,
+                        name: "Build".into(),
+                        kind: StepKind::Shell,
+                        status: StepStatus::Success,
+                        ..Step::default()
+                    }],
+                    ..Run::default()
+                };
+                s.view = View::Run {
+                    id: "r-wrap".into(),
+                };
+                s.run = Some(run);
+                s.open_step = Some(0);
+                s.logs.insert(
+                    ("r-wrap".into(), 0),
+                    LogState {
+                        text: log_text,
+                        loading: false,
+                        error: None,
+                        mode: Some(LogMode::Tail),
+                    },
+                );
+            },
+            1180.0,
+            760.0,
+        );
+
+        let log_text_height = |rt: &Runtime<State>| -> f32 {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("log-text") && !e.exiting)
+                .expect("log-text")
+                .rect[3]
+        };
+
+        // Default wrapped: vertical scrollbar only, no scroll-bar-x, sticks to bottom.
+        assert!(rt.state.log_wrap);
+        assert!(rt.find("run-log-scroll-scroll-area/scroll-bar").is_some());
+        assert!(rt.find("run-log-scroll-scroll-area/scroll-bar-x").is_none());
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+        let wrapped_h = log_text_height(&rt);
+
+        // Toggle via run-log-wrap button -> unwrapped: shorter text height, both v + h scrollbars.
+        let (wx, wy) = rt.find("run-log-wrap").expect("run-log-wrap");
+        rt.pointer_down(wx, wy);
+        rt.pointer_up(wx, wy);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(!rt.state.log_wrap);
+        assert!(rt.find("run-log-scroll-scroll-area/scroll-bar").is_some());
+        assert!(rt.find("run-log-scroll-scroll-area/scroll-bar-x").is_some());
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+        let unwrapped_h = log_text_height(&rt);
+        assert!(
+            wrapped_h > unwrapped_h * 1.5,
+            "wrapped height ({wrapped_h}) should significantly exceed unwrapped height ({unwrapped_h})"
+        );
+
+        // Toggle Tail -> Full while unwrapped -> stays at bottom.
+        let (fx, fy) = rt.find("run-log-mode/segment1").expect("Full toggle");
+        rt.pointer_down(fx, fy);
+        rt.pointer_up(fx, fy);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+
+        // Toggle back via Alt+Z in Run view and verify re-wrap keeps bottom alignment.
+        let mut tx = rune::Tx::default();
+        let alt_z = KeyEvent {
+            key: Key::Text("z".into()),
+            mods: Mods {
+                alt: true,
+                ..Mods::default()
+            },
+        };
+        assert!(on_key(&mut rt.state, &alt_z, &mut tx));
+        assert!(rt.state.log_wrap);
+        rt.update(|_, _| {});
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(rt.find("run-log-scroll-scroll-area/scroll-bar-x").is_none());
+        assert_eq!(rt.scroll_at_bottom("run-log-scroll"), Some(true));
+
+        // Switch to Settings -> Appearance: Alt+Z should NOT toggle outside Run view,
+        // and appearance-log-wrap switch should toggle it cleanly.
+        rt.update(|s, tx| s.open_settings(SettingsPage::Appearance, tx));
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(!on_key(&mut rt.state, &alt_z, &mut tx));
+        assert!(rt.state.log_wrap);
+
+        let (sx, sy) = rt
+            .find("appearance-log-wrap")
+            .expect("appearance-log-wrap switch");
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(!rt.state.log_wrap);
+
+        // Restore default wrapped preference.
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        for _ in 0..4 {
+            rt.frame(0.016);
+            rt.settle_all();
+        }
+        assert!(rt.state.log_wrap);
+    }
+
+    #[test]
+    fn animations_run_on_drawer_open_close_and_toast() {
+        let mut rt = setup_runtime(
+            |s| {
+                crate::demo::load(s, View::Projects);
+                // Keep only idle/finished projects so no background loader keeps frames active.
+                for p in &mut s.projects {
+                    p.running = false;
+                    p.current_run = None;
+                }
+            },
+            390.0,
+            844.0,
+        );
+        rt.settle_all();
+        assert!(
+            !rt.frame(0.016),
+            "settled idle screen should not keep requesting frames"
+        );
+
+        // Drawer open animates smoothly before settle_all().
+        let (mx, my) = rt.find("titlebar-menu").expect("titlebar-menu");
+        rt.pointer_down(mx, my);
+        rt.pointer_up(mx, my);
+        assert!(
+            rt.frame(0.016),
+            "drawer open should animate instead of snapping"
+        );
+        assert!(rt.state.drawer_open);
+        assert!(rt.find("rail-drawer").is_some());
+
+        // Settle, tap non-interactive space inside rail-drawer (must NOT close it), then close via scrim.
+        rt.settle_all();
+        rt.frame(0.016);
+        let drawer_rect = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("rail-drawer") && !e.exiting)
+            .expect("rail-drawer")
+            .rect;
+        // Bottom-left empty area inside rail-drawer (footer/padding, not a nav item or close button).
+        rt.pointer_down(
+            drawer_rect[0] + 24.0,
+            drawer_rect[1] + drawer_rect[3] - 24.0,
+        );
+        rt.pointer_up(
+            drawer_rect[0] + 24.0,
+            drawer_rect[1] + drawer_rect[3] - 24.0,
+        );
+        rt.frame(0.016);
+        assert!(
+            rt.state.drawer_open,
+            "tapping non-interactive space inside rail-drawer must not close it"
+        );
+
+        let (_sx, sy) = rt.find("drawer-scrim").expect("drawer-scrim");
+        // Tap on the right side of the scrim outside the drawer.
+        rt.pointer_down(360.0, sy);
+        rt.pointer_up(360.0, sy);
+        assert!(rt.frame(0.016), "drawer close should animate out");
+        assert!(!rt.state.drawer_open);
+        for _ in 0..14 {
+            rt.frame(0.016);
+        }
+        assert!(
+            rt.find("rail-drawer").is_none(),
+            "drawer exit should finish well within ~0.2s"
+        );
+
+        // Toast show animates before settle_all().
+        rt.settle_all();
+        rt.frame(0.016);
+        assert!(!rt.frame(0.016));
+        rt.update(|s, tx| {
+            s.toast(tx, ToastKind::Info, "Queued", "alpha: a run was queued.");
+        });
+        assert!(
+            rt.frame(0.016),
+            "toast enter should animate instead of snapping"
+        );
+        assert!(rt.find("toast-1").is_some());
     }
 }

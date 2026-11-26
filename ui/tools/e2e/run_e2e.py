@@ -917,12 +917,16 @@ def test_responsive_layouts(sb: Sandbox, alpha_run_id: str) -> None:
 
         sc = Script(1.0).tap("project-alpha", 0.7).tap(f"run-{alpha_run_id}", 0.7).tap("step-0", 0.7)
         t_run = sb.run_ui(f"resp_{tag}_run", sc.events, at=sc.t + 0.4, size=size)
-        assert has_key(t_run, "log") and has_key(t_run, "run-log-mode")
+        assert has_key(t_run, "log") and has_key(t_run, "run-log-mode") and has_key(t_run, "run-log-wrap")
         assert_tree_responsive("run", t_run, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
 
         sc = Script(1.0).tap("titlebar-settings", 0.7)
         t_gen = sb.run_ui(f"resp_{tag}_settings_general", sc.events, at=sc.t + 0.3, size=size)
         assert has_key(t_gen, "field-general.poll_interval")
+        if compact:
+            assert has_key(t_gen, "settings-nav-strip-scroll-area")
+        else:
+            assert has_key(t_gen, "settings-pages-scroll-scroll-area")
         assert_tree_responsive("settings-general", t_gen, win_w=win_w, expect_compact=compact, expect_zoom=zoom)
 
         sc = Script(1.0).tap("connection", 0.7)
@@ -965,6 +969,8 @@ def test_job_b_features(sb: Sandbox, alpha_run_id: str) -> None:
     t_tail = sb.run_ui("jobb_log_tail", sc.events, at=sc.t + 0.3, size="1180x760")
     assert has_key(t_tail, "run-steps-scroll-scroll-area")
     assert has_key(t_tail, "run-log-scroll-scroll-area")
+    assert has_key(t_tail, "run-log-wrap")
+    assert not has_key(t_tail, "scroll-bar-x"), "wrapped log must not mount horizontal scrollbar"
     assert has_key(t_tail, "thumb")
     vp = el_rect(find_el(t_tail, "run-log-scroll"))
     lg = el_rect(find_el(t_tail, "log"))
@@ -975,6 +981,19 @@ def test_job_b_features(sb: Sandbox, alpha_run_id: str) -> None:
     vp_f = el_rect(find_el(t_full, "run-log-scroll"))
     lg_f = el_rect(find_el(t_full, "log"))
     assert abs((lg_f[1] + lg_f[3]) - (vp_f[1] + vp_f[3])) <= 2.5, f"Full not at bottom: vp={vp_f} log={lg_f}"
+
+    # Toggle run-log-wrap off -> mounts horizontal scrollbar and persists across UI restart; then reset back to wrapped.
+    sc_unwrap = Script(1.0).tap("project-alpha", 0.7).tap(f"run-{alpha_run_id}", 0.7).tap("step-0", 0.7).tap("run-log-wrap", 0.4)
+    t_unwrap = sb.run_ui("jobb_log_unwrap", sc_unwrap.events, at=sc_unwrap.t + 0.3, size="1180x760")
+    assert has_key(t_unwrap, "scroll-bar-x"), "unwrapped log must mount horizontal scrollbar"
+
+    sc_unwrap_persist = Script(1.0).tap("project-alpha", 0.7).tap(f"run-{alpha_run_id}", 0.7).tap("step-0", 0.7)
+    t_unwrap_persist = sb.run_ui("jobb_log_unwrap_persist", sc_unwrap_persist.events, at=sc_unwrap_persist.t + 0.3, size="1180x760")
+    assert has_key(t_unwrap_persist, "scroll-bar-x"), "unwrapped log preference must persist across restart"
+
+    sc_rewrap = Script(1.0).tap("project-alpha", 0.7).tap(f"run-{alpha_run_id}", 0.7).tap("step-0", 0.7).tap("run-log-wrap", 0.4)
+    t_rewrap = sb.run_ui("jobb_log_rewrap", sc_rewrap.events, at=sc_rewrap.t + 0.3, size="1180x760")
+    assert not has_key(t_rewrap, "scroll-bar-x"), "rewrapped log must unmount horizontal scrollbar"
 
     # B4 & B5: OLED + 1.25x zoom in Appearance, persisted across restart, then Ctrl/Cmd+= & Ctrl/Cmd+0.
     sc_set = (
@@ -987,6 +1006,7 @@ def test_job_b_features(sb: Sandbox, alpha_run_id: str) -> None:
     t_oled = sb.run_ui("jobb_oled_125", sc_set.events, at=sc_set.t + 0.4, size="1180x760")
     assert find_el(t_oled, "app-root").get("fill") == "#000000ff"
     assert has_key(t_oled, "settings-body-scroll-area")
+    assert has_key(t_oled, "settings-pages-scroll-scroll-area")
     assert_tree_responsive("appearance-oled-1.25", t_oled, win_w=1180.0, expect_compact=False, expect_zoom=1.25)
 
     # Fresh UI instance in the same RUNE_DIRS_ROOT restores OLED + 1.25x.

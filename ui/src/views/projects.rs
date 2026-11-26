@@ -44,7 +44,8 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, hair: f32, compact: bool) -
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .px(if compact { 14.0 } else { 22.0 })
+                .pl(if compact { 14.0 } else { 22.0 })
+                .pr(if compact { 18.0 } else { 22.0 })
                 .pt(16.0)
                 .scroll(ScrollSpec::default())
                 .child(body),
@@ -72,9 +73,8 @@ fn header(s: &State, k: &Kit, hair: f32, compact: bool) -> El {
     let force_switch = rune_kit::Switch::new(s.force)
         .label("Force")
         .hide_label()
-        .on_toggle_tx(|s: &mut State, tx: &mut Tx| {
+        .on_toggle_tx(|s: &mut State, _tx: &mut Tx| {
             s.force = !s.force;
-            tx.instant();
         })
         .build(k)
         .min_h(if compact { 44.0 } else { 0.0 })
@@ -172,15 +172,16 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         .font(k.ty.small)
         .color(k.c.text_muted);
         let subj = if compact {
-            subj.wrap().grow(1.0)
+            subj.wrap().min_w(0.0).grow(1.0)
         } else {
-            subj.nowrap().truncate().grow(1.0)
+            subj.nowrap().truncate().min_w(0.0).grow(1.0)
         };
         facts = facts.child(widgets::run_pill(k, run.status)).child(
             row()
                 .gap(6.0)
                 .center_y()
-                .grow(if compact { 1.0 } else { 0.0 })
+                .grow(1.0)
+                .min_w(0.0)
                 .child(mono_chip(k, &short_sha(&run.sha)))
                 .child(subj),
         );
@@ -214,21 +215,35 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         );
     }
 
-    let mut title_row = row()
-        .w_full()
-        .gap(10.0)
-        .center_y()
-        .child(widgets::dot(ink, 8.0))
-        .child(
-            text(project.name.clone())
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base),
-        )
-        .child(
-            text(project.branch.clone())
-                .font(k.ty.small)
-                .color(k.c.text_faint),
-        )
+    let indicator = if state == ProjectState::Running {
+        rune_kit::Loader::new().size(13.0).color(ink).build(k)
+    } else {
+        widgets::dot(ink, 8.0)
+    };
+    let name_el = text(project.name.clone())
+        .font(k.ty.ui_medium)
+        .color(k.c.text_base)
+        .min_w(0.0);
+    let branch_el = text(project.branch.clone())
+        .font(k.ty.small)
+        .color(k.c.text_faint)
+        .min_w(0.0);
+    let mut title_row = row().w_full().gap(10.0).center_y();
+    if compact {
+        title_row = title_row.flex_wrap();
+    }
+    title_row = title_row
+        .child(indicator)
+        .child(if compact {
+            name_el.wrap().shrink()
+        } else {
+            name_el.nowrap().truncate()
+        })
+        .child(if compact {
+            branch_el.wrap().shrink()
+        } else {
+            branch_el.nowrap().truncate()
+        })
         .child(el().grow(1.0));
     if !compact {
         title_row = title_row.children(directly.map(|repo| {
@@ -250,6 +265,7 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
         .fill(k.c.layer_01)
         .border(hair_width(k), k.c.border_base)
         .hover(k.c.layer_02)
+        .press_scale(0.992)
         .on_press_tx({
             let name = project.name.clone();
             move |s: &mut State, tx: &mut Tx| s.open_project(&name, tx)
@@ -274,7 +290,7 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
                 .w_full()
                 .gap(10.0)
                 .center_y()
-                .child(facts.grow(1.0))
+                .child(facts.grow(1.0).min_w(0.0))
                 .child(right),
         );
     }
@@ -287,7 +303,7 @@ fn card_row(s: &State, k: &Kit, project: &Project, compact: bool) -> El {
     .font(k.ty.small)
     .color(k.c.text_faint);
     card = card.child(row().w_full().gap(8.0).center_y().child(if compact {
-        repo_line.wrap()
+        repo_line.wrap_anywhere().shrink()
     } else {
         repo_line.nowrap().truncate()
     }));

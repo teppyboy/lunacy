@@ -31,3 +31,16 @@ args=(lunacy-ui --out dist)
 "$RUNE/scripts/web-build.sh" "${args[@]}"
 # Our own page: absolute asset paths (deep links), a /runs/{id} redirect, readable errors.
 cp web/index.html dist/index.html
+if command -v sha256sum >/dev/null 2>&1; then
+  hash=$(cat dist/app_bg.wasm dist/app.js | sha256sum | awk '{print substr($1, 1, 12)}')
+elif command -v shasum >/dev/null 2>&1; then
+  hash=$(cat dist/app_bg.wasm dist/app.js | shasum -a 256 | awk '{print substr($1, 1, 12)}')
+else
+  echo "Neither sha256sum nor shasum found to compute build hash." >&2
+  exit 1
+fi
+tmp=$(mktemp)
+trap 'rm -f "${tmp:-}"' EXIT
+sed "s|/\*__LUNACY_BUILD__\*/|$hash|g" dist/index.html > "$tmp"
+cat "$tmp" > dist/index.html
+rm -f "$tmp"

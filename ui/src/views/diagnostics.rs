@@ -14,7 +14,8 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
     let mut c = col()
         .key("diagnostics")
         .w_full()
-        .px(if compact { 14.0 } else { 22.0 })
+        .pl(if compact { 14.0 } else { 22.0 })
+        .pr(if compact { 18.0 } else { 22.0 })
         .py(if compact { 14.0 } else { 18.0 })
         .gap(20.0);
 
@@ -52,7 +53,7 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
                 .control_size(ControlSize::Small)
                 .on_press_tx(|s: &mut State, tx: &mut Tx| {
                     s.request_system();
-                    tx.instant();
+                    s.refresh(tx);
                 })
                 .build(k)
                 .key("diagnostics-refresh"),
@@ -137,7 +138,29 @@ pub fn view(s: &State, k: &Kit, _cx: &mut Cx<State>, compact: bool) -> El {
         "docker",
         match (info.docker.ok, info.docker.error.as_deref()) {
             (true, _) => widgets::pill(k, "Available", theme::status(k).success),
-            (false, Some(error)) => widgets::pill(k, error.to_string(), theme::status(k).failure),
+            (false, Some(error)) => {
+                let ink = theme::status(k).failure;
+                let mut notice = row()
+                    .px(8.0)
+                    .py(4.0)
+                    .radius(k.radius.sm)
+                    .fill(theme::status(k).tint(ink))
+                    .items_start()
+                    .min_w(0.0)
+                    .shrink()
+                    .child(
+                        text(error.to_string())
+                            .font(k.ty.small_medium)
+                            .color(ink)
+                            .wrap_anywhere()
+                            .shrink()
+                            .min_w(0.0),
+                    );
+                if compact {
+                    notice = notice.w_full();
+                }
+                notice
+            }
             (false, None) => widgets::pill(k, "Not available", theme::status(k).failure),
         },
     ));
@@ -182,7 +205,7 @@ fn tool_row(k: &Kit, compact: bool, name: &str, path: Option<&str>, version: Opt
                 text(detail)
                     .font(k.ty.mono)
                     .color(if found { k.c.text_base } else { k.c.text_faint })
-                    .wrap(),
+                    .wrap_anywhere(),
             );
     }
     row()

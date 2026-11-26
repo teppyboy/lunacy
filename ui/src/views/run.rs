@@ -4,10 +4,10 @@
 //! does. A step skipped because of `only_on` says so in muted text, since "skipped" alone reads
 //! like a problem.
 
-use rune::{col, el, icon, row, text, Cx, El, Icon, ScrollSpec, Tx};
+use rune::{col, el, icon, row, text, Cx, El, Icon, ScrollSpec, Spring, Transition, Tx};
 use rune_kit::{glyphs, Button, ButtonVariant, ControlSize, Kit};
 
-use crate::model::{Run, Step, StepKind, StepStatus, Substep};
+use crate::model::{Run, RunStatus, Step, StepKind, StepStatus, Substep};
 use crate::state::{LogMode, LogState, State};
 use crate::theme;
 use crate::widgets::{self, ago, duration, mono_chip, short_sha};
@@ -16,6 +16,7 @@ pub fn view(s: &State, k: &Kit, id: &str, _cx: &mut Cx<State>, hair: f32, compac
     let Some(run) = s.run.as_ref().filter(|r| r.id == id) else {
         if let Some(error) = &s.run_error {
             return col()
+                .key("run-error")
                 .w_full()
                 .h_full()
                 .child(header_shell(k, hair, compact))
@@ -30,6 +31,7 @@ pub fn view(s: &State, k: &Kit, id: &str, _cx: &mut Cx<State>, hair: f32, compac
                 );
         }
         return col()
+            .key("run-loading")
             .w_full()
             .h_full()
             .child(header_shell(k, hair, compact))
@@ -156,12 +158,18 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
                     .child(
                         text(run.project.clone())
                             .font(k.ty.ui_medium)
-                            .color(k.c.text_base),
+                            .color(k.c.text_base)
+                            .wrap()
+                            .shrink()
+                            .min_w(0.0),
                     )
                     .child(
                         text(format!("#{}", run_id_suffix(&run.id)))
                             .font(k.ty.mono)
-                            .color(k.c.text_faint),
+                            .color(k.c.text_faint)
+                            .wrap_anywhere()
+                            .shrink()
+                            .min_w(0.0),
                     )
                     .child(el().grow(1.0))
                     .children(failed.map(|step| {
@@ -179,7 +187,11 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
                     .color(k.c.text_muted)
                     .wrap()
             }))
-            .child(actions);
+            .child(actions)
+            .children(
+                (run.status == RunStatus::Running)
+                    .then(|| rune_kit::Progress::new(None).build(k).key("run-progress")),
+            );
     }
 
     let mut meta = row().w_full().gap(8.0).center_y();
@@ -192,6 +204,8 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
                 .color(k.c.text_muted)
                 .nowrap()
                 .truncate()
+                .min_w(0.0)
+                .shrink()
         }))
         .child(
             text("·")
@@ -243,12 +257,17 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
                 .child(
                     text(run.project.clone())
                         .font(k.ty.ui_medium)
-                        .color(k.c.text_base),
+                        .color(k.c.text_base)
+                        .nowrap()
+                        .truncate()
+                        .min_w(0.0),
                 )
                 .child(
                     text(format!("#{}", run_id_suffix(&run.id)))
                         .font(k.ty.mono)
-                        .color(k.c.text_faint),
+                        .color(k.c.text_faint)
+                        .nowrap()
+                        .min_w(0.0),
                 )
                 .child(el().grow(1.0))
                 .children(failed.map(|step| {
@@ -260,6 +279,10 @@ fn header(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
                 })),
         )
         .child(meta)
+        .children(
+            (run.status == RunStatus::Running)
+                .then(|| rune_kit::Progress::new(None).build(k).key("run-progress")),
+        )
 }
 
 /// `#4f1c2b9` reads better than the whole id.
@@ -363,7 +386,7 @@ fn step_row(
     } else {
         k.c.text_base
     });
-    let mut label_col = col().grow(1.0).gap(1.0).child(if compact {
+    let mut label_col = col().grow(1.0).min_w(0.0).gap(1.0).child(if compact {
         name_txt.wrap()
     } else {
         name_txt.nowrap().truncate()
@@ -410,12 +433,14 @@ fn step_row(
         .key(format!("step-{index}"))
         .w_full()
         .min_h(if compact { 44.0 } else { 34.0 })
-        .px(14.0)
+        .pl(14.0)
+        .pr(18.0)
         .py(if compact { 8.0 } else { 6.0 })
         .gap(9.0)
         .center_y()
         .fill(if selected { k.c.layer_03 } else { k.c.layer_01 })
         .hover(if selected { k.c.layer_03 } else { k.c.hover })
+        .press_scale(0.992)
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             if s.open_step == Some(index) {
                 s.open_step = None;
@@ -427,8 +452,8 @@ fn step_row(
                 s.stick_log_pending = entry.is_none_or(|e| e.text.is_empty());
                 s.request_log(&run_id, index, mode);
                 tx.scroll_to_bottom_instant("run-log-scroll");
+                s.refresh(tx);
             }
-            tx.instant();
         })
         .cursor(rune::Cursor::Pointer)
         .child(widgets::status_glyph(k, step.status, host))
@@ -479,11 +504,51 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
                 s.stick_log_pending = true;
                 s.request_log(&run_id, index, mode);
                 tx.scroll_to_bottom_instant("run-log-scroll");
-                tx.instant();
+                s.refresh(tx);
             }
         },
     )
     .key("run-log-mode");
+
+    let wrap_on = s.log_wrap;
+    let wrap_btn = el()
+        .key("run-log-wrap")
+        .role("button")
+        .label("Wrap")
+        .a11y_value(if wrap_on { "on" } else { "off" })
+        .help("Toggle word wrap (Alt+Z)")
+        .h(if compact { 44.0 } else { 26.0 })
+        .min_w(if compact { 44.0 } else { 0.0 })
+        .px(if compact { 14.0 } else { 10.0 })
+        .center()
+        .radius(k.radius.md)
+        .fill(if wrap_on {
+            k.c.text_accent.alpha(0.14)
+        } else {
+            k.c.layer_01
+        })
+        .border(
+            1.0,
+            if wrap_on {
+                k.c.text_accent.alpha(0.55)
+            } else {
+                k.c.border_muted
+            },
+        )
+        .hover(k.c.hover)
+        .press_scale(0.98)
+        .cursor(rune::Cursor::Pointer)
+        .on_press_tx(|s: &mut State, tx: &mut Tx| s.toggle_log_wrap(tx))
+        .child(
+            text("Wrap")
+                .font(k.ty.small_medium)
+                .color(if wrap_on {
+                    k.c.text_accent
+                } else {
+                    k.c.text_muted
+                })
+                .nowrap(),
+        );
 
     let step_title = text(step.name.clone())
         .font(k.ty.small_medium)
@@ -491,6 +556,7 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
     let title_block = col()
         .gap(1.0)
         .grow(1.0)
+        .min_w(0.0)
         .child(if compact {
             step_title.wrap()
         } else {
@@ -507,7 +573,8 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
                     ))
                     .font(k.ty.small)
                     .color(theme::status(k).for_step(step.status))
-                    .wrap(),
+                    .wrap()
+                    .shrink(),
                 ),
             }),
         );
@@ -525,31 +592,46 @@ fn log_pane(s: &State, k: &Kit, run: &Run, hair: f32, compact: bool) -> El {
     head = head
         .child(widgets::status_glyph(k, step.status, host.as_deref()))
         .child(title_block)
-        .child(mode_ctrl);
+        .child(row().gap(6.0).center_y().child(wrap_btn).child(mode_ctrl));
 
-    let mut body = col().w_full().gap(0.0);
+    let mut body = col()
+        .key(format!("log-step-{}-{index}", run.id))
+        .w_full()
+        .gap(0.0)
+        .transition(Transition::asymmetric(
+            Transition::opacity(),
+            Transition::none(),
+        ))
+        .transition_motion(rune::tok::motion::SNAP, Spring::NONE);
+    if s.log_wrap {
+        body = body.min_w(0.0);
+    }
     if !step.substeps.is_empty() {
         body = body.child(substeps_block(k, &step.substeps, host.as_deref(), compact));
     }
-    body = body.child(log_block(k, step, state));
+    body = body.child(log_block(k, step, state, s.log_wrap));
+
+    let log_viewport = col()
+        .key("run-log-scroll")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec::stick_bottom());
+    let log_scroll = if s.log_wrap {
+        widgets::scroll_bar(log_viewport.child(body), k)
+    } else {
+        widgets::scroll_bars_xy(log_viewport.scroll_xy().child(body), k)
+    };
 
     col()
         .key("run-log")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
+        .min_w(0.0)
         .h_full()
         .child(head)
-        .child(widgets::scroll_bar(
-            col()
-                .key("run-log-scroll")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .scroll(ScrollSpec::stick_bottom())
-                .child(body),
-            k,
-        ))
+        .child(log_scroll)
 }
 
 /// The GitHub Actions tree an act step produces: one header per job, its steps indented under it.
@@ -564,12 +646,17 @@ fn substeps_block(k: &Kit, substeps: &[Substep], host: Option<&str>, compact: bo
     let mut block = col()
         .key("substeps")
         .w_full()
-        .px(if compact { 14.0 } else { 16.0 })
+        .pl(if compact { 14.0 } else { 16.0 })
+        .pr(18.0)
         .py(10.0)
         .gap(8.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted);
     block = block.child(widgets::caption(k, "GITHUB ACTIONS"));
     for (job_idx, (job, steps)) in jobs.into_iter().enumerate() {
+        let job_txt = text(job.to_string())
+            .font(k.ty.small_medium)
+            .color(k.c.text_base)
+            .min_w(0.0);
         let mut job_block = col()
             .key(format!("substeps-job-{job_idx}"))
             .w_full()
@@ -580,12 +667,11 @@ fn substeps_block(k: &Kit, substeps: &[Substep], host: Option<&str>, compact: bo
                     .gap(6.0)
                     .center_y()
                     .child(icon(&glyphs::TRIANGLE_DOWN, 12.0).color(k.c.icon_faint))
-                    .child(
-                        text(job.to_string())
-                            .font(k.ty.small_medium)
-                            .color(k.c.text_base)
-                            .wrap(),
-                    ),
+                    .child(if compact {
+                        job_txt.wrap_anywhere().shrink()
+                    } else {
+                        job_txt.wrap().shrink()
+                    }),
             );
         for (sub_idx, sub) in steps.into_iter().enumerate() {
             job_block = job_block.child(substep_row(k, sub, sub_idx, host, compact));
@@ -603,7 +689,8 @@ fn substep_row(k: &Kit, sub: &Substep, index: usize, host: Option<&str>, compact
     }
     let name_el = text(sub.name.clone())
         .font(k.ty.small)
-        .color(k.c.text_muted);
+        .color(k.c.text_muted)
+        .min_w(0.0);
     row()
         .key(format!("substep-{index}-{}", sub.name))
         .w_full()
@@ -613,7 +700,7 @@ fn substep_row(k: &Kit, sub: &Substep, index: usize, host: Option<&str>, compact
         .center_y()
         .child(widgets::status_glyph(k, sub.status, host))
         .child(if compact {
-            name_el.wrap().grow(1.0)
+            name_el.wrap_anywhere().grow(1.0)
         } else {
             name_el.nowrap().truncate().grow(1.0)
         })
@@ -629,14 +716,19 @@ fn substep_row(k: &Kit, sub: &Substep, index: usize, host: Option<&str>, compact
         )
 }
 
-fn log_block(k: &Kit, step: &Step, state: Option<&LogState>) -> El {
+fn log_block(k: &Kit, step: &Step, state: Option<&LogState>, wrap: bool) -> El {
     let mut block = col()
         .key("log")
         .w_full()
-        .padding(16.0)
+        .pl(16.0)
+        .pr(18.0)
         .pt(10.0)
+        .pb(if wrap { 16.0 } else { 18.0 })
         .gap(6.0)
         .child(widgets::caption(k, "OUTPUT"));
+    if wrap {
+        block = block.min_w(0.0);
+    }
 
     match state {
         None => {
@@ -661,7 +753,7 @@ fn log_block(k: &Kit, step: &Step, state: Option<&LogState>) -> El {
             );
         }
         Some(entry) => {
-            block = block.child(widgets::log_body(k, &entry.text));
+            block = block.child(widgets::log_body(k, &entry.text, wrap));
         }
     }
     let _ = step;

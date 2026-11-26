@@ -171,3 +171,35 @@ name = "Deploy stack"
 # It sends its own Discord notification through deploy-notify.py.
 run = "bash scripts/deploy-local.sh"
 timeout = 3600
+
+# ---------------------------------------------------------------------------
+# lunacy (self-CI + rolling GitHub pre-release). Uncomment to let lunacy test
+# itself in an isolated git worktree and publish Linux, Windows (via
+# cargo-xwin), and Web WASM artifacts to the `prerelease` GitHub release.
+# ---------------------------------------------------------------------------
+# [[project]]
+# name = "lunacy"
+# repo_path = "/home/tretrauit/workspace/lunacy"
+# remote = "origin"
+# branch = "master"
+# github_repo = "teppyboy/lunacy"
+# checkout = "worktree"
+# poll_interval = 300
+# # Optional: override persistent target dir or sync the built web bundle into
+# # the live checkout served by [server].web_root.
+# # env = { "LUNACY_SYNC_LOCAL_WEB_DIR" = "/home/tretrauit/workspace/lunacy/ui/dist" }
+#
+# [[project.ci]]
+# name = "Daemon CI"
+# run = "bash scripts/ci-daemon.sh"
+# timeout = 1800
+#
+# [[project.ci]]
+# name = "UI CI"
+# run = "bash scripts/ci-ui.sh"
+# timeout = 1800
+#
+# [[project.deploy]]
+# name = "Publish pre-release"
+# run = "bash scripts/release-prerelease.sh"
+# timeout = 3600

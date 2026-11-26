@@ -14,6 +14,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/workspace/lunacy
+Environment="PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin"
 ExecStart=%h/.cargo/bin/lunacy run -c %h/.config/lunacy/config.toml
 Restart=on-failure
 RestartSec=10s
